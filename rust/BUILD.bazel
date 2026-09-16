@@ -21,6 +21,11 @@ config_setting(
     constraint_values = ["@platforms//os:windows"],
 )
 
+config_setting(
+    name = "debug",
+    values = {"compilation_mode": "dbg"},
+)
+
 _SQL_NIO_INPUTS = [
     "Cargo.toml",
     "rust-toolchain.toml",
@@ -35,11 +40,14 @@ genrule(
     name = "_sql_nio_static_unix",
     srcs = _SQL_NIO_INPUTS,
     outs = ["libsql_nio.a"],
-    cmd = """
+    cmd = select({
+        ":debug": "profile=cmake-debug\n",
+        "//conditions:default": "profile=release\n",
+    }) + """
 set -eu
 export CARGO_TARGET_DIR="$(@D)/sql_nio-cargo-target"
-cargo build --release --manifest-path "$(location Cargo.toml)" --package sql-nio
-cp "$$CARGO_TARGET_DIR/release/libsql_nio.a" "$@"
+cargo build --profile "$$profile" --manifest-path "$(location Cargo.toml)" --package sql-nio
+cp "$$CARGO_TARGET_DIR/$$profile/libsql_nio.a" "$@"
 """,
     tags = [
         "no-remote",

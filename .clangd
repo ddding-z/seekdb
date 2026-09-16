@@ -1,0 +1,9 @@
+CompileFlags:
+  CompilationDatabase: .
+  Remove:
+    - -fmodule-name=*
+    - -fmodule-map-file=*
+    - -fmodules-strict-decluse
+    - -fmodules-decluse
+    - -fno-implicit-module-maps
+    - -Werror=private-header

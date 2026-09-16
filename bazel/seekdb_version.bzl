@@ -58,12 +58,13 @@ sed \
   -e 's|@BUILD_NUMBER@|1|g' \
   -e "s|@GIT_REVISION@|${git_revision}|g" \
   -e "s|@GIT_BRANCH@|${git_branch}|g" \
-  -e 's|@BUILD_FLAGS@|RelWithDebInfo|g' \
+  -e 's|@BUILD_FLAGS@|%s|g' \
   -e 's|@BUILD_INFO@||g' \
   "${template}" > "${output}"
 """ % (
             _GIT_REVISION_KEY,
             _GIT_BRANCH_KEY,
+            "Debug" if ctx.var.get("COMPILATION_MODE") == "dbg" else "RelWithDebInfo",
         ),
         mnemonic = "SeekdbVersionSource",
         progress_message = "Generating %{output}",
