@@ -1391,17 +1391,8 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
     result = result_str;
   }
   if (ret == OB_INVALID_DATA) {
-    ObString response_str;
-    if (OB_SUCCESS == ObAIFuncJsonUtils::print_json_to_str(*allocator_, response, response_str)) {
-      char http_message_str[1024];
-      snprintf(http_message_str, sizeof(http_message_str), "unexpected http message: %s", response_str.ptr());
-      ObString ob_http_message_str(http_message_str);
-      LOG_WARN("unexpected http message", K(ret), K(ob_http_message_str));
-      FORWARD_USER_ERROR(ret, ob_http_message_str.ptr());
-    } else {
-      LOG_WARN("unexpected http message", K(ret));
-      FORWARD_USER_ERROR(ret, "unexpected http message");
-    }
+    LOG_WARN("unexpected AI completion response", K(ret));
+    FORWARD_USER_ERROR(ret, "unexpected AI completion response");
   } 
   return ret;
 }
@@ -1441,11 +1432,9 @@ int ObAIFuncModel::call_completion_vector(ObArray<ObString> &prompts, ObJsonObje
   } else {
     for (int i = 0; OB_SUCC(ret) && i < response_array.count(); i++) {
       ObJsonObject *response = response_array[i];
-      ObStringBuffer result_buf(allocator_);
       if (OB_FAIL(complete_provider->parse_output(*allocator_, response, result_base))) {
-      } else if (OB_FAIL(result_base->print(result_buf, 0))) {
-      } else {
-        results.push_back(result_buf.string());
+      } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(*allocator_, result_base, result_str))) {
+      } else if (OB_FAIL(results.push_back(result_str))) {
       }
     }
   }

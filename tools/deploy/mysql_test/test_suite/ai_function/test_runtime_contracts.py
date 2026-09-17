@@ -1,0 +1,593 @@
+"""Black-box runtime contracts; use --self-test for the test harness only."""
+
+from collections import Counter
+from dataclasses import dataclass, field
+from email.utils import formatdate, parsedate_to_datetime
+from http.client import HTTPConnection
+import json
+import socket
+import sys
+import threading
+import time
+import unittest
+
+import pymysql
+
+import test_runtime as runtime
+
+
+WINDOW = 50
+RESPONSE_LIMIT = 8 * 1024 * 1024
+
+
+def answer(prompt):
+    return 'result:"' + prompt + '"\n'
+
+
+def completion(content):
+    return json.dumps({"choices": [{"message": {"content": content}}]},
+                      ensure_ascii=False).encode("utf-8")
+
+
+def sized_completion(size):
+    prefix = b'{"choices":[{"message":{"content":"'
+    suffix = b'"}}]}'
+    return prefix + b"x" * (size - len(prefix) - len(suffix)) + suffix
+
+
+def sql_error(test, code, operation):
+    with test.assertRaises(pymysql.MySQLError) as caught:
+        operation()
+    expected = (code,) if isinstance(code, int) else code
+    test.assertIn(caught.exception.args[0], expected, caught.exception.args)
+    return caught.exception
+
+
+@dataclass
+class Reply:
+    status: int = 200
+    body: bytes | None = None
+    headers: dict = field(default_factory=dict)
+    gate: threading.Event | None = None
+    peers: int = 0
+    drop: bool = False
+    truncate: bool = False
+
+
+class ContractHandler(runtime.MockHandler):
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_POST(self):
+        server = self.server
+        record = None
+        try:
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if "messages" in body:
+                prompt = body["messages"][-1]["content"]
+            else:
+                inputs = body["input"]
+                if isinstance(inputs, list):
+                    if len(inputs) != 1:
+                        raise AssertionError("embedding must preserve one input per SQL row")
+                    prompt = inputs[0]
+                else:
+                    prompt = inputs
+            with server.condition:
+                server.active += 1
+                server.peak = max(server.peak, server.active)
+                server.counts[prompt] += 1
+                server.requests.append(body)
+                record = {"prompt": prompt, "received": time.monotonic(),
+                          "wall_received": time.time(), "response": None,
+                          "headers": {name.lower(): value for name, value in self.headers.items()}}
+                server.audit.append(record)
+                sequence = server.scenarios.get(prompt, [Reply()])
+                reply = sequence[min(server.counts[prompt] - 1, len(sequence) - 1)]
+                server.condition.notify_all()
+                if reply.peers:
+                    if not server.condition.wait_for(lambda: len(server.audit) >= reply.peers, timeout=3):
+                        raise AssertionError("peer request did not reach mock")
+            if reply.gate is not None and not reply.gate.wait(timeout=10):
+                raise AssertionError("test did not release response gate")
+            if reply.drop:
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                return
+            raw = completion(answer(prompt)) if reply.body is None else reply.body
+            self.send_response(reply.status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw) + (100 if reply.truncate else 0)))
+            if reply.truncate:
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            for name, value in reply.headers.items():
+                self.send_header(name, value)
+            self.end_headers()
+            with server.condition:
+                record["response"] = time.monotonic()
+                server.condition.notify_all()
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as error:
+            with server.condition:
+                server.fixture_errors.append(repr(error))
+            self.close_connection = True
+        finally:
+            if record is not None:
+                with server.condition:
+                    server.active -= 1
+                    server.finished.append(record["prompt"])
+                    server.condition.notify_all()
+
+
+def configure_mock(server):
+    server.RequestHandlerClass = ContractHandler
+    server.audit = []
+    server.scenarios = {}
+    server.fixture_errors = []
+
+
+class HarnessTests(unittest.TestCase):
+    def test_wrong_error_code_is_rejected(self):
+        def wrong_error():
+            raise pymysql.OperationalError(1210, "not a timeout")
+        with self.assertRaises(AssertionError):
+            sql_error(self, 4012, wrong_error)
+
+    def test_success_is_not_an_expected_failure(self):
+        with self.assertRaises(AssertionError):
+            sql_error(self, 4012, lambda: None)
+
+    def test_response_boundary_fixture_is_valid_json(self):
+        for size in (RESPONSE_LIMIT - 1, RESPONSE_LIMIT, RESPONSE_LIMIT + 1):
+            raw = sized_completion(size)
+            self.assertEqual(len(raw), size)
+            value = json.loads(raw)["choices"][0]["message"]["content"]
+            self.assertTrue(value and set(value) == {"x"})
+
+    def test_scripted_http_status_and_body(self):
+        server = runtime.MockServer()
+        configure_mock(server)
+        server.scenarios["probe"] = [Reply(429, b"not json", {"Retry-After": "4"}), Reply()]
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            client = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            try:
+                body = json.dumps({"messages": [{"content": "probe"}]})
+                for expected in (429, 200):
+                    client.request("POST", "/", body, {"Content-Type": "application/json",
+                                                      "aUtHoRiZaTiOn": "Bearer fixture-only"})
+                    response = client.getresponse()
+                    self.assertEqual(response.status, expected)
+                    if expected == 429:
+                        self.assertEqual(response.getheader("Retry-After"), "4")
+                        self.assertEqual(response.read(), b"not json")
+                    else:
+                        self.assertEqual(json.loads(response.read())["choices"][0]["message"]["content"],
+                                         answer("probe"))
+            finally:
+                client.close()
+            self.assertEqual(server.counts, Counter({"probe": 2}))
+            self.assertEqual(server.audit[0]["headers"]["authorization"], "Bearer fixture-only")
+            self.assertFalse(server.fixture_errors)
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join()
+
+
+class RuntimeContracts(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        configure_mock(cls.server)
+        with cls.connection.cursor() as cursor:
+            cursor.execute("CREATE DATABASE ai_contract_test")
+            cursor.execute("USE ai_contract_test")
+            cursor.execute("CALL DBMS_AI_SERVICE.CREATE_AI_MODEL(%s, %s)",
+                           ("contract_model", json.dumps({"type": "completion", "model_name": "mock"})))
+            endpoint = {"ai_model_name": "contract_model", "url":
+                        f"http://127.0.0.1:{cls.server.server_port}/v1/chat/completions",
+                        "access_key": "contract-test-only", "provider": "openai",
+                        "request_model_name": "mock"}
+            cursor.execute("CALL DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT(%s, %s)",
+                           ("contract_endpoint", json.dumps(endpoint)))
+            cursor.execute("CREATE TABLE inputs (id INT PRIMARY KEY, prompt LONGTEXT, model VARCHAR(64))")
+            cursor.execute("CALL DBMS_AI_SERVICE.CREATE_AI_MODEL(%s, %s)",
+                           ("contract_embed", json.dumps({"type": "dense_embedding", "model_name": "mock-embed"})))
+            endpoint.update(ai_model_name="contract_embed", request_model_name="mock-embed")
+            cursor.execute("CALL DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT(%s, %s)",
+                           ("contract_embed_endpoint", json.dumps(endpoint)))
+
+    def setUp(self):
+        self.gates = []
+        self.server = runtime.MockServer()
+        self.server.daemon_threads = False
+        configure_mock(self.server)
+        self.mock_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.mock_thread.start()
+        self.addCleanup(self.close_mock)
+        self.cursor = self.connection.cursor()
+        self.addCleanup(self.cursor.close)
+        self.cursor.execute("SET ob_query_timeout = 20000000")
+        for endpoint in ("contract_endpoint", "contract_embed_endpoint"):
+            self.cursor.execute("CALL DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT(%s, %s)",
+                                (endpoint, json.dumps({"url": f"http://127.0.0.1:{self.server.server_port}/"})))
+        self.cursor.execute("TRUNCATE TABLE inputs")
+
+    def close_mock(self):
+        for gate in self.gates:
+            gate.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.mock_thread.join()
+        self.assertEqual(self.server.active, 0)
+        self.assertFalse(self.server.fixture_errors, self.server.fixture_errors)
+
+    def load(self, prompts):
+        self.cursor.executemany("INSERT INTO inputs VALUES (%s, %s, 'contract_model')",
+                                list(enumerate(prompts)))
+
+    def query(self, expression="AI_COMPLETE('contract_model', prompt)", suffix="ORDER BY id"):
+        self.cursor.execute(f"SELECT id, {expression} FROM inputs {suffix}")
+        return self.cursor.fetchall()
+
+    def gate(self):
+        gate = threading.Event()
+        self.gates.append(gate)
+        return gate
+
+    def test_default_window_limits_active_requests(self):
+        prompts = [f"parallel-{index}" for index in range(WINDOW + 1)]
+        self.load(prompts)
+        gate = self.gate()
+        first_gate = self.gate()
+        for prompt in prompts:
+            self.server.scenarios[prompt] = [Reply(gate=gate)]
+        self.server.scenarios[prompts[0]] = [Reply(gate=first_gate)]
+        outcome = []
+
+        def execute():
+            try:
+                self.cursor.execute("SELECT /*+ OPT_PARAM('rowsets_max_rows', 64) */ "
+                                    "id, AI_COMPLETE('contract_model', prompt) FROM inputs ORDER BY id")
+                outcome.append(self.cursor.fetchall())
+            except Exception as error:
+                outcome.append(error)
+
+        worker = threading.Thread(target=execute, daemon=True)
+        worker.start()
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(
+                    lambda: len(self.server.audit) >= WINDOW, timeout=3),
+                    "default window did not start 50 requests")
+                self.assertFalse(self.server.condition.wait_for(
+                    lambda: len(self.server.audit) > WINDOW, timeout=0.2),
+                    "request 51 started while all 50 slots were occupied")
+                first_gate.set()
+                self.assertTrue(self.server.condition.wait_for(
+                    lambda: len(self.server.audit) == len(prompts), timeout=3),
+                    "the released slot was not refilled")
+        finally:
+            first_gate.set()
+            gate.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome, [tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))])
+        self.assertEqual(self.server.counts, Counter(prompts))
+        self.assertEqual(self.server.peak, WINDOW)
+
+    def test_window_refills_across_preparation_boundary(self):
+        prompts = [f"window-{index}" for index in range(64)]
+        self.load(prompts)
+        gate = self.gate()
+        self.server.scenarios[prompts[0]] = [Reply(gate=gate)]
+        outcome = []
+
+        def execute():
+            try:
+                outcome.append(self.query())
+            except Exception as error:
+                outcome.append(error)
+
+        worker = threading.Thread(target=execute, daemon=True)
+        worker.start()
+        try:
+            with self.server.condition:
+                progressed = self.server.condition.wait_for(
+                    lambda: len(self.server.audit) >= 33, timeout=3)
+        finally:
+            gate.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive(), "query did not finish after releasing the response")
+        self.assertTrue(progressed, "an unfinished request blocked submission beyond the first 32 rows")
+        self.assertEqual(outcome, [tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))])
+        self.assertEqual(self.server.counts, Counter(prompts))
+        self.assertLessEqual(self.server.peak, WINDOW)
+
+    def test_large_batch_preserves_all_rows(self):
+        prompts = [f"large-{index}" for index in range(2048)]
+        self.load(prompts)
+        self.cursor.execute("SET ob_query_timeout = 60000000")
+        self.cursor.execute("SELECT /*+ OPT_PARAM('rowsets_max_rows', 2048) */ "
+                            "id, AI_COMPLETE('contract_model', prompt) FROM inputs ORDER BY id")
+        self.assertEqual(self.cursor.fetchall(), tuple((index, answer(prompt)) for index, prompt in enumerate(prompts)))
+        self.assertEqual(self.server.counts, Counter(prompts))
+        self.assertLessEqual(self.server.peak, WINDOW)
+
+    def test_duplicate_inputs_are_not_deduplicated(self):
+        prompts = ["duplicate"] * 17
+        self.load(prompts)
+        self.assertEqual(self.query(), tuple((index, answer(prompt)) for index, prompt in enumerate(prompts)))
+        self.assertEqual(self.server.counts, Counter(prompts))
+
+    def test_unicode_nul_and_quotes_round_trip(self):
+        prompts = ["quote\" backslash\\ newline\n", "nul\x00tail", "\u6d4b\u8bd5\U0001f680"]
+        self.load(prompts)
+        expected = tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))
+        self.assertEqual(self.query(), expected)
+        self.assertEqual(self.server.counts, Counter(prompts))
+
+    def test_request_preserves_model_prompt_and_options(self):
+        prompts = ["first input", "second\ninput"]
+        self.load(prompts)
+        options = {"temperature": 0, "max_tokens": 32, "stop": ["STOP"]}
+        result = self.query("AI_COMPLETE('contract_model', prompt, "
+                            "'{\"temperature\":0,\"max_tokens\":32,\"stop\":[\"STOP\"]}')")
+        self.assertEqual(result, tuple((index, answer(prompt)) for index, prompt in enumerate(prompts)))
+        self.assertEqual(len(self.server.requests), len(prompts))
+        for body in self.server.requests:
+            self.assertEqual(body["model"], "mock")
+            self.assertEqual(body["messages"], [{"role": "user", "content": body["messages"][0]["content"]}])
+            self.assertEqual({key: body[key] for key in options}, options)
+        self.assertEqual(Counter(body["messages"][0]["content"] for body in self.server.requests), Counter(prompts))
+        self.assertTrue(all(entry["headers"]["authorization"] == "Bearer contract-test-only"
+                            for entry in self.server.audit))
+
+    def test_case_skips_invalid_unselected_inputs(self):
+        self.load([None, "", "valid", None])
+        self.assertEqual(self.query("CASE WHEN id = 2 THEN AI_COMPLETE('contract_model', prompt) ELSE 'skip' END"),
+                         ((0, "skip"), (1, "skip"), (2, answer("valid")), (3, "skip")))
+        self.assertEqual(self.server.counts, Counter({"valid": 1}))
+
+    def test_limit_zero_sends_nothing(self):
+        self.load(["not-needed"] * 24)
+        self.assertEqual(self.query(suffix="LIMIT 0"), ())
+        self.assertFalse(self.server.audit)
+
+    def test_limit_does_not_expand_logical_inputs(self):
+        self.load([f"limited-{index}" for index in range(24)])
+        expected = tuple((index, answer(f"limited-{index}")) for index in range(3))
+        self.assertEqual(self.query(suffix="ORDER BY id LIMIT 3"), expected)
+        self.assertEqual(self.server.counts, Counter(f"limited-{index}" for index in range(3)))
+
+    def test_permanent_http_errors_have_transport_error_code(self):
+        for status in (400, 401, 403, 404, 422, 501):
+            with self.subTest(status=status):
+                prompt = f"http-{status}"
+                self.cursor.execute("TRUNCATE TABLE inputs")
+                self.load([prompt])
+                self.server.scenarios[prompt] = [Reply(status, b"not json")]
+                sql_error(self, 4216, self.query)
+                self.assertEqual(self.server.counts[prompt], 1)
+
+    def test_invalid_arguments_have_argument_error_code(self):
+        for prompt in (None, ""):
+            with self.subTest(prompt=prompt):
+                self.cursor.execute("TRUNCATE TABLE inputs")
+                self.load([prompt])
+                sql_error(self, 1210, self.query)
+                self.assertFalse(self.server.audit)
+
+    def test_non_object_response_has_json_error_code(self):
+        self.load(["array"])
+        self.server.scenarios["array"] = [Reply(body=b"[]")]
+        sql_error(self, 3140, self.query)
+        self.assertEqual(self.server.counts["array"], 1)
+
+    def test_malformed_response_has_json_syntax_error_code(self):
+        self.load(["broken-json"])
+        self.server.scenarios["broken-json"] = [Reply(body=b'{"broken')]
+        sql_error(self, (3140, 5447), self.query)
+        self.assertEqual(self.server.counts["broken-json"], 1)
+
+    def test_single_provider_error_has_data_error_code(self):
+        self.load(["provider-error"])
+        self.server.scenarios["provider-error"] = [Reply(body=b'{"unexpected":true}')]
+        sql_error(self, 4070, self.query)
+        self.assertEqual(self.server.counts["provider-error"], 1)
+
+    def test_accepted_post_with_lost_response_is_not_retried(self):
+        for field_name in ("drop", "truncate"):
+            with self.subTest(fault=field_name):
+                self.cursor.execute("TRUNCATE TABLE inputs")
+                self.load([field_name])
+                self.server.scenarios[field_name] = [Reply(**{field_name: True})]
+                sql_error(self, 4216, self.query)
+                self.assertEqual(self.server.counts[field_name], 1)
+
+    def test_retry_after_seconds_sets_a_real_lower_bound(self):
+        self.load(["limited", "healthy"])
+        self.server.scenarios["limited"] = [Reply(429, b"not json", {"rEtRy-AfTeR": "4"}), Reply()]
+        self.assertEqual(self.query(), ((0, answer("limited")), (1, answer("healthy"))))
+        attempts = [entry for entry in self.server.audit if entry["prompt"] == "limited"]
+        self.assertEqual(len(attempts), 2)
+        self.assertGreaterEqual(attempts[1]["received"] - attempts[0]["response"], 3.95)
+        self.assertEqual(self.server.counts["healthy"], 1)
+
+    def test_retry_after_http_date_sets_a_real_lower_bound(self):
+        date = formatdate(time.time() + 5, usegmt=True)
+        self.load(["dated"])
+        self.server.scenarios["dated"] = [Reply(503, b"{}", {"Retry-After": date}), Reply()]
+        self.assertEqual(self.query(), ((0, answer("dated")),))
+        self.assertEqual(len(self.server.audit), 2)
+        self.assertGreaterEqual(self.server.audit[1]["wall_received"], parsedate_to_datetime(date).timestamp() - 0.05)
+
+    def test_retry_exhaustion_is_finite(self):
+        self.load(["always-429"])
+        self.server.scenarios["always-429"] = [Reply(429, b"{}")]
+        sql_error(self, 4216, self.query)
+        self.assertEqual(self.server.counts["always-429"], 4)
+
+    def test_transient_http_statuses_retry_only_failed_rows(self):
+        for status in (500, 502, 503, 504):
+            with self.subTest(status=status):
+                self.cursor.execute("TRUNCATE TABLE inputs")
+                prompt, healthy = f"retry-{status}", f"healthy-{status}"
+                self.load([prompt, healthy])
+                self.server.scenarios[prompt] = [Reply(status, b"not json"), Reply()]
+                self.assertEqual(self.query(), ((0, answer(prompt)), (1, answer(healthy))))
+                self.assertEqual(self.server.counts[prompt], 2)
+                self.assertEqual(self.server.counts[healthy], 1)
+
+    def test_retry_after_cannot_extend_query_deadline(self):
+        self.load(["long-retry"])
+        self.server.scenarios["long-retry"] = [Reply(429, b"{}", {"Retry-After": "60"})]
+        self.cursor.execute("SET ob_query_timeout = 700000")
+        start = time.monotonic()
+        sql_error(self, 4012, self.query)
+        self.assertGreaterEqual(time.monotonic() - start, 0.5)
+        self.assertLess(time.monotonic() - start, 2)
+        self.assertEqual(self.server.counts["long-retry"], 1)
+
+    def test_cancel_during_retry_backoff_and_recover(self):
+        self.load(["cancel-backoff"])
+        self.server.scenarios["cancel-backoff"] = [Reply(429, b"{}", {"Retry-After": "60"})]
+        self.cursor.execute("SET ob_query_timeout = 3000000")
+        outcome = []
+
+        def execute():
+            try:
+                self.query()
+            except Exception as error:
+                outcome.append(error)
+
+        worker = threading.Thread(target=execute, daemon=True)
+        worker.start()
+        self.addCleanup(worker.join, 5)
+        with self.server.condition:
+            self.assertTrue(self.server.condition.wait_for(
+                lambda: bool(self.server.audit) and self.server.audit[0]["response"] is not None, timeout=2))
+        start = time.monotonic()
+        with pymysql.connect(unix_socket=self.sql_socket, user="root", autocommit=True) as control:
+            with control.cursor() as cursor:
+                cursor.execute(f"KILL QUERY {self.connection.thread_id()}")
+        worker.join(1.5)
+        self.assertFalse(worker.is_alive(), "cancellation waited for the retry delay or query timeout")
+        self.assertLess(time.monotonic() - start, 1.5)
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], pymysql.MySQLError)
+        self.assertEqual(outcome[0].args[0], 1317, outcome[0].args)
+        self.assertEqual(self.server.counts["cancel-backoff"], 1)
+        self.cursor.execute("SET ob_query_timeout = 20000000")
+        self.cursor.execute("TRUNCATE TABLE inputs")
+        self.load(["after-cancel"])
+        self.assertEqual(self.query(), ((0, answer("after-cancel")),))
+
+    def test_response_limit_uses_valid_json_at_boundary(self):
+        for size in (RESPONSE_LIMIT - 1, RESPONSE_LIMIT, RESPONSE_LIMIT + 1):
+            with self.subTest(size=size):
+                self.cursor.execute("TRUNCATE TABLE inputs")
+                prompt = f"size-{size}"
+                self.load([prompt])
+                raw = sized_completion(size)
+                self.server.scenarios[prompt] = [Reply(body=raw)]
+                if size > RESPONSE_LIMIT:
+                    sql_error(self, 4019, self.query)
+                else:
+                    expected = json.loads(raw)["choices"][0]["message"]["content"]
+                    self.assertEqual(self.query(), ((0, expected),))
+                self.assertEqual(self.server.counts[prompt], 1)
+
+    def test_batch_response_budget_is_not_just_per_response(self):
+        prompts = [f"budget-{index}" for index in range(9)]
+        self.load(prompts)
+        raw = sized_completion(RESPONSE_LIMIT)
+        for prompt in prompts:
+            self.server.scenarios[prompt] = [Reply(body=raw)]
+        sql_error(self, 4019, self.query)
+        self.assertLessEqual(self.server.peak, WINDOW)
+        self.assertTrue(all(count == 1 for count in self.server.counts.values()))
+
+    def test_serialized_request_limit_counts_escaping(self):
+        self.load(["\x01" * (1024 * 1024)])
+        sql_error(self, 4019, self.query)
+        self.assertFalse(self.server.audit)
+
+    def fail_fast(self, reply, code):
+        prompts = ["fatal"] + [f"held-{index}" for index in range(WINDOW)]
+        self.load(prompts)
+        gate = self.gate()
+        for prompt in prompts[1:]:
+            self.server.scenarios[prompt] = [Reply(gate=gate)]
+        reply.peers = 2
+        self.server.scenarios["fatal"] = [reply]
+        self.cursor.execute("SET ob_query_timeout = 2000000")
+        start = time.monotonic()
+        with self.assertRaises(pymysql.MySQLError) as caught:
+            self.query()
+        elapsed = time.monotonic() - start
+        evidence = f"elapsed={elapsed:.3f}s submitted={len(self.server.audit)} error={caught.exception.args}"
+        self.assertEqual(caught.exception.args[0], code, evidence)
+        self.assertLess(elapsed, 1.5, evidence)
+        self.assertLessEqual(len(self.server.audit), WINDOW)
+        self.assertEqual(self.server.counts["fatal"], 1)
+
+    def test_http_error_stops_refill_without_waiting_for_peers(self):
+        self.fail_fast(Reply(400, b"{}"), 4216)
+
+    def test_provider_error_stops_refill_without_waiting_for_peers(self):
+        self.fail_fast(Reply(body=b'{"unexpected":true}'), 4070)
+
+    def test_json_error_stops_refill_without_waiting_for_peers(self):
+        self.fail_fast(Reply(body=b"[]"), 3140)
+
+    def test_embedding_preserves_vectors_and_retries(self):
+        prompts = ["embedding-retry", "embedding-healthy"]
+        self.load(prompts)
+        vector = [0.125, -0.25, 0.5]
+        raw = json.dumps({"data": [{"index": 0, "embedding": vector}]}).encode()
+        self.server.scenarios[prompts[0]] = [Reply(502, b"{}"), Reply(body=raw)]
+        self.server.scenarios[prompts[1]] = [Reply(body=raw)]
+        results = self.query("AI_EMBED('contract_embed', CAST(prompt AS CHAR), 3)")
+        self.assertEqual(tuple((row, json.loads(value)) for row, value in results), ((0, vector), (1, vector)))
+        self.assertEqual(self.server.counts, Counter({prompts[0]: 2, prompts[1]: 1}))
+        self.assertTrue(all(body["model"] == "mock-embed" and body["dimensions"] == 3
+                            for body in self.server.requests))
+
+    def test_endpoint_credentials_refresh_between_executions(self):
+        self.load(["credential-check"])
+        query = "AI_COMPLETE('contract_model', prompt)"
+        self.assertEqual(self.query(query), ((0, answer("credential-check")),))
+        self.assertEqual(self.server.audit[-1]["headers"]["authorization"], "Bearer contract-test-only")
+        try:
+            self.cursor.execute("CALL DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT(%s, %s)",
+                                ("contract_endpoint", '{"access_key":"rotated-test-only"}'))
+            self.assertEqual(self.query(query), ((0, answer("credential-check")),))
+            self.assertEqual(self.server.audit[-1]["headers"]["authorization"], "Bearer rotated-test-only")
+            self.assertEqual(self.server.counts["credential-check"], 2)
+        finally:
+            self.cursor.execute("CALL DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT(%s, %s)",
+                                ("contract_endpoint", '{"access_key":"contract-test-only"}'))
+
+
+def run_contracts(connection, server, sql_socket):
+    RuntimeContracts.connection = connection
+    RuntimeContracts.server = server
+    RuntimeContracts.sql_socket = sql_socket
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(RuntimeContracts))
+    if not result.wasSuccessful():
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        unittest.main(argv=[sys.argv[0]], defaultTest="HarnessTests", verbosity=2)
+    else:
+        runtime.main(run_contracts)

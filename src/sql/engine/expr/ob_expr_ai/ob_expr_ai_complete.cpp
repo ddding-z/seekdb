@@ -83,9 +83,9 @@ int ObExprAIComplete::calc_result_typeN(ObExprResType &type,
   return ret;
 }
 
-int ObExprAIComplete::eval_ai_complete(const ObExpr &expr, 
-                                       ObEvalCtx &ctx,
-                                       ObDatum &res) 
+int ObExprAIComplete::prepare_input(const ObExpr &expr, ObEvalCtx &ctx,
+                                    MultimodeAlloctor &temp_allocator, ObString &model_id,
+                                    ObString &prompt, ObJsonObject *&config)
 {
   INIT_SUCC(ret);
   ObDatum *arg_model_id = nullptr;
@@ -96,21 +96,9 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("parameters is null", K(ret));
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, parameters is null");
-    res.set_null();
   } else {
-    ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-    
-    MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator());
-    lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(N_AI_COMPLETE));
-    ObAIFuncExprInfo *info = nullptr;
-    ObString model_id = arg_model_id->get_string();
-    ObString prompt;
-    ObJsonObject *config = nullptr;
+    model_id = arg_model_id->get_string();
     ObString config_str;
-    share::ObAiModelEndpointInfo resolved_endpoint;
-    const share::ObAiModelEndpointInfo *endpoint_info = &resolved_endpoint;
-    query::ObIAiEndpointResolver *endpoint_resolver =
-        ::oceanbase::share::server_service<::oceanbase::query::ObIAiEndpointResolver>();
     ObExpr *arg_expr_prompt = expr.args_[1];
     if ( OB_ISNULL(arg_expr_prompt) ) {
       ret = OB_ERR_UNEXPECTED;
@@ -120,7 +108,7 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
       ObJsonObject *prompt_object = nullptr;
       bool is_null = false;
       if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, temp_allocator, PROMPT_IDX, j_base, is_null))) {
-      } else if (j_base->json_type() != ObJsonNodeType::J_OBJECT) {
+      } else if (nullptr == j_base || j_base->json_type() != ObJsonNodeType::J_OBJECT) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("j_base is not json object", K(ret));
       } else if (OB_FALSE_IT(prompt_object = static_cast<ObJsonObject *>(j_base))) {
@@ -128,7 +116,6 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("prompt is not valid", K(ret));
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "prompt is not valid");
-        res.set_null();
       } else if (!ObAIFuncJsonUtils::ob_is_json_array_all_str(static_cast<ObJsonArray *>(prompt_object->get_value(ObAIFuncPromptObjectUtils::prompt_args_key)))) {
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("prompt object is not support", K(ret));
@@ -150,24 +137,114 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("model id or input is empty", K(ret));
       LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, model id or input is empty");
-      res.set_null();
     }
+  }
+  return ret;
+}
 
-    if (OB_FAIL(ret)){
-    } else if (OB_FAIL(ObAIFuncUtils::get_ai_func_info(temp_allocator, model_id, info))) {
-    } else if (OB_ISNULL(endpoint_resolver)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("AI endpoint resolver is unavailable", K(ret));
-    } else if (OB_FAIL(endpoint_resolver->resolve_by_model_name(
-                   model_id, temp_allocator, resolved_endpoint))) {
+int ObExprAIComplete::eval_ai_complete(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res)
+{
+  int ret = OB_SUCCESS;
+  ObEvalCtx::TempAllocGuard guard(ctx);
+  MultimodeAlloctor allocator(guard.get_allocator());
+  lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(N_AI_COMPLETE));
+  ObString model_id;
+  ObString prompt;
+  ObJsonObject *config = nullptr;
+  ObAIFuncExprInfo *info = nullptr;
+  share::ObAiModelEndpointInfo endpoint;
+  auto *resolver = share::server_service<query::ObIAiEndpointResolver>();
+  if (OB_FAIL(prepare_input(expr, ctx, allocator, model_id, prompt, config))) {
+  } else if (OB_FAIL(ctx.exec_ctx_.check_status())) {
+  } else if (OB_FAIL(ObAIFuncUtils::get_ai_func_info(allocator, model_id, info))) {
+  } else if (OB_ISNULL(resolver)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(resolver->resolve_by_model_name(model_id, allocator, endpoint))) {
+  } else {
+    ObAIFuncModel model(allocator, *info, endpoint);
+    ObString result;
+    if (OB_FAIL(model.call_completion(prompt, config, result))) {
+    } else if (OB_FAIL(ObAIFuncUtils::set_string_result(expr, ctx, res, result))) {
+    }
+  }
+  if (OB_FAIL(ret)) {
+    res.set_null();
+  }
+  return ret;
+}
+
+int ObExprAIComplete::eval_ai_complete_batch(const ObExpr &expr, ObEvalCtx &ctx,
+                                            const ObBitVector &skip, const int64_t size)
+{
+  if (ctx.exec_ctx_.get_my_session()->is_diagnosis_enabled()) {
+    return expr_default_eval_batch_func(expr, ctx, skip, size);
+  }
+  int ret = OB_SUCCESS;
+  ObBitVector &evaluated = expr.get_evaluated_flags(ctx);
+  ObDatumVector output = expr.locate_expr_datumvector(ctx);
+  ObEvalCtx::BatchInfoScopeGuard batch_guard(ctx);
+  batch_guard.set_batch_size(size);
+  const int64_t start_ts = ObTimeUtility::current_time();
+  int64_t requested_rows = 0;
+  int64_t prepare_us = 0;
+  int64_t fill_us = 0;
+  ObEvalCtx::TempAllocGuard guard(ctx);
+  MultimodeAlloctor allocator(guard.get_allocator());
+  ObArray<ObString> prompts;
+  ObArray<int64_t> rows;
+  ObArray<ObString> results;
+  ObString model_id;
+  ObJsonObject *config = nullptr;
+  int64_t prompt_bytes = 0;
+  for (int64_t row = 0; OB_SUCC(ret) && row < size; ++row) {
+    if (skip.at(row) || evaluated.at(row)) {
+      continue;
+    }
+    batch_guard.set_batch_idx(row);
+    ObString prompt;
+    if (OB_FAIL(ctx.exec_ctx_.check_status())) {
+    } else if (OB_FAIL(prepare_input(expr, ctx, allocator, model_id, prompt, config))) {
+    } else if (prompt.length() > ObAIFuncClient::MAX_REQUEST_BYTES ||
+               prompt_bytes > ObAIFuncClient::MAX_BATCH_BYTES - prompt.length()) {
+      ret = OB_SIZE_OVERFLOW;
+    } else if (OB_FAIL(prompts.push_back(prompt))) {
+    } else if (OB_FAIL(rows.push_back(row))) {
     } else {
-      ObAIFuncModel model(temp_allocator, *info, *endpoint_info);
-      ObString result;
-      if (OB_FAIL(model.call_completion(prompt, config, result))) {
-      } else if (OB_FAIL(ObAIFuncUtils::set_string_result(expr, ctx, res, result))) {
+      prompt_bytes += prompt.length();
+    }
+  }
+  if (OB_SUCC(ret) && !rows.empty()) {
+    ObAIFuncExprInfo *info = nullptr;
+    share::ObAiModelEndpointInfo endpoint;
+    auto *resolver = share::server_service<query::ObIAiEndpointResolver>();
+    if (OB_FAIL(ObAIFuncUtils::get_ai_func_info(allocator, model_id, info))) {
+    } else if (OB_ISNULL(resolver)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(resolver->resolve_by_model_name(model_id, allocator, endpoint))) {
+    } else {
+      ObAIFuncModel model(allocator, *info, endpoint);
+      prepare_us = ObTimeUtility::current_time() - start_ts;
+      requested_rows = rows.count();
+      if (OB_FAIL(model.call_completion_vector(prompts, config, results))) {
+      } else if (results.count() != rows.count()) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        const int64_t fill_start = ObTimeUtility::current_time();
+        for (int64_t index = 0; OB_SUCC(ret) && index < rows.count(); ++index) {
+          const int64_t row = rows.at(index);
+          batch_guard.set_batch_idx(row);
+          if (OB_FAIL(ObAIFuncUtils::set_string_result(expr, ctx, *output.at(row), results.at(index)))) {
+          } else {
+            evaluated.set(row);
+          }
+        }
+        fill_us = ObTimeUtility::current_time() - fill_start;
       }
     }
   }
+  const int64_t wall_us = ObTimeUtility::current_time() - start_ts;
+  LOG_TRACE("AI_COMPLETE batch evaluation", K(ret), K(size), K(requested_rows),
+            K(prepare_us), K(fill_us), K(wall_us));
   return ret;
 }
 
@@ -206,6 +283,11 @@ int ObExprAIComplete::cg_expr(ObExprCGCtx &expr_cg_ctx,
 
   if (OB_SUCC(ret)) {
     rt_expr.eval_func_ = ObExprAIComplete::eval_ai_complete;
+    if (raw_expr.get_param_expr(MODEL_IDX)->is_static_scalar_const_expr() &&
+        (raw_expr.get_param_count() == 2 ||
+         raw_expr.get_param_expr(CONFIG_IDX)->is_static_scalar_const_expr())) {
+      rt_expr.eval_batch_func_ = ObExprAIComplete::eval_ai_complete_batch;
+    }
   }
   return ret;
 }
