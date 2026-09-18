@@ -16,7 +16,6 @@ import pymysql
 import test_runtime as runtime
 
 
-WINDOW = 50
 RESPONSE_LIMIT = 8 * 1024 * 1024
 
 
@@ -242,19 +241,17 @@ class RuntimeContracts(unittest.TestCase):
         self.gates.append(gate)
         return gate
 
-    def test_default_window_limits_active_requests(self):
-        prompts = [f"parallel-{index}" for index in range(WINDOW + 1)]
+    def test_default_parallelism_matches_batch_size(self):
+        prompts = [f"parallel-{index}" for index in range(72)]
         self.load(prompts)
         gate = self.gate()
-        first_gate = self.gate()
         for prompt in prompts:
             self.server.scenarios[prompt] = [Reply(gate=gate)]
-        self.server.scenarios[prompts[0]] = [Reply(gate=first_gate)]
         outcome = []
 
         def execute():
             try:
-                self.cursor.execute("SELECT /*+ OPT_PARAM('rowsets_max_rows', 64) */ "
+                self.cursor.execute("SELECT /*+ OPT_PARAM('rowsets_max_rows', 128) */ "
                                     "id, AI_COMPLETE('contract_model', prompt) FROM inputs ORDER BY id")
                 outcome.append(self.cursor.fetchall())
             except Exception as error:
@@ -265,25 +262,18 @@ class RuntimeContracts(unittest.TestCase):
         try:
             with self.server.condition:
                 self.assertTrue(self.server.condition.wait_for(
-                    lambda: len(self.server.audit) >= WINDOW, timeout=3),
-                    "default window did not start 50 requests")
-                self.assertFalse(self.server.condition.wait_for(
-                    lambda: len(self.server.audit) > WINDOW, timeout=0.2),
-                    "request 51 started while all 50 slots were occupied")
-                first_gate.set()
-                self.assertTrue(self.server.condition.wait_for(
                     lambda: len(self.server.audit) == len(prompts), timeout=3),
-                    "the released slot was not refilled")
+                    f"only {len(self.server.audit)} of {len(prompts)} requests reached the server before a response")
+                self.assertTrue(all(record["response"] is None for record in self.server.audit))
         finally:
-            first_gate.set()
             gate.set()
             worker.join(5)
         self.assertFalse(worker.is_alive())
         self.assertEqual(outcome, [tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))])
         self.assertEqual(self.server.counts, Counter(prompts))
-        self.assertEqual(self.server.peak, WINDOW)
+        self.assertEqual(self.server.peak, len(prompts))
 
-    def test_window_refills_across_preparation_boundary(self):
+    def test_submission_crosses_preparation_boundary(self):
         prompts = [f"window-{index}" for index in range(64)]
         self.load(prompts)
         gate = self.gate()
@@ -309,7 +299,7 @@ class RuntimeContracts(unittest.TestCase):
         self.assertTrue(progressed, "an unfinished request blocked submission beyond the first 32 rows")
         self.assertEqual(outcome, [tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))])
         self.assertEqual(self.server.counts, Counter(prompts))
-        self.assertLessEqual(self.server.peak, WINDOW)
+        self.assertLessEqual(self.server.peak, len(prompts))
 
     def test_large_batch_preserves_all_rows(self):
         prompts = [f"large-{index}" for index in range(2048)]
@@ -319,7 +309,7 @@ class RuntimeContracts(unittest.TestCase):
                             "id, AI_COMPLETE('contract_model', prompt) FROM inputs ORDER BY id")
         self.assertEqual(self.cursor.fetchall(), tuple((index, answer(prompt)) for index, prompt in enumerate(prompts)))
         self.assertEqual(self.server.counts, Counter(prompts))
-        self.assertLessEqual(self.server.peak, WINDOW)
+        self.assertLessEqual(self.server.peak, len(prompts))
 
     def test_duplicate_inputs_are_not_deduplicated(self):
         prompts = ["duplicate"] * 17
@@ -512,7 +502,7 @@ class RuntimeContracts(unittest.TestCase):
         for prompt in prompts:
             self.server.scenarios[prompt] = [Reply(body=raw)]
         sql_error(self, 4019, self.query)
-        self.assertLessEqual(self.server.peak, WINDOW)
+        self.assertLessEqual(self.server.peak, len(prompts))
         self.assertTrue(all(count == 1 for count in self.server.counts.values()))
 
     def test_serialized_request_limit_counts_escaping(self):
@@ -521,7 +511,7 @@ class RuntimeContracts(unittest.TestCase):
         self.assertFalse(self.server.audit)
 
     def fail_fast(self, reply, code):
-        prompts = ["fatal"] + [f"held-{index}" for index in range(WINDOW)]
+        prompts = ["fatal"] + [f"held-{index}" for index in range(71)]
         self.load(prompts)
         gate = self.gate()
         for prompt in prompts[1:]:
@@ -536,16 +526,17 @@ class RuntimeContracts(unittest.TestCase):
         evidence = f"elapsed={elapsed:.3f}s submitted={len(self.server.audit)} error={caught.exception.args}"
         self.assertEqual(caught.exception.args[0], code, evidence)
         self.assertLess(elapsed, 1.5, evidence)
-        self.assertLessEqual(len(self.server.audit), WINDOW)
+        self.assertLessEqual(len(self.server.audit), len(prompts))
+        self.assertTrue(all(count == 1 for count in self.server.counts.values()))
         self.assertEqual(self.server.counts["fatal"], 1)
 
-    def test_http_error_stops_refill_without_waiting_for_peers(self):
+    def test_http_error_cancels_active_peers(self):
         self.fail_fast(Reply(400, b"{}"), 4216)
 
-    def test_provider_error_stops_refill_without_waiting_for_peers(self):
+    def test_provider_error_cancels_active_peers(self):
         self.fail_fast(Reply(body=b'{"unexpected":true}'), 4070)
 
-    def test_json_error_stops_refill_without_waiting_for_peers(self):
+    def test_json_error_cancels_active_peers(self):
         self.fail_fast(Reply(body=b"[]"), 3140)
 
     def test_embedding_preserves_vectors_and_retries(self):

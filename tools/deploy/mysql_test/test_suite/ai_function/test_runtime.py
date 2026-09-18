@@ -143,7 +143,7 @@ def run_checks(connection, server, socket):
         batch_bodies = {body["messages"][-1]["content"]: body for body in server.requests}
         assert batch == tuple((index, 'reply:"' + prompt + '"\n')
                               for index, prompt in enumerate(prompts)), batch
-        assert 1 < server.peak <= 50, ("not bounded/concurrent", server.peak)
+        assert 1 < server.peak <= len(prompts), ("not batch-bounded/concurrent", server.peak)
         assert server.finished != prompts, "mock did not reorder responses"
         assert server.finished.index("row-8") < server.finished.index("row-0"), server.finished
         assert server.counts == Counter(prompts)
@@ -161,8 +161,8 @@ def run_checks(connection, server, socket):
         assert chunk_result == tuple((index, 'reply:"' + prompt + '"\n')
                          for index, prompt in enumerate(chunk_prompts))
         assert server.counts == Counter(chunk_prompts)
-        assert 1 < server.peak <= 50
-        print("PASS window refill across the SQL batch", flush=True)
+        assert 1 < server.peak <= len(chunk_prompts)
+        print("PASS whole-batch submission and aligned results", flush=True)
 
         for prompt in ("retry", "retry-date", "retry-503"):
             load([prompt] + prompts[:12])
@@ -218,21 +218,23 @@ def run_checks(connection, server, socket):
         print("PASS permanent/parse/provider/size errors and recovery", flush=True)
 
         for prompt in ("slow", "rate-limit"):
-            load([prompt] * 72)
+            timeout_prompts = [prompt] * 72
+            load(timeout_prompts)
             cursor.execute("SET ob_query_timeout = 700000")
             start = time.monotonic()
             expect_error(code=4012)
             assert 0.5 <= time.monotonic() - start < 2
-            assert server.peak <= 50
+            assert server.peak <= len(timeout_prompts)
             submitted = len(server.requests)
-            assert 0 < submitted <= (50 if prompt == "slow" else 72)
+            assert 0 < submitted <= len(timeout_prompts)
             with server.condition:
                 assert server.condition.wait_for(lambda: server.active == 0, timeout=5)
                 assert len(server.requests) == submitted
             cursor.execute("SET ob_query_timeout = 30000000")
         print("PASS deadline covers active requests and retry queue", flush=True)
 
-        load(["slow-cancel"] * 72)
+        cancel_prompts = ["slow-cancel"] * 72
+        load(cancel_prompts)
         errors = []
         def cancel_query():
             try:
@@ -249,8 +251,8 @@ def run_checks(connection, server, socket):
         worker.join(3)
         assert not worker.is_alive() and errors, errors
         assert errors[0].args[0] == 1317, errors[0].args
-        assert len(server.requests) <= 50
-        print("PASS query cancellation stops refill", flush=True)
+        assert 0 < len(server.requests) <= len(cancel_prompts)
+        print("PASS query cancellation aborts the active batch", flush=True)
 
 
 def main(checks=run_checks, *, live=False, server_env=None, sql_timeout=40, description=__doc__):

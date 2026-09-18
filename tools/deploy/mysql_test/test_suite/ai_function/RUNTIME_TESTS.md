@@ -11,7 +11,7 @@ Requires Linux, Python 3, PyMySQL and a runnable seekdb binary with its runtime 
 
 The script creates a private temporary database directory, starts seekdb with TCP SQL and RPC disabled, and runs a loopback-only HTTP mock on a random port. It does not connect to an existing database or a real model. The database process and temporary data are cleaned up on exit; the model access key is a dummy test value. No global proxy settings are changed.
 
-Assertions cover request/output equivalence, bounded concurrency, window refill across the SQL batch, reordered completion, per-request retry, constant/dynamic parameters, CASE skips, repeated expressions, NULL/JSON/LOB behavior, malformed responses, size limits, deadline and query cancellation. Timing compares identical mocked work through batch and scalar paths. Reported process CPU and peak RSS include database bootstrap and the whole suite, not a per-query resource comparison.
+Assertions cover request/output equivalence, batch-sized concurrency, whole-batch submission, reordered completion, per-request retry, constant/dynamic parameters, CASE skips, repeated expressions, NULL/JSON/LOB behavior, malformed responses, size limits, deadline and query cancellation. Timing compares identical mocked work through batch and scalar paths. Reported process CPU and peak RSS include database bootstrap and the whole suite, not a per-query resource comparison.
 
 Allocation failure, low-level `no_wait` lifetime checks, other AI functions/providers and detailed resource comparisons remain separate verification work. This standalone script is not registered in the mysqltest `.test` runner.
 
@@ -34,8 +34,8 @@ Expected behavior comes from the execution plan, SQL evaluation boundaries, HTTP
 | Area | Independent expectation | Defect the case can expose |
 | --- | --- | --- |
 | Input preservation | Explicit model, one user message per row, unchanged options, exact independent result | Both scalar and batch making the same wrong request |
-| Default window | Hold 51 responses; exactly 50 requests may be active, and the 51st starts only after one slot is released | An unchanged default of 8, unbounded submission or failure to refill |
-| Continuous window | Hold the first response until at least 33 requests arrive; all 64 results remain aligned, with peak activity at most 50 | A fixed preparation boundary idling available concurrency |
+| Default parallelism | Hold all 72 responses with plan batch size 128; all 72 requests must arrive before any response is released | A leftover fixed 50/64-request limit or waiting for responses before submitting the rest of the batch |
+| Whole-batch submission | Hold the first response until at least 33 requests arrive; all 64 results remain aligned, with no duplicate submissions | A fixed preparation boundary blocking later requests |
 | Large batch | 2048 rows with `OPT_PARAM('rowsets_max_rows', 2048)`, exact outputs and one request per row | A leftover 1024-request limit, missing rows or duplicate submissions |
 | Logical row set | Duplicate prompts still sent per row; CASE skips invalid unselected inputs; LIMIT 0/3 sends only needed rows in the tested plan | Hidden deduplication or unnecessary remote work |
 | Strings | Exact Unicode, NUL, quotes, backslash and newline round trip | Truncation, encoding or double escaping |
@@ -44,7 +44,7 @@ Expected behavior comes from the execution plan, SQL evaluation boundaries, HTTP
 | Retry-After | Second attempt after advertised four-second delay or absolute HTTP-date | Merely seeing two requests even when the header is ignored |
 | Retry policy | Temporary 429/500/502/503/504 retry; successful rows once; maximum four attempts | Whole-batch retries or infinite attempts |
 | Uncertain POST result | Mock reads the request then drops/truncates response; no retry | Duplicate model execution after uncertain transport failure |
-| Fail-fast | Fatal HTTP, JSON and provider errors must return before held peers' deadline and stop refill | Deferred validation hidden by other requests' timeout |
+| Fail-fast | Fatal HTTP, JSON and provider errors must return before held peers' deadline and cancel remaining local transfers; submitted requests need not stop remotely | Deferred validation hidden by other requests' timeout |
 | Byte limits | Valid response JSON at 8MiB minus one, exactly 8MiB and plus one; nine individually valid large responses exceed 64MiB total | Oversize fixture failing only because it was invalid JSON, or per-response-only accounting |
 | Serialized request | 1MiB control-character input expands above 4MiB when JSON escaped | Checking prompt character length instead of request bytes |
 | Deadline/cancel | Long Retry-After cannot extend query deadline; cancel during backoff returns 1317 promptly and next query succeeds | Ignoring cancel while no transfer is active |
@@ -53,7 +53,7 @@ Expected behavior comes from the execution plan, SQL evaluation boundaries, HTTP
 
 Four fixture self-tests check exact valid-JSON byte lengths, scripted HTTP responses, case-insensitive header names, and negative controls: wrong SQL codes and unexpected success must fail. Threading events hold peer responses for fail-fast tests; no arbitrary sleep is used to infer their completion. Retry timing assertions allow 50ms scheduling/measurement tolerance. HTTP-date tests assume the local wall clock is not stepped during the run.
 
-The default window (50), retry count (3 retries), and byte limits are versioned first-stage policy values. They are deliberately not imported from the implementation under test; an intentional policy change requires updating the specification and these expectations together. Timing ratios in the smoke benchmark are not semantic correctness gates. LIMIT and reused-expression checks demonstrate the concrete tested query shapes, not every possible optimizer plan. This suite does not prove constant total process memory, exactly-once remote execution, or absence of resource leaks.
+The default batch-sized concurrency, retry count (3 retries), and byte limits are versioned first-stage policies. They are deliberately not imported from the implementation under test; an intentional policy change requires updating the specification and these expectations together. Timing ratios in the smoke benchmark are not semantic correctness gates. LIMIT and reused-expression checks demonstrate the concrete tested query shapes, not every possible optimizer plan. This suite does not prove constant total process memory, exactly-once remote execution, or absence of resource leaks.
 
 ### Results: 2026-09-17
 
@@ -72,7 +72,7 @@ Remaining gaps: allocator fault injection, low-level `no_wait` cleanup, leak/san
 
 ### Whole-Batch Scheduling: 2026-09-17
 
-AI_COMPLETE prepares all eligible rows in the current SQL batch and submits them through one client window, following Sema's whole-batch queueing approach. The former 32-row preparation barriers are removed. The HTTP window was 8 at this stage and was subsequently raised to 50 as recorded below; this is not 2048 concurrent requests, prompt batching, lazy request preparation or cross-batch asynchronous execution.
+AI_COMPLETE prepares all eligible rows in the current SQL batch and submits them through one client window, following Sema's whole-batch queueing approach. The former 32-row preparation barriers are removed. The HTTP window was 8 at this stage and was subsequently raised to 50, then changed to batch-sized concurrency as recorded below. At this stage, 2048 input rows did not mean 2048 concurrent requests. These changes do not introduce prompt batching, lazy request preparation or cross-batch asynchronous execution.
 
 The fixed 1024-request limit has been replaced with byte-budgeted request state. The 64MiB client budget includes `sizeof(Request)` per request, serialized bodies and retained raw responses. SQL preparation also rejects aggregate prompt bytes above 64MiB. Per-request 4MiB and per-response 8MiB limits are unchanged. JSON trees, allocator capacity and curl internals are not included, so this is not an RSS hard cap.
 
@@ -89,11 +89,25 @@ The latest 24-row mock comparison was batch 0.971s versus scalar 6.102s. The dat
 
 ### Default Window Raised to 50: 2026-09-17
 
-The client now defaults to 50 active requests. The configurable range remains 1-64; retry, deadline, byte limits and connection-pool lifetime are unchanged. This is a per-client request limit, not a curl connection limit or database-wide quota.
+At this stage, the client default was raised to 50 active requests and the configurable range remained 1-64; retry, deadline, byte limits and connection-pool lifetime were unchanged. This was a per-client request limit, not a curl connection limit or database-wide quota.
 
 The new gate test starts 51 logical inputs, holds all responses, observes 50 active requests with the 51st still queued, then releases one response and requires the queued request to start. Existing fail-fast and cancellation inputs exceed the new window so those tests still exercise pending requests.
 
 Debug build and editor diagnostics passed. Eight focused SQL contracts passed (12.820s): the default window, continuous refill, 2048 rows, aggregate response budget, fatal HTTP/JSON errors, retry deadline and cancellation recovery. The smoke suite also passed. The full contract suite, the known provider fail-fast failure and connection-reuse tests were not rerun for this default-value change. No real model service was called.
+
+### Default Parallelism Follows the Batch: 2026-09-18
+
+The client now defaults to `max_parallel_ = 0`, meaning the effective activity limit is recalculated from the current HTTP batch's request count. Every eligible initial request is added to curl multi without waiting for another request to finish. For AI_COMPLETE, skipped/already-evaluated rows are excluded; scalar calls and dynamic-parameter fallback still submit one request at a time. The C++ setter accepts zero for this default policy or a positive explicit limit; negative values are rejected, and the former fixed 64 ceiling is removed. No SQL system variable is added.
+
+This delegates inference admission and queueing to the service rather than a fixed seekdb window. It does not guarantee simultaneous arrival or inference: network, protocol and provider capacity still apply. Retry backoff remains client-side, and service queueing consumes the existing query deadline. There is no database-wide quota; connection/handle memory and remote work can grow with the batch size. The 4MiB request, 8MiB response and 64MiB aggregate budgets remain unchanged and do not include curl internals. Local cancellation cannot retract requests already accepted remotely. The SQL worker still waits for the whole batch.
+
+- The new 72-request response gate failed against the prior binary with only 50/72 requests received, then passed against the rebuilt binary with all 72 requests received before any response.
+- Debug build passed; both Python test files passed Pylance syntax checks. Four fixture self-tests passed.
+- Full SQL contract suite: 29 tests, 28 passed, 1 failed (78.077s), including passing 2048-row, aggregate-budget, HTTP/JSON fail-fast, retry and cancellation cases.
+- The only failure remains `test_provider_error_cancels_active_peers`: timeout 4012 after 2.007s with 72 requests submitted, instead of provider error 4070 before 1.5s. The error-code and latency assertions are unchanged; the suite still exits with status 1.
+- Smoke suite passed. The 24-row mock comparison was batch 0.828s versus scalar 6.101s; database CPU including bootstrap and the suite was 18.67s, peak RSS 367056KiB. This is not a real-provider benchmark or proof of a speedup over the prior 50-request policy.
+
+No real model service, existing debug database or Notebook was used or modified for these tests. Explicit positive client limits and low-level `no_wait` lifetime behavior were not independently exercised.
 
 ## Real Model Service Tests
 

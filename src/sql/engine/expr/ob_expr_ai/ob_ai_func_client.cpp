@@ -55,7 +55,7 @@ struct ObAIFuncClient::Request
 ObAIFuncClient::ObAIFuncClient()
   : allocator_(nullptr), url_(nullptr), header_list_(nullptr), curlm_(nullptr),
     requests_(), is_finished_(false), max_retry_times_(3), abs_timeout_ts_(0),
-    timeout_sec_(60), max_parallel_(50), active_count_(0), completed_count_(0),
+    timeout_sec_(60), max_parallel_(0), active_count_(0), completed_count_(0),
     batch_ret_(OB_SUCCESS), status_checker_(nullptr), status_context_(nullptr),
     batch_start_ts_(0), attempts_(0), retries_(0), peak_active_(0),
     buffered_bytes_(0), received_bytes_(0), submitted_bytes_(0)
@@ -107,7 +107,7 @@ int ObAIFuncClient::init(ObIAllocator &allocator, const ObString &url, ObArray<O
 {
   int ret = OB_SUCCESS;
   reset();
-  if (url.empty() || headers.empty() || max_parallel_ < 1 || max_parallel_ > 64 || timeout_sec_ <= 0) {
+  if (url.empty() || headers.empty() || max_parallel_ < 0 || timeout_sec_ <= 0) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     allocator_ = &allocator;
@@ -394,7 +394,8 @@ int ObAIFuncClient::advance_batch()
       }
     }
   }
-  for (int64_t index = 0; OB_SUCC(ret) && active_count_ < max_parallel_ && index < requests_.count(); ++index) {
+  const int64_t max_parallel = max_parallel_ == 0 ? requests_.count() : max_parallel_;
+  for (int64_t index = 0; OB_SUCC(ret) && active_count_ < max_parallel && index < requests_.count(); ++index) {
     Request &request = *requests_.at(index);
     if (!request.active_ && !request.done_ && request.retry_at_ <= ObTimeUtility::current_time()) {
       ret = start_request(request);
