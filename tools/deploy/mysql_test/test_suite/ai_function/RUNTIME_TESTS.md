@@ -1,6 +1,6 @@
 # AI Function Runtime Regression
 
-Latest validation (2026-09-18): all 43 SQL contracts and the smoke suite passed after adding [constrained output](#constrained-output). Earlier failures below are retained as historical evidence.
+Latest validation (2026-09-20): all **62 SQL contracts**, including **19 embedding cases**, and the [resource reliability tests](#resource-reliability-tests) passed after implementing [native embedding batches](#native-embedding-batches). The earlier smoke, constrained-output and resource-only results are retained below as historical evidence.
 
 Run from the repository root after a Debug build:
 
@@ -15,7 +15,7 @@ The script creates a private temporary database directory, starts seekdb with TC
 
 Assertions cover request/output equivalence, batch-sized concurrency, whole-batch submission, reordered completion, per-request retry, constant/dynamic parameters, CASE skips, repeated expressions, NULL/JSON/LOB behavior, malformed responses, size limits, deadline and query cancellation. Timing compares identical mocked work through batch and scalar paths. Reported process CPU and peak RSS include database bootstrap and the whole suite, not a per-query resource comparison.
 
-Allocation failure, low-level `no_wait` lifetime checks, other AI functions/providers and detailed resource comparisons remain separate verification work. This standalone script is not registered in the mysqltest `.test` runner.
+Client-owned allocation failures and low-level `no_wait` lifetime checks are covered by the resource tests below. Whole-heap sanitizer coverage, AI_RERANK, real embedding providers and detailed resource comparisons remain separate verification work. These standalone scripts are not registered in the mysqltest `.test` runner.
 
 ## Independent Contract Tests
 
@@ -54,10 +54,14 @@ Expected behavior comes from the execution plan, SQL evaluation boundaries, HTTP
 | Byte limits | Valid response JSON at 8MiB minus one, exactly 8MiB and plus one; nine individually valid large responses exceed 64MiB total | Oversize fixture failing only because it was invalid JSON, or per-response-only accounting |
 | Serialized request | 1MiB control-character input expands above 4MiB when JSON escaped | Checking prompt character length instead of request bytes |
 | Deadline/cancel | Long Retry-After cannot extend query deadline; cancel during backoff returns 1317 promptly and next query succeeds | Ignoring cancel while no transfer is active |
-| Shared client | Known embedding vector and dimensions survive a 502 retry | Completion-only tests missing embedding regressions |
+| Resource recovery | 12 rounds each of cancel, provider error and Schema error, with eight held requests; model socket FDs disappear before peers are released and the same SQL connection recovers | Local transfers or connections retained after errors, unexpected retries, or state leaking into the next query |
+| Native embedding | 74 eligible rows, including duplicates and Unicode/NUL, form one HTTP request; indexed responses arrive reversed and return distinct known vectors in SQL row order | Accidental scalar requests, deduplication, nested output arrays or wrong row mapping |
+| Embedding splitting | Raw texts fit 4MiB but JSON escaping does not; two native subrequests are formed, only the failing one retries | Raw-byte-only sizing, unnecessarily splitting every row or retrying successful subrequests |
+| Embedding validation | Exact counts, unique in-range integer indices, nonempty finite numeric vectors and consistent/requested dimensions; malformed response cancels a held subrequest | Unsafe casts, ignored indices, dimension drift or late validation |
+| Shared client | Dynamic-model scalar embedding preserves vectors/dimensions and 502 retry; native requests preserve deadline, cancellation and socket cleanup | Native batching breaking fallback or resource ownership |
 | Credentials | Endpoint key rotation applies to the same SQL on next execution | Stale credentials retained across executions |
 
-Four fixture self-tests check exact valid-JSON byte lengths, scripted HTTP responses, case-insensitive header names, and negative controls: wrong SQL codes and unexpected success must fail. Threading events hold peer responses for fail-fast tests; no arbitrary sleep is used to infer their completion. Retry timing assertions allow 50ms scheduling/measurement tolerance. HTTP-date tests assume the local wall clock is not stepped during the run.
+Five fixture self-tests check exact valid-JSON byte lengths, scripted HTTP responses, case-insensitive header names, independently specified reordered embedding vectors, and negative controls: wrong SQL codes and unexpected success must fail. Threading events hold peer responses for fail-fast tests; no arbitrary sleep is used to infer their completion. Retry timing assertions allow 50ms scheduling/measurement tolerance. HTTP-date tests assume the local wall clock is not stepped during the run.
 
 The default batch-sized concurrency, retry count (3 retries), and byte limits are versioned first-stage policies. They are deliberately not imported from the implementation under test; an intentional policy change requires updating the specification and these expectations together. Timing ratios in the smoke benchmark are not semantic correctness gates. LIMIT and reused-expression checks demonstrate the concrete tested query shapes, not every possible optimizer plan. This suite does not prove constant total process memory, exactly-once remote execution, or absence of resource leaks.
 
@@ -74,7 +78,7 @@ The cause was provider parsing in [call_completion_vector](../../../../../src/sq
 
 An earlier apparent LIMIT failure was traced to late requests from a prior case entering shared mock counters. Per-case ports and joined request threads removed that test-fixture defect without weakening the LIMIT assertion.
 
-Remaining gaps: allocator fault injection, low-level `no_wait` cleanup, leak/sanitizer evidence, DNS/connection failure, diagnosis mode, denied-access/multi-tenant isolation, AI_RERANK and non-OpenAI providers, and per-query CPU/RSS/tail-latency comparisons. The embedding case is a focused regression, not full embedding coverage. These are not reported as passed.
+Remaining gaps at that time included allocator fault injection, low-level `no_wait` cleanup, leak/sanitizer evidence, DNS/connection failure, diagnosis mode, denied-access/multi-tenant isolation, AI_RERANK and non-OpenAI providers, and per-query CPU/RSS/tail-latency comparisons. The later resource tests below cover bounded allocator/cleanup cases, not all of these gaps. The embedding case is a focused regression, not full embedding coverage.
 
 ### Whole-Batch Scheduling: 2026-09-17
 
@@ -113,7 +117,83 @@ This delegates inference admission and queueing to the service rather than a fix
 - At this stage the only failure remained `test_provider_error_cancels_active_peers`: timeout 4012 after 2.007s with 72 requests submitted, instead of provider error 4070 before 1.5s. The error-code and latency assertions were unchanged; that run exited with status 1.
 - Smoke suite passed. The 24-row mock comparison was batch 0.828s versus scalar 6.101s; database CPU including bootstrap and the suite was 18.67s, peak RSS 367056KiB. This is not a real-provider benchmark or proof of a speedup over the prior 50-request policy.
 
-No real model service, existing debug database or Notebook was used or modified for these tests. Explicit positive client limits and low-level `no_wait` lifetime behavior were not independently exercised.
+No real model service, existing debug database or Notebook was used or modified for these tests. At that stage, explicit positive client limits and low-level `no_wait` lifetime behavior were not independently exercised.
+
+## Resource Reliability Tests
+
+[test_runtime_resources.py](test_runtime_resources.py) builds and runs [test_runtime_resources.cpp](test_runtime_resources.cpp) against the existing Linux Debug Bazel objects. It compiles only the test entry point, queries the actual final-link action as JSON, and replaces the server entry point in a temporary test executable. The production binary is not overwritten. Rebuild Debug and refresh `compile_commands.json` after production changes before running this test; the runner does not rebuild stale production objects.
+
+```bash
+# Requires the existing Debug build, compile_commands.json and its compiler/runtime environment.
+python tools/deploy/mysql_test/test_suite/ai_function/test_runtime_resources.py \
+  --build-dir "$PWD/build_debug"
+
+# Includes the real SQL process/socket lifecycle checks.
+python tools/deploy/mysql_test/test_suite/ai_function/test_runtime_contracts.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+```
+
+In this workspace, source `.vscode/seekdb-env.sh` and use `/volume/xicksys/.venv/bin/python`. The native runner uses a loopback mock and temporary build directory, without starting a database. The SQL runner starts its own temporary database as described above. Neither uses a real model service or the existing debug instance.
+
+### Failure Injection And Ownership
+
+The native test calls the production client with a tracking allocator and link-time wrappers around curl resource APIs. Except for the selected injected failure, curl calls execute the real implementation. No production fault switch or alternate client implementation is added.
+
+| Check | Required result |
+| --- | --- |
+| URL and two header-copy allocation sites | Return the allocation error; repeated reset and destruction release all client-owned allocations; subsequent initialization succeeds |
+| Every reachable request-preparation allocation | Fail each allocation in turn until a successful preparation is reached; six failure sites for the three-row fixture; no residual request memory or handles |
+| Eight curl faults | First/second header append, multi creation, first/second request-handle creation, second handle attachment, perform and poll failures return the expected error and roll back resources |
+| Response buffer allocation | Propagate allocation failure, expose no partial results and release peer requests and buffers |
+| `no_wait` lifetime | 32 cancellation cycles with an explicit window of two for three rows; pending reads return EAGAIN, queued work stays unsubmitted, repeated cleanup is safe |
+| Reinitialization/destruction while pending | Release the old allocator's resources when switching allocators, and detach/clean requests before destroying their multi handle |
+| Failure followed by success | 16 cycles complete actual loopback requests using the same client after a failed preparation; returned JSON remains valid after client destruction because the caller still owns its allocator |
+| Detector negative controls | Deliberately omit one allocation release or one request-handle cleanup in separate test processes; each must fail with its specific leak diagnostic |
+
+Request memory is compared with the post-initialization baseline before releasing the caller's allocator. Client-owned easy handles, multi handles and header nodes must be balanced at client destruction. A live multi may retain connections; its internally created cache handles are not counted as application request handles because their internal cleanup bypasses the public easy-cleanup API. The test does not pretend to instrument every libcurl allocation.
+
+The SQL resource case uses Linux `SO_PEERCRED` to identify the database process, then correlates its `/proc/<pid>/fd` socket descriptors with the mock endpoint in `/proc/<pid>/net/tcp`. Each round first observes live model sockets while eight responses are held. It then cancels the query or releases one invalid provider/Schema response. Error 1317 or 4070 must return promptly with no model socket FDs remaining, even while peers are still held. A successful follow-up on the same SQL connection must return all eight answers and also leave no model socket FDs. Kernel TIME_WAIT entries without a process FD are not counted as leaks. Socket-table access is required; inaccessible evidence is not silently skipped.
+
+### Resource Results: 2026-09-20
+
+- All native fault, lifetime and recovery checks passed. Both deliberately broken cleanup controls failed as required and were recognized by the runner.
+- SQL: 36 failed batches and 36 successful recoveries passed, with eight model socket FDs observed in flight and zero after every query. Request-count and exact error-code assertions were retained.
+- Complete independent SQL suite: **44/44 passed in 230.861s**. Database CPU including bootstrap and all tests was 62.51s, peak RSS 481396KiB; these are context measurements, not a memory-leak oracle or a performance comparison.
+- No production code, Notebook or existing database was changed. No real-model requests were made. This round did not rerun the separate smoke timing comparison.
+
+This is bounded resource-lifetime evidence, not a whole-process leak proof. No ASan/LSan/Valgrind build was run. Global allocator failures, JSON parser/Schema compiler allocation failures, failures inside every curl option or allocator, and concurrent cross-thread destruction remain outside these checks. The no_wait tests use one owner thread; they do not establish thread safety. The 64MiB logical budget still is not an RSS cap.
+
+## Native Embedding Batches
+
+AI_EMBED now groups the eligible rows of the **current SQL batch** into a native multi-input request. The model and optional dimension must be static scalar constants for the batch evaluator; dynamic model/dimension expressions and diagnosis mode choose scalar evaluation before submitting requests. Scalar and batch paths share input handling and output validation. SQL syntax and the per-row one-dimensional JSON vector result remain unchanged:
+
+```sql
+SELECT id, AI_EMBED('my_embedding_model', prompt, 1536) AS embedding
+FROM inputs;
+```
+
+The model/endpoint must already be registered and support the optional requested dimension. Omitting the third argument uses the service's default dimension. Inputs are not concatenated into a prompt, deduplicated or cached; CASE/skip and already-evaluated rows are excluded. The SQL worker still synchronously waits for the batch. This does not collect rows from future SQL batches or add a physical prediction operator.
+
+### Request And Result Contract
+
+- One request is used whenever the whole eligible input array fits the existing **4MiB serialized-body limit**. Otherwise, consecutive inputs are grouped into subrequests using the JSON printer's actual escaped sizes, provider envelope and separators. All subrequests are prepared before any are submitted. A single input that cannot fit is rejected with 4019, without sending earlier rows.
+- All subrequests share the existing client, query deadline and **64MiB aggregate budget** for request state, serialized bodies and retained raw responses. Splitting does not reset this budget. The **8MiB per-response limit** remains; JSON trees, conversion buffers, allocator capacity and curl internals are not an RSS hard cap.
+- OpenAI-compatible endpoints receive an `input` array and must return `data[].index`. Native `aliyun-dashscope` receives `input.texts` and must return `output.embeddings[].text_index`. The registered embedding providers `openai`, `aliyun-openai`, `hunyuan-openai`, `siliconflow` and `aliyun-dashscope` were checked against protocol mocks. Ollama has a legacy helper class but is not registered as an SQL provider; this change does not enable it.
+- Every completed response is checked immediately against that subrequest's input count. Indices must be present, integer, unique and in range. Vectors must be nonempty arrays of finite numbers, with the requested dimension or a consistent inferred dimension across subrequests. Responses are reordered by index before flattening to one JSON vector per original SQL row.
+- Wrong shape/count/index/non-numeric values return 4070; an explicit dimension mismatch retains error 1210. Malformed JSON may return 3140/5447. Invalid results are not repaired or regenerated, and permanent errors cancel other local transfers. No partial-success mode is introduced.
+- A retry replays only the failed HTTP subrequest, including all inputs it contains; successful subrequests are not resent. The existing bounded retry policy and no-retry rule for uncertain POST outcomes remain. Cancellation cannot guarantee that the service stops computation or billing.
+
+Only the local serialized-byte bound drives splitting. There is no model-specific tokenizer, input-count negotiation, or speculative retry using smaller batches after an endpoint rejection. Service-specific input/token limits and the response size still apply; an accepted protocol format is not evidence that every deployed model accepts every SQL batch size. No real embedding service or performance benchmark was run.
+
+### Native Batch Results: 2026-09-20
+
+- The new 74-row test failed against the previous binary with **74 requests instead of 1**. Its identical request-count, content and result assertions passed after implementation, including reversed response indices and duplicate inputs.
+- The final embedding subset passed **19/19** in 25.355s. Cases cover all registered embedding provider formats, 270 rows spanning SQL batches with a tail, optional/dynamic dimensions, dynamic-model fallback, CASE/empty inputs, malformed results, byte splitting, selective retry, lost responses, response limits, deadline, cancellation and same-connection recovery.
+- The complete suite passed **62/62** in 92.516s, including the existing completion/Schema contracts and 36 failed batches plus 36 socket-verified recoveries. Database CPU including bootstrap and the suite was 52.09s; peak RSS was 487740KiB. These are context measurements, not embedding speedup or leak-proof claims.
+- Native allocator/curl fault and lifecycle tests passed again against the rebuilt production objects, including both deliberately broken cleanup controls. Debug build, five fixture self-tests and Python syntax validation passed.
+- During implementation, the first new SQL run exposed a missing allocator on JSON measurement buffers (4152); the production buffers were corrected and the same tests rerun. Provider tests initially used unregistered short names; they now use the declared provider registry and explicitly retain rejection of Ollama. Result assertions were not relaxed.
+
+No existing debug database or Notebook was accessed or modified. The separate smoke timing comparison and real-model tests were not rerun for this change.
 
 ## Constrained Output
 
@@ -187,7 +267,7 @@ Permanent validation failures terminate the local batch without waiting for held
 - Smoke suite passed: 24-row batch 0.824s versus scalar 6.105s. Database CPU including bootstrap and the smoke suite was 18.86s, peak RSS 365228KiB. This is mock evidence, not a constrained-decoding performance measurement.
 - Debug build and focused Unicode checks passed before the complete run. No real model service, existing debug database or Notebook was used or modified.
 
-Remaining work includes server-side decoding evidence, broader real-endpoint Schema coverage, resource-failure/sanitizer coverage and broader provider testing. Schema compilation/validation allocations are not included in the HTTP client's 64MiB logical byte budget; no constant-RSS or arbitrary-Schema complexity guarantee is claimed. The historical live JSON failure below has not been rerun and is not retroactively marked fixed.
+Remaining work includes server-side decoding evidence, broader real-endpoint Schema coverage, wider allocator-failure/sanitizer coverage and broader provider testing. The resource tests above cover client-owned resources and repeated SQL failure recovery, not Schema compiler allocation faults. Schema compilation/validation allocations are not included in the HTTP client's 64MiB logical byte budget; no constant-RSS or arbitrary-Schema complexity guarantee is claimed. The historical live JSON failure below has not been rerun and is not retroactively marked fixed.
 
 ## Real Model Service Tests
 

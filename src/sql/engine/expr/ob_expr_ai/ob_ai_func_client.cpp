@@ -351,7 +351,8 @@ int ObAIFuncClient::finish_request(Request &request, CURLcode result)
     } else if (nullptr == json || json->json_type() != ObJsonNodeType::J_OBJECT) {
       ret = OB_ERR_INVALID_JSON_TEXT;
     } else if (nullptr != response_validator_ &&
-               OB_FAIL(response_validator_->validate_response(*allocator_, static_cast<ObJsonObject *>(json)))) {
+               OB_FAIL(response_validator_->validate_response(*allocator_, static_cast<ObJsonObject *>(json),
+                                                               request.index_))) {
     } else {
       request.result_ = static_cast<ObJsonObject *>(json);
       request.done_ = true;

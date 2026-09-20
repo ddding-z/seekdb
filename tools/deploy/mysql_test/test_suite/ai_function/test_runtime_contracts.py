@@ -5,7 +5,9 @@ from dataclasses import dataclass, field
 from email.utils import formatdate, parsedate_to_datetime
 from http.client import HTTPConnection
 import json
+from pathlib import Path
 import socket
+import struct
 import sys
 import threading
 import time
@@ -16,6 +18,7 @@ import pymysql
 import test_runtime as runtime
 
 
+REQUEST_LIMIT = 4 * 1024 * 1024
 RESPONSE_LIMIT = 8 * 1024 * 1024
 
 
@@ -30,6 +33,14 @@ def completion(content, *, finish_reason=None, refusal=None):
     if refusal is not None:
         choice["message"]["refusal"] = refusal
     return json.dumps({"choices": [choice]}, ensure_ascii=False).encode("utf-8")
+
+
+def embedding_response(inputs, vectors, response_format="openai"):
+    index_key = "text_index" if response_format == "dashscope" else "index"
+    entries = [{index_key: index, "embedding": vectors[text]}
+               for index, text in reversed(list(enumerate(inputs)))]
+    response = {"output": {"embeddings": entries}} if response_format == "dashscope" else {"data": entries}
+    return json.dumps(response).encode("utf-8")
 
 
 def constrained_options(schema):
@@ -49,6 +60,21 @@ def sql_error(test, code, operation):
     expected = (code,) if isinstance(code, int) else code
     test.assertIn(caught.exception.args[0], expected, caught.exception.args)
     return caught.exception
+
+
+def model_socket_fds(process_id, port):
+    process = Path("/proc") / str(process_id)
+    inodes = {f"socket:[{fields[9]}]"
+              for line in (process / "net/tcp").read_text().splitlines()[1:]
+              if (fields := line.split()) and int(fields[2].rsplit(":", 1)[1], 16) == port}
+    descriptors = set()
+    for descriptor in (process / "fd").iterdir():
+        try:
+            if str(descriptor.readlink()) in inodes:
+                descriptors.add(descriptor.name)
+        except FileNotFoundError:
+            continue
+    return descriptors
 
 
 @dataclass
@@ -73,17 +99,18 @@ class ContractHandler(runtime.MockHandler):
         server = self.server
         record = None
         try:
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            raw_body = self.rfile.read(int(self.headers["Content-Length"]))
+            body = json.loads(raw_body)
+            inputs = None
             if "messages" in body:
                 prompt = body["messages"][-1]["content"]
             else:
                 inputs = body["input"]
-                if isinstance(inputs, list):
-                    if len(inputs) != 1:
-                        raise AssertionError("embedding must preserve one input per SQL row")
-                    prompt = inputs[0]
-                else:
-                    prompt = inputs
+                if isinstance(inputs, dict):
+                    inputs = inputs["texts"]
+                if not isinstance(inputs, list) or not inputs or not all(isinstance(text, str) for text in inputs):
+                    raise AssertionError("embedding input must be a nonempty array of strings")
+                prompt = inputs[0] if len(inputs) == 1 else tuple(inputs)
             with server.condition:
                 server.active += 1
                 server.peak = max(server.peak, server.active)
@@ -91,6 +118,7 @@ class ContractHandler(runtime.MockHandler):
                 server.requests.append(body)
                 record = {"prompt": prompt, "received": time.monotonic(),
                           "wall_received": time.time(), "response": None,
+                          "request_bytes": len(raw_body),
                           "headers": {name.lower(): value for name, value in self.headers.items()}}
                 server.audit.append(record)
                 sequence = server.scenarios.get(prompt, [Reply()])
@@ -105,7 +133,10 @@ class ContractHandler(runtime.MockHandler):
                 self.close_connection = True
                 self.connection.shutdown(socket.SHUT_RDWR)
                 return
-            raw = completion(answer(prompt)) if reply.body is None else reply.body
+            raw = reply.body
+            if raw is None:
+                raw = (completion(answer(prompt)) if inputs is None else
+                       embedding_response(inputs, server.embedding_vectors, server.embedding_format))
             self.send_response(reply.status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw) + (100 if reply.truncate else 0)))
@@ -138,6 +169,8 @@ def configure_mock(server):
     server.audit = []
     server.scenarios = {}
     server.fixture_errors = []
+    server.embedding_vectors = {}
+    server.embedding_format = "openai"
 
 
 class HarnessTests(unittest.TestCase):
@@ -189,6 +222,32 @@ class HarnessTests(unittest.TestCase):
             server.server_close()
             worker.join()
 
+    def test_native_embedding_fixture_preserves_indices_and_distinct_vectors(self):
+        server = runtime.MockServer()
+        configure_mock(server)
+        server.embedding_vectors = {"left": [0.25, -1], "right": [0.5, 2]}
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            client = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            try:
+                body = json.dumps({"model": "fixture-embed", "input": ["left", "right", "left"]})
+                client.request("POST", "/", body, {"Content-Type": "application/json"})
+                response = client.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read()), {"data": [
+                    {"index": 2, "embedding": [0.25, -1]},
+                    {"index": 1, "embedding": [0.5, 2]},
+                    {"index": 0, "embedding": [0.25, -1]}]})
+            finally:
+                client.close()
+            self.assertEqual(server.counts, Counter({("left", "right", "left"): 1}))
+            self.assertFalse(server.fixture_errors)
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join()
+
 
 class RuntimeContracts(unittest.TestCase):
     @classmethod
@@ -225,7 +284,8 @@ class RuntimeContracts(unittest.TestCase):
         self.cursor.execute("SET ob_query_timeout = 20000000")
         for endpoint in ("contract_endpoint", "contract_embed_endpoint"):
             self.cursor.execute("CALL DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT(%s, %s)",
-                                (endpoint, json.dumps({"url": f"http://127.0.0.1:{self.server.server_port}/"})))
+                                (endpoint, json.dumps({"url": f"http://127.0.0.1:{self.server.server_port}/",
+                                                       "provider": "openai"})))
         self.cursor.execute("TRUNCATE TABLE inputs")
 
     def close_mock(self):
@@ -240,6 +300,17 @@ class RuntimeContracts(unittest.TestCase):
     def load(self, prompts):
         self.cursor.executemany("INSERT INTO inputs VALUES (%s, %s, 'contract_model')",
                                 list(enumerate(prompts)))
+
+    def load_embeddings(self, prompts):
+        self.load(prompts)
+        self.server.embedding_vectors = {text: [index + 0.125, -index - 0.25, 0.5]
+                                         for index, text in enumerate(dict.fromkeys(prompts))}
+        return tuple((index, self.server.embedding_vectors[text]) for index, text in enumerate(prompts))
+
+    def query_embeddings(self, expression="AI_EMBED('contract_embed', prompt, 3)"):
+        self.cursor.execute("SELECT /*+ OPT_PARAM('rowsets_max_rows', 128) */ "
+                            f"id, {expression} FROM inputs ORDER BY id")
+        return tuple((row, json.loads(value)) for row, value in self.cursor.fetchall())
 
     def query(self, expression="AI_COMPLETE('contract_model', prompt)", suffix="ORDER BY id"):
         self.cursor.execute(f"SELECT id, {expression} FROM inputs {suffix}")
@@ -694,6 +765,82 @@ class RuntimeContracts(unittest.TestCase):
         self.load(["after-cancel"])
         self.assertEqual(self.query(), ((0, answer("after-cancel")),))
 
+    def test_repeated_failures_release_model_sockets_and_recover(self):
+        credentials = self.connection._sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                       struct.calcsize("3i"))
+        process_id, _, _ = struct.unpack("3i", credentials)
+        self.assertGreater(process_id, 0)
+        peak_descriptors = 0
+        with pymysql.connect(unix_socket=self.sql_socket, user="root", autocommit=True) as control:
+            with control.cursor() as cancel_cursor:
+                for failure, code in (("cancel", 1317), ("provider", 4070), ("schema", 4070)):
+                    expression = "AI_COMPLETE('contract_model', prompt)"
+                    if failure == "schema":
+                        config = self.connection.escape(json.dumps(constrained_options({"type": "boolean"})))
+                        expression = f"AI_COMPLETE('contract_model', prompt, {config})"
+                    for iteration in range(12):
+                        with self.subTest(failure=failure, iteration=iteration):
+                            self.cursor.execute("TRUNCATE TABLE inputs")
+                            prompts = [f"resource-{failure}-{iteration}-{index}" for index in range(8)]
+                            self.load(prompts)
+                            peers = self.gate()
+                            failed = self.gate()
+                            for prompt in prompts:
+                                self.server.scenarios[prompt] = [Reply(gate=peers)]
+                            if failure != "cancel":
+                                body = (completion('"not-a-boolean"', finish_reason="stop")
+                                        if failure == "schema" else b'{"unexpected":true}')
+                                self.server.scenarios[prompts[0]] = [Reply(body=body, gate=failed)]
+                            outcome = []
+
+                            def execute():
+                                try:
+                                    outcome.append(self.query(expression))
+                                except Exception as error:
+                                    outcome.append(error)
+
+                            worker = threading.Thread(target=execute, daemon=True)
+                            worker.start()
+                            try:
+                                with self.server.condition:
+                                    self.assertTrue(self.server.condition.wait_for(
+                                        lambda: all(self.server.counts[prompt] == 1 for prompt in prompts),
+                                        timeout=3), "not all held requests reached the model service")
+                                descriptors = model_socket_fds(process_id, self.server.server_port)
+                                self.assertTrue(descriptors, "socket oracle did not see the active requests")
+                                peak_descriptors = max(peak_descriptors, len(descriptors))
+                                if failure == "cancel":
+                                    cancel_cursor.execute(f"KILL QUERY {self.connection.thread_id()}")
+                                else:
+                                    failed.set()
+                                worker.join(3)
+                                self.assertFalse(worker.is_alive(), "failed query still holds its peers")
+                                self.assertEqual(len(outcome), 1)
+                                self.assertIsInstance(outcome[0], pymysql.MySQLError)
+                                self.assertEqual(outcome[0].args[0], code, outcome[0].args)
+                                self.assertFalse(model_socket_fds(process_id, self.server.server_port),
+                                                 "query returned but model socket descriptors remain open")
+                            finally:
+                                failed.set()
+                                peers.set()
+                                worker.join(5)
+                            with self.server.condition:
+                                self.assertTrue(self.server.condition.wait_for(lambda: self.server.active == 0,
+                                                                               timeout=3))
+                            self.assertEqual([self.server.counts[prompt] for prompt in prompts], [1] * 8)
+                            for prompt in prompts:
+                                self.server.scenarios[prompt] = [
+                                    Reply(body=completion("true", finish_reason="stop"))
+                                    if failure == "schema" else Reply()]
+                            self.assertEqual(self.query(expression), tuple(
+                                (index, "true" if failure == "schema" else answer(prompt))
+                                for index, prompt in enumerate(prompts)))
+                            self.assertFalse(model_socket_fds(process_id, self.server.server_port),
+                                             "successful recovery retained model sockets")
+                            self.assertEqual([self.server.counts[prompt] for prompt in prompts], [2] * 8)
+        print(f"RESOURCE SQL: 36 failed batches and 36 recoveries; peak model socket FDs={peak_descriptors}; "
+              "zero after every query", flush=True)
+
     def test_response_limit_uses_valid_json_at_boundary(self):
         for size in (RESPONSE_LIMIT - 1, RESPONSE_LIMIT, RESPONSE_LIMIT + 1):
             with self.subTest(size=size):
@@ -758,14 +905,273 @@ class RuntimeContracts(unittest.TestCase):
     def test_json_error_cancels_active_peers(self):
         self.fail_fast(Reply(body=b"[]"), 3140)
 
-    def test_embedding_preserves_vectors_and_retries(self):
+    def test_embedding_native_whole_batch_preserves_order_and_duplicates(self):
+        prompts = [f"native-{index}" for index in range(72)] + ["native-5", "\u4e2d\u6587\n\"\\\x00"]
+        expected = self.load_embeddings(prompts)
+        self.assertEqual(self.query_embeddings(), expected)
+        self.assertEqual(len(self.server.requests), 1, "one SQL batch must produce one native HTTP request")
+        self.assertEqual(self.server.requests[0], {"model": "mock-embed", "input": prompts, "dimensions": 3})
+        self.assertEqual(self.server.counts, Counter({tuple(prompts): 1}))
+
+    def test_embedding_multiple_sql_batches_preserve_all_rows_and_tail(self):
+        prompts = [f"batch-tail-{index}" for index in range(270)]
+        expected = self.load_embeddings(prompts)
+        self.assertEqual(self.query_embeddings(), expected)
+        sizes = [len(body["input"]) for body in self.server.requests]
+        self.assertGreater(len(sizes), 1)
+        self.assertLess(len(sizes), len(prompts))
+        self.assertTrue(all(0 < size <= 128 for size in sizes), sizes)
+        self.assertTrue(any(size < 128 for size in sizes), sizes)
+        self.assertEqual(Counter(text for body in self.server.requests for text in body["input"]), Counter(prompts))
+
+    def test_embedding_native_provider_formats_and_dimensions(self):
+        prompts = ["provider-left", "provider-right"]
+        expected = self.load_embeddings(prompts)
+        for provider in ("openai", "aliyun-openai", "hunyuan-openai", "siliconflow", "aliyun-dashscope"):
+            with self.subTest(provider=provider):
+                self.cursor.execute("CALL DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT(%s, %s)",
+                                    ("contract_embed_endpoint", json.dumps({"provider": provider})))
+                self.server.embedding_format = "dashscope" if provider == "aliyun-dashscope" else "openai"
+                before = len(self.server.requests)
+                self.assertEqual(self.query_embeddings(), expected)
+                self.assertEqual(len(self.server.requests), before + 1)
+                expected_body = ({"model": "mock-embed", "input": {"texts": prompts}, "parameters": {"dimension": 3}}
+                                 if provider == "aliyun-dashscope" else
+                                 {"model": "mock-embed", "input": prompts, "dimensions": 3})
+                self.assertEqual(self.server.requests[-1], expected_body)
+                self.assertEqual(self.server.audit[-1]["headers"]["content-type"], "application/json")
+
+    def test_embedding_native_optional_and_dynamic_dimensions(self):
+        prompts = ["dimension-left", "dimension-right", "dimension-last"]
+        expected = self.load_embeddings(prompts)
+        self.assertEqual(self.query_embeddings("AI_EMBED('contract_embed', prompt)"), expected)
+        self.assertEqual(self.server.requests, [{"model": "mock-embed", "input": prompts}])
+        self.server.embedding_vectors = {text: [index + 0.5] * (index + 2)
+                                         for index, text in enumerate(prompts)}
+        expected = tuple((index, self.server.embedding_vectors[text]) for index, text in enumerate(prompts))
+        self.assertEqual(self.query_embeddings("AI_EMBED('contract_embed', prompt, id + 2)"), expected)
+        self.assertEqual(len(self.server.requests), 4)
+        self.assertEqual(self.server.requests[1:], [
+            {"model": "mock-embed", "input": [text], "dimensions": index + 2}
+            for index, text in enumerate(prompts)])
+
+    def test_embedding_native_case_skips_and_empty_input(self):
+        self.load(["selected-left", None, "selected-right"])
+        self.server.embedding_vectors = {"selected-left": [0.5, -1, 2], "selected-right": [0.25, 3, 4]}
+        results = self.query("CASE WHEN id = 1 THEN 'skipped' ELSE AI_EMBED('contract_embed', prompt, 3) END")
+        self.assertEqual(tuple((row, value if row == 1 else json.loads(value)) for row, value in results),
+                         ((0, [0.5, -1, 2]), (1, "skipped"), (2, [0.25, 3, 4])))
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(self.server.requests[0]["input"], ["selected-left", "selected-right"])
+        self.assertEqual(self.query("CASE WHEN id >= 0 THEN 'skipped' ELSE AI_EMBED('contract_embed', prompt) END"),
+                         ((0, "skipped"), (1, "skipped"), (2, "skipped")))
+        self.cursor.execute("TRUNCATE TABLE inputs")
+        self.assertEqual(self.query_embeddings(), ())
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_embedding_native_invalid_input_rejected_before_http(self):
+        for invalid in (None, ""):
+            with self.subTest(input=invalid):
+                self.cursor.execute("TRUNCATE TABLE inputs")
+                self.load(["valid-before-error", invalid])
+                sql_error(self, 1210, self.query_embeddings)
+                self.assertFalse(self.server.requests)
+        self.cursor.execute("TRUNCATE TABLE inputs")
+        self.load(["valid-dimension-input"])
+        for dimension in ("0", "-1", "CAST(NULL AS SIGNED)"):
+            with self.subTest(dimension=dimension):
+                sql_error(self, 1210, lambda: self.query_embeddings(f"AI_EMBED('contract_embed', prompt, {dimension})"))
+                self.assertFalse(self.server.requests)
+
+    def test_embedding_native_invalid_results_rejected_and_recover(self):
+        prompts = ["invalid-left", "invalid-middle", "invalid-right"]
+        expected = self.load_embeddings(prompts)
+        entries = [{"index": index, "embedding": self.server.embedding_vectors[text]}
+                   for index, text in enumerate(prompts)]
+        bad_responses = [("missing data", {}), ("null data", {"data": None}),
+                         ("object data", {"data": {}}), ("empty data", {"data": []}),
+                         ("missing result", {"data": entries[:2]}),
+                         ("extra result", {"data": entries + [{"index": 3, "embedding": [1, 2, 3]}]}),
+                         ("null item", {"data": [None] + entries[1:]}),
+                         ("missing index", {"data": [{"embedding": [1, 2, 3]}] + entries[1:]})]
+        for index in (-1, 3, 1, False, 0.5, "0", None, 2**63):
+            bad_responses.append((f"invalid index {index!r}",
+                                  {"data": [{"index": index, "embedding": [1, 2, 3]}] + entries[1:]}))
+        for vector in (None, "vector", {}, [], [True, 0, 1], [None, 0, 1], ["0", 0, 1], [[1], 0, 1]):
+            bad_responses.append((f"invalid vector {vector!r}",
+                                  {"data": [{"index": 0, "embedding": vector}] + entries[1:]}))
+        for name, response in bad_responses:
+            with self.subTest(response=name):
+                before = len(self.server.requests)
+                self.server.scenarios[tuple(prompts)] = [Reply(body=json.dumps(response).encode())]
+                sql_error(self, 4070, self.query_embeddings)
+                self.assertEqual(len(self.server.requests), before + 1, "invalid provider data must not be retried")
+                self.server.scenarios.clear()
+                self.assertEqual(self.query_embeddings(), expected)
+
+    def test_embedding_native_dimension_mismatch_and_nonfinite_values(self):
+        prompts = ["dimension-mismatch", "dimension-healthy"]
+        expected = self.load_embeddings(prompts)
+        self.server.scenarios[tuple(prompts)] = [Reply(body=json.dumps({"data": [
+            {"index": 0, "embedding": [1, 2]}, {"index": 1, "embedding": [1, 2, 3]}]}).encode())]
+        sql_error(self, 1210, self.query_embeddings)
+        sql_error(self, 4070, lambda: self.query_embeddings("AI_EMBED('contract_embed', prompt)"))
+        for value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                raw = ('{"data":[{"index":0,"embedding":[' + value + ',0,1]},'
+                       '{"index":1,"embedding":[1,2,3]}]}').encode()
+                self.server.scenarios[tuple(prompts)] = [Reply(body=raw)]
+                sql_error(self, (4070, 3140, 5447), self.query_embeddings)
+        self.server.scenarios.clear()
+        self.assertEqual(self.query_embeddings(), expected)
+
+    def test_embedding_native_dashscope_malformed_responses(self):
+        prompts = ["shape-left", "shape-right"]
+        expected = self.load_embeddings(prompts)
+        self.cursor.execute("CALL DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT(%s, %s)",
+                            ("contract_embed_endpoint", '{"provider":"aliyun-dashscope"}'))
+        self.server.embedding_format = "dashscope"
+        invalid_responses = [{}, {"output": False}, {"output": {"embeddings": {}}},
+                             {"output": {"embeddings": [None]}},
+                             {"output": {"embeddings": [{"embedding": [1, 2, 3]}]}},
+                             {"output": {"embeddings": [{"text_index": 0, "embedding": [1, 2, 3]},
+                                                         {"text_index": 0, "embedding": [4, 5, 6]}]}}]
+        for response in invalid_responses:
+            with self.subTest(response=response):
+                before = len(self.server.requests)
+                self.server.scenarios[tuple(prompts)] = [Reply(body=json.dumps(response).encode())]
+                sql_error(self, 4070, self.query_embeddings)
+                self.assertEqual(len(self.server.requests), before + 1)
+        self.server.scenarios.clear()
+        self.assertEqual(self.query_embeddings(), expected)
+
+    def test_embedding_unsupported_provider_is_rejected_before_http(self):
+        expected = self.load_embeddings(["supported-left", "supported-right"])
+        sql_error(self, 11116, lambda: self.cursor.execute(
+            "CALL DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT(%s, %s)",
+            ("contract_embed_endpoint", '{"provider":"ollama"}')))
+        self.assertFalse(self.server.requests)
+        self.assertEqual(self.query_embeddings(), expected)
+
+    def test_embedding_native_retry_preserves_whole_request(self):
+        prompts = ["retry-batch-left", "retry-batch-right"]
+        expected = self.load_embeddings(prompts)
+        self.server.scenarios[tuple(prompts)] = [Reply(502, b"{}"), Reply()]
+        self.assertEqual(self.query_embeddings(), expected)
+        self.assertEqual(self.server.counts, Counter({tuple(prompts): 2}))
+        self.assertEqual(self.server.requests, [{"model": "mock-embed", "input": prompts, "dimensions": 3}] * 2)
+
+    def test_embedding_native_dropped_response_is_not_retried(self):
+        prompts = ["drop-batch-left", "drop-batch-right"]
+        self.load_embeddings(prompts)
+        self.server.scenarios[tuple(prompts)] = [Reply(drop=True)]
+        sql_error(self, 4216, self.query_embeddings)
+        self.assertEqual(self.server.counts, Counter({tuple(prompts): 1}))
+
+    def test_embedding_split_uses_encoded_bytes_and_retries_only_failed_request(self):
+        prompts = [f"split-{index}:" + "\\" * (900 * 1024) for index in range(3)]
+        self.assertLess(sum(len(text) for text in prompts), REQUEST_LIMIT)
+        expected = self.load_embeddings(prompts)
+        self.server.scenarios[tuple(prompts[:2])] = [Reply(502, b"{}"), Reply()]
+        self.assertEqual(self.query_embeddings(), expected)
+        self.assertEqual(self.server.counts, Counter({tuple(prompts[:2]): 2, prompts[2]: 1}))
+        self.assertEqual(sorted(len(body["input"]) for body in self.server.requests), [1, 2, 2])
+        self.assertTrue(all(record["request_bytes"] <= REQUEST_LIMIT for record in self.server.audit))
+        self.assertEqual(Counter(text for body in self.server.requests for text in body["input"]),
+                         Counter({prompts[0]: 2, prompts[1]: 2, prompts[2]: 1}))
+
+    def test_embedding_split_count_error_cancels_held_peer(self):
+        prompts = [f"fail-fast-{index}:" + "\\" * (900 * 1024) for index in range(3)]
+        self.load_embeddings(prompts)
+        gate = self.gate()
+        self.server.scenarios[prompts[2]] = [Reply(gate=gate)]
+        self.server.scenarios[tuple(prompts[:2])] = [Reply(peers=2, body=json.dumps({
+            "data": [{"index": 0, "embedding": [1, 2, 3]}]}).encode())]
+        self.cursor.execute("SET ob_query_timeout = 3000000")
+        start = time.monotonic()
+        sql_error(self, 4070, self.query_embeddings)
+        self.assertLess(time.monotonic() - start, 2.5)
+        self.assertEqual(len(self.server.requests), 2)
+        self.assertTrue(any(record["prompt"] == prompts[2] and record["response"] is None
+                            for record in self.server.audit))
+
+    def test_embedding_oversized_single_input_rejected_before_http(self):
+        for text in ("x" * (REQUEST_LIMIT + 1), "\\" * (REQUEST_LIMIT // 2 + 1)):
+            with self.subTest(raw_bytes=len(text)):
+                self.cursor.execute("TRUNCATE TABLE inputs")
+                self.load(["valid-before-oversize", text])
+                sql_error(self, 4019, self.query_embeddings)
+                self.assertFalse(self.server.requests)
+
+    def test_embedding_native_response_limit_and_recovery(self):
+        prompts = ["response-limit-left", "response-limit-right"]
+        expected = self.load_embeddings(prompts)
+        raw = b'{"data":[],"padding":"' + b"x" * RESPONSE_LIMIT + b'"}'
+        self.server.scenarios[tuple(prompts)] = [Reply(body=raw)]
+        sql_error(self, 4019, self.query_embeddings)
+        self.assertEqual(self.server.counts, Counter({tuple(prompts): 1}))
+        self.server.scenarios.clear()
+        self.assertEqual(self.query_embeddings(), expected)
+
+    def test_embedding_native_deadline_and_recovery(self):
+        prompts = ["deadline-left", "deadline-right"]
+        expected = self.load_embeddings(prompts)
+        gate = self.gate()
+        self.server.scenarios[tuple(prompts)] = [Reply(gate=gate)]
+        self.cursor.execute("SET ob_query_timeout = 500000")
+        sql_error(self, 4012, self.query_embeddings)
+        self.assertEqual(self.server.counts, Counter({tuple(prompts): 1}))
+        gate.set()
+        self.cursor.execute("SET ob_query_timeout = 20000000")
+        self.server.scenarios.clear()
+        self.assertEqual(self.query_embeddings(), expected)
+
+    def test_embedding_native_cancel_releases_socket_and_recovers(self):
+        prompts = ["cancel-native-left", "cancel-native-right"]
+        expected = self.load_embeddings(prompts)
+        gate = self.gate()
+        self.server.scenarios[tuple(prompts)] = [Reply(gate=gate)]
+        outcome = []
+
+        def execute():
+            try:
+                outcome.append(self.query_embeddings())
+            except Exception as error:
+                outcome.append(error)
+
+        worker = threading.Thread(target=execute, daemon=True)
+        worker.start()
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(lambda: len(self.server.audit) == 1, timeout=3))
+            process_id = struct.unpack("3i", self.connection._sock.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
+            self.assertTrue(model_socket_fds(process_id, self.server.server_port))
+            with pymysql.connect(unix_socket=self.sql_socket, user="root", autocommit=True) as control:
+                with control.cursor() as cursor:
+                    cursor.execute(f"KILL QUERY {self.connection.thread_id()}")
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(outcome), 1)
+            self.assertIsInstance(outcome[0], pymysql.MySQLError)
+            self.assertEqual(outcome[0].args[0], 1317)
+            self.assertFalse(model_socket_fds(process_id, self.server.server_port))
+        finally:
+            gate.set()
+            worker.join(5)
+        self.assertEqual(self.server.counts, Counter({tuple(prompts): 1}))
+        self.server.scenarios.clear()
+        self.assertEqual(self.query_embeddings(), expected)
+
+    def test_embedding_scalar_fallback_preserves_vectors_and_retries(self):
         prompts = ["embedding-retry", "embedding-healthy"]
         self.load(prompts)
+        self.cursor.execute("UPDATE inputs SET model = 'contract_embed'")
         vector = [0.125, -0.25, 0.5]
         raw = json.dumps({"data": [{"index": 0, "embedding": vector}]}).encode()
         self.server.scenarios[prompts[0]] = [Reply(502, b"{}"), Reply(body=raw)]
         self.server.scenarios[prompts[1]] = [Reply(body=raw)]
-        results = self.query("AI_EMBED('contract_embed', CAST(prompt AS CHAR), 3)")
+        results = self.query("AI_EMBED(model, CAST(prompt AS CHAR), 3)")
         self.assertEqual(tuple((row, json.loads(value)) for row, value in results), ((0, vector), (1, vector)))
         self.assertEqual(self.server.counts, Counter({prompts[0]: 2, prompts[1]: 1}))
         self.assertTrue(all(body["model"] == "mock-embed" and body["dimensions"] == 3

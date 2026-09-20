@@ -72,6 +72,11 @@ public:
     common::ObIJsonBase *result = nullptr;
     return parse_output(allocator, http_response, result);
   }
+  virtual int validate_response(common::ObIAllocator &allocator, common::ObJsonObject *http_response,
+                                const int64_t)
+  {
+    return validate_response(allocator, http_response);
+  }
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncBase);
 };
@@ -95,14 +100,26 @@ private:
 class ObAIFuncIEmbed : public ObAIFuncBase 
 {
 public:
-  ObAIFuncIEmbed() {}
+  ObAIFuncIEmbed() : expected_counts_(nullptr), dimension_(0), inferred_dimension_(0) {}
   virtual ~ObAIFuncIEmbed() {}
   virtual int get_body(common::ObIAllocator &allocator,
                        common::ObString &model,
                        common::ObArray<ObString> &contents,
                        common::ObJsonObject *config,
                        common::ObJsonObject *&body) = 0;
+  using ObAIFuncBase::validate_response;
+  virtual int validate_response(common::ObIAllocator &allocator, common::ObJsonObject *http_response,
+                                const int64_t request_index) override;
+  void set_response_constraints(const common::ObIArray<int64_t> &expected_counts, int64_t dimension)
+  {
+    expected_counts_ = &expected_counts;
+    dimension_ = dimension;
+    inferred_dimension_ = 0;
+  }
 private:
+  const common::ObIArray<int64_t> *expected_counts_;
+  int64_t dimension_;
+  int64_t inferred_dimension_;
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncIEmbed);
 };
 
