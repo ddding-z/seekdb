@@ -57,6 +57,7 @@ ObAIFuncClient::ObAIFuncClient()
     requests_(), is_finished_(false), max_retry_times_(3), abs_timeout_ts_(0),
     timeout_sec_(60), max_parallel_(0), active_count_(0), completed_count_(0),
     batch_ret_(OB_SUCCESS), status_checker_(nullptr), status_context_(nullptr),
+    response_validator_(nullptr),
     batch_start_ts_(0), attempts_(0), retries_(0), peak_active_(0),
     buffered_bytes_(0), received_bytes_(0), submitted_bytes_(0)
 {}
@@ -349,6 +350,8 @@ int ObAIFuncClient::finish_request(Request &request, CURLcode result)
         ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, json))) {
     } else if (nullptr == json || json->json_type() != ObJsonNodeType::J_OBJECT) {
       ret = OB_ERR_INVALID_JSON_TEXT;
+    } else if (nullptr != response_validator_ &&
+               OB_FAIL(response_validator_->validate_response(*allocator_, static_cast<ObJsonObject *>(json)))) {
     } else {
       request.result_ = static_cast<ObJsonObject *>(json);
       request.done_ = true;

@@ -17,12 +17,57 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_ai_func_utils.h"
 #include "ob_ai_func_client.h"
+#include "common/json_type/ob_json_schema.h"
 #include "query/engine/expr/ob_ai_model_resolver.h"
 
 namespace oceanbase 
 {
 namespace common 
 {
+
+namespace
+{
+int check_completion_schema(ObIAllocator &allocator, ObJsonNode *schema)
+{
+  static const char *definition = R"({
+    "type": "object",
+    "required": ["type"],
+    "properties": {
+      "type": {"enum": ["object", "array", "string", "integer", "number", "boolean", "null"]},
+      "properties": {"type": "object", "additionalProperties": {"$ref": "#"}},
+      "required": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+      "additionalProperties": {"type": "boolean"},
+      "items": {"$ref": "#"},
+      "enum": {"type": "array", "minItems": 1, "uniqueItems": true},
+      "minItems": {"type": "integer", "minimum": 0},
+      "maxItems": {"type": "integer", "minimum": 0},
+      "uniqueItems": {"type": "boolean"},
+      "minLength": {"type": "integer", "minimum": 0},
+      "maxLength": {"type": "integer", "minimum": 0},
+      "minimum": {"type": "number"},
+      "maximum": {"type": "number"},
+      "title": {"type": "string"},
+      "description": {"type": "string"}
+    },
+    "additionalProperties": false
+  })";
+  int ret = OB_SUCCESS;
+  ObIJsonBase *meta_schema = nullptr;
+  ObJsonSchemaTree schema_tree(&allocator);
+  bool is_valid = false;
+  if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator, ObString(definition),
+      ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, meta_schema))) {
+  } else if (OB_FAIL(schema_tree.build_schema_tree(meta_schema))) {
+  } else {
+    ObJsonSchemaValidator validator(&allocator, schema_tree.get_schema_map());
+    if (OB_FAIL(validator.schema_validator(schema, is_valid))) {
+    } else if (!is_valid) {
+      ret = OB_INVALID_ARGUMENT;
+    }
+  }
+  return ret;
+}
+}
 
 int ObOpenAIUtils::get_header(common::ObIAllocator &allocator,
                               ObString &api_key,
@@ -73,6 +118,7 @@ int ObOpenAIUtils::ObOpenAIComplete::get_body(common::ObIAllocator &allocator,
   if (model.empty() || content.empty()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("Model name or content is empty", K(ret));
+  } else if (OB_FAIL(prepare_output_schema(allocator, config))) {
   } else {
     // {"model": "*", "messages": [{"role": "system", "content": "*"}, {"role": "user", "content": "*"}]}
     ObJsonObject *body_obj = nullptr;
@@ -86,6 +132,120 @@ int ObOpenAIUtils::ObOpenAIComplete::get_body(common::ObIAllocator &allocator,
     } else if (OB_FAIL(ObAIFuncJsonUtils::compact_json_object(allocator, config, body_obj))) {
     } else {
       body = body_obj;
+    }
+  }
+  return ret;
+}
+
+int ObOpenAIUtils::ObOpenAIComplete::prepare_output_schema(ObIAllocator &allocator, ObJsonObject *config)
+{
+  int ret = OB_SUCCESS;
+  if (config != output_config_) {
+    output_schema_ = nullptr;
+    ObJsonNode *format = nullptr == config ? nullptr : config->get_value("response_format");
+    if (nullptr != format && format->json_type() != ObJsonNodeType::J_OBJECT) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (nullptr != format) {
+      ObJsonObject *format_object = static_cast<ObJsonObject *>(format);
+      ObJsonNode *type = format_object->get_value("type");
+      if (nullptr == type || type->json_type() != ObJsonNodeType::J_STRING) {
+        ret = OB_INVALID_ARGUMENT;
+      } else if (ObString(type->get_data_length(), type->get_data()) == "json_schema") {
+        ObJsonNode *definition = format_object->get_value("json_schema");
+        ObJsonNode *stream = config->get_value("stream");
+        ObJsonNode *count = config->get_value("n");
+        if (nullptr == definition || definition->json_type() != ObJsonNodeType::J_OBJECT) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if ((nullptr != stream && (stream->json_type() != ObJsonNodeType::J_BOOLEAN || stream->get_boolean())) ||
+                   (nullptr != count && !((count->json_type() == ObJsonNodeType::J_INT && count->get_int() == 1) ||
+                                          (count->json_type() == ObJsonNodeType::J_UINT && count->get_uint() == 1))) ||
+                   nullptr != config->get_value("structured_outputs") || nullptr != config->get_value("guided_json") ||
+                   nullptr != config->get_value("guided_grammar") || nullptr != config->get_value("guided_regex") ||
+                   nullptr != config->get_value("guided_choice")) {
+          ret = OB_INVALID_ARGUMENT;
+        } else {
+          ObJsonObject *definition_object = static_cast<ObJsonObject *>(definition);
+          ObJsonNode *name = definition_object->get_value("name");
+          ObJsonNode *strict = definition_object->get_value("strict");
+          ObJsonNode *schema = definition_object->get_value("schema");
+          if (nullptr == name || name->json_type() != ObJsonNodeType::J_STRING || name->get_data_length() == 0 ||
+              nullptr == strict || strict->json_type() != ObJsonNodeType::J_BOOLEAN || !strict->get_boolean() ||
+              nullptr == schema || schema->json_type() != ObJsonNodeType::J_OBJECT) {
+            ret = OB_INVALID_ARGUMENT;
+          } else if (OB_FAIL(check_completion_schema(allocator, schema))) {
+          } else {
+            ObJsonSchemaTree schema_tree(&allocator);
+            ObJsonNode *schema_copy = schema->clone(&allocator, true);
+            if (nullptr == schema_copy) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else if (OB_FAIL(schema_tree.build_schema_tree(schema_copy))) {
+            } else {
+              output_schema_ = schema_tree.get_schema_map();
+            }
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      output_config_ = config;
+    }
+  }
+  if (ret == OB_INVALID_ARGUMENT) {
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "AI_COMPLETE JSON schema output configuration");
+  }
+  return ret;
+}
+
+int ObOpenAIUtils::ObOpenAIComplete::validate_response(ObIAllocator &allocator, ObJsonObject *http_response)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator arena("AIOutputCheck");
+  MultimodeAlloctor temporary_allocator(arena);
+  ObIJsonBase *result = nullptr;
+  if (OB_FAIL(parse_output(temporary_allocator, http_response, result))) {
+  } else if (OB_FAIL(validate_output_schema(temporary_allocator, http_response, result))) {
+  }
+  if (ret == OB_INVALID_DATA) {
+    FORWARD_USER_ERROR(ret, "AI_COMPLETE response violates its output contract");
+  }
+  return ret;
+}
+
+int ObOpenAIUtils::ObOpenAIComplete::validate_output_schema(ObIAllocator &allocator,
+                                                          ObJsonObject *response, ObIJsonBase *result)
+{
+  int ret = OB_SUCCESS;
+  if (nullptr != output_schema_) {
+    ObJsonNode *choices = response->get_value("choices");
+    ObJsonNode *choice = nullptr;
+    ObJsonNode *message = nullptr;
+    ObJsonNode *finish_reason = nullptr;
+    ObJsonNode *refusal = nullptr;
+    if (nullptr == choices || choices->json_type() != ObJsonNodeType::J_ARRAY || choices->element_count() != 1 ||
+        nullptr == (choice = choices->get_value(0)) || choice->json_type() != ObJsonNodeType::J_OBJECT) {
+      ret = OB_INVALID_DATA;
+    } else {
+      finish_reason = static_cast<ObJsonObject *>(choice)->get_value("finish_reason");
+      message = static_cast<ObJsonObject *>(choice)->get_value("message");
+      if (nullptr == finish_reason || finish_reason->json_type() != ObJsonNodeType::J_STRING ||
+          ObString(finish_reason->get_data_length(), finish_reason->get_data()) != "stop" || nullptr == message ||
+          message->json_type() != ObJsonNodeType::J_OBJECT || nullptr == result ||
+          result->json_type() != ObJsonNodeType::J_STRING) {
+        ret = OB_INVALID_DATA;
+      } else if (nullptr != (refusal = static_cast<ObJsonObject *>(message)->get_value("refusal")) &&
+                 refusal->json_type() != ObJsonNodeType::J_NULL) {
+        ret = OB_INVALID_DATA;
+      } else {
+        ObIJsonBase *document = nullptr;
+        bool is_valid = false;
+        ObJsonSchemaValidator validator(&allocator, output_schema_);
+        if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator, ObString(result->get_data_length(), result->get_data()),
+            ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, document))) {
+        } else if (OB_FAIL(validator.schema_validator(document, is_valid))) {
+        } else if (!is_valid) {
+          ret = OB_INVALID_DATA;
+        }
+      }
     }
   }
   return ret;
@@ -444,6 +604,9 @@ int ObDashscopeUtils::ObDashscopeComplete::get_body(common::ObIAllocator &alloca
   if (OB_ISNULL(model) || OB_ISNULL(content)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("model or content is null", K(ret));
+  } else if (nullptr != config && nullptr != config->get_value("response_format")) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "response_format with the native Dashscope provider");
   } else {
     // {"model": "*", "input": {"messages": [{"role": "system", "content": "*"}, {"role": "user", "content": "*"}]}, "parameters": {}}
     ObJsonObject *body_obj = nullptr;
@@ -1384,11 +1547,15 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
   } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
   } else if (OB_FAIL(complete_provider->get_body(*allocator_, request_model_name, prompt_str, prompt, config, body))) {
-  } else if (OB_FAIL(client.send_post(*allocator_, endpoint_info_.get_url(), headers, body, response))) {
-  } else if (OB_FAIL(complete_provider->parse_output(*allocator_, response, result_base))) {
-  } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(*allocator_, result_base, result_str))) {
-  } else {
-    result = result_str;
+  }
+  if (OB_SUCC(ret)) {
+    client.set_response_validator(complete_provider);
+    if (OB_FAIL(client.send_post(*allocator_, endpoint_info_.get_url(), headers, body, response))) {
+    } else if (OB_FAIL(complete_provider->parse_output(*allocator_, response, result_base))) {
+    } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(*allocator_, result_base, result_str))) {
+    } else {
+      result = result_str;
+    }
   }
   if (ret == OB_INVALID_DATA) {
     LOG_WARN("unexpected AI completion response", K(ret));
@@ -1419,6 +1586,7 @@ int ObAIFuncModel::call_completion_vector(ObArray<ObString> &prompts, ObJsonObje
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
   } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
   } else {
+    client.set_response_validator(complete_provider);
     for (int i = 0; OB_SUCC(ret) && i < prompts.count(); i++) {
       ObString prompt = prompts[i];
       if (OB_FAIL(complete_provider->get_body(*allocator_, request_model_name, prompt_str, prompt, config, body))) {

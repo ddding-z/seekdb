@@ -1,5 +1,7 @@
 # AI Function Runtime Regression
 
+Latest validation (2026-09-18): all 43 SQL contracts and the smoke suite passed after adding [constrained output](#constrained-output). Earlier failures below are retained as historical evidence.
+
 Run from the repository root after a Debug build:
 
 ```bash
@@ -27,6 +29,8 @@ python tools/deploy/mysql_test/test_suite/ai_function/test_runtime_contracts.py 
 
 The contract suite uses stdlib `unittest` to collect failures and continue through independent cases. It reuses only the isolated database launcher, not the smoke test's assertions. Each SQL test gets a separate loopback server and port, and joins the server's request threads during cleanup. Requests already sent before cancellation cannot contaminate the next case.
 
+Its SQL connection waits 75 seconds, exceeding the existing 60-second SQL deadline used by the 2048-row test. Other per-query deadlines are unchanged. The mock listens with backlog 4096 to accept a whole-batch connection burst; this changes test-service capacity, not the seekdb concurrency policy or result assertions.
+
 ### Oracle Design
 
 Expected behavior comes from the execution plan, SQL evaluation boundaries, HTTP semantics, and the public error definitions in [ob_errno.def](../../../../../src/share/ob_errno.def), not from recorded output of the modified client.
@@ -45,6 +49,8 @@ Expected behavior comes from the execution plan, SQL evaluation boundaries, HTTP
 | Retry policy | Temporary 429/500/502/503/504 retry; successful rows once; maximum four attempts | Whole-batch retries or infinite attempts |
 | Uncertain POST result | Mock reads the request then drops/truncates response; no retry | Duplicate model execution after uncertain transport failure |
 | Fail-fast | Fatal HTTP, JSON and provider errors must return before held peers' deadline and cancel remaining local transfers; submitted requests need not stop remotely | Deferred validation hidden by other requests' timeout |
+| Constrained output | Forward the exact Schema; reject malformed/unsupported configuration before HTTP; validate content, finish reason and refusal on each completed response | Prompt-only constraints, silently ignored Schema keywords, truncation, invalid structured results or delayed validation |
+| JSON string length | Count Unicode code points, including supplementary characters and embedded NUL, in both AI output and JSON_SCHEMA_VALID | Treating UTF-8 bytes or displayed graphemes as JSON Schema string length |
 | Byte limits | Valid response JSON at 8MiB minus one, exactly 8MiB and plus one; nine individually valid large responses exceed 64MiB total | Oversize fixture failing only because it was invalid JSON, or per-response-only accounting |
 | Serialized request | 1MiB control-character input expands above 4MiB when JSON escaped | Checking prompt character length instead of request bytes |
 | Deadline/cancel | Long Retry-After cannot extend query deadline; cancel during backoff returns 1317 promptly and next query succeeds | Ignoring cancel while no transfer is active |
@@ -62,9 +68,9 @@ The default batch-sized concurrency, retry count (3 retries), and byte limits ar
 - Independent SQL suite: 26 tests, 25 passed, 1 failed (46.584s in the recorded run).
 - No production code was modified during this testing task; the current Debug binary from the prior build was tested.
 
-The failing case is `RuntimeContracts.test_provider_error_stops_refill_without_waiting_for_peers`. The mock responds HTTP 200 with `{"unexpected":true}` for one row, while holding other responses. The single-request control confirms error 4070. With peers active, the query instead returns timeout 4012 after 2.002s and has submitted 9 requests. The expectation remains 4070 before 1.5s and no refill after the permanent error is observed. The test is not skipped or marked expected-failure, so the suite currently exits with status 1.
+The failing case was `RuntimeContracts.test_provider_error_stops_refill_without_waiting_for_peers`. The mock responds HTTP 200 with `{"unexpected":true}` for one row, while holding other responses. The single-request control confirms error 4070. With peers active, that version returned timeout 4012 after 2.002s and submitted 9 requests. The expectation remained 4070 before 1.5s and no refill after the permanent error was observed. The test was not skipped or marked expected-failure, so that run exited with status 1.
 
-The cause is visible in [call_completion_vector](../../../../../src/sql/engine/expr/ob_expr_ai/ob_ai_func_utils.cpp#L1431): provider parsing happens only after `send_post_batch` finishes the entire batch. HTTP and JSON validation already fail promptly, but provider validation cannot stop refill or outrank a later peer timeout. This is a known failed acceptance criterion, not permission to redefine the expected result as a timeout.
+The cause was provider parsing in [call_completion_vector](../../../../../src/sql/engine/expr/ob_expr_ai/ob_ai_func_utils.cpp) only after `send_post_batch` finished the entire batch. HTTP and JSON validation already failed promptly, but provider validation could not stop refill or outrank a later peer timeout. The constrained-output change below validates each completion response immediately and fixes this defect without accepting timeout as the expected error.
 
 An earlier apparent LIMIT failure was traced to late requests from a prior case entering shared mock counters. Per-case ports and joined request threads removed that test-fixture defect without weakening the LIMIT assertion.
 
@@ -104,10 +110,84 @@ This delegates inference admission and queueing to the service rather than a fix
 - The new 72-request response gate failed against the prior binary with only 50/72 requests received, then passed against the rebuilt binary with all 72 requests received before any response.
 - Debug build passed; both Python test files passed Pylance syntax checks. Four fixture self-tests passed.
 - Full SQL contract suite: 29 tests, 28 passed, 1 failed (78.077s), including passing 2048-row, aggregate-budget, HTTP/JSON fail-fast, retry and cancellation cases.
-- The only failure remains `test_provider_error_cancels_active_peers`: timeout 4012 after 2.007s with 72 requests submitted, instead of provider error 4070 before 1.5s. The error-code and latency assertions are unchanged; the suite still exits with status 1.
+- At this stage the only failure remained `test_provider_error_cancels_active_peers`: timeout 4012 after 2.007s with 72 requests submitted, instead of provider error 4070 before 1.5s. The error-code and latency assertions were unchanged; that run exited with status 1.
 - Smoke suite passed. The 24-row mock comparison was batch 0.828s versus scalar 6.101s; database CPU including bootstrap and the suite was 18.67s, peak RSS 367056KiB. This is not a real-provider benchmark or proof of a speedup over the prior 50-request policy.
 
 No real model service, existing debug database or Notebook was used or modified for these tests. Explicit positive client limits and low-level `no_wait` lifetime behavior were not independently exercised.
+
+## Constrained Output
+
+AI_COMPLETE accepts explicit JSON Schema constraints through its existing third argument on the OpenAI-compatible completion path. It sends `response_format.type = "json_schema"` and the original Schema to the inference service, which must support structured output generation. This follows BlendSQL's separation between output constraints and independent per-row requests, but uses the standard JSON Schema request format rather than compiling a grammar or sending legacy `guided_*` fields.
+
+The model must already be registered with a compatible endpoint. Given an `inputs(id, prompt)` table, replace `my_model` with its registered model name:
+
+```sql
+SELECT id, AI_COMPLETE('my_model', prompt, '{
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "classification",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "label": {"type": "string", "enum": ["ENGINE", "BODY"]}
+        },
+        "required": ["label"],
+        "additionalProperties": false
+      }
+    }
+  }
+}') AS result
+FROM inputs;
+```
+
+An accepted result is JSON text such as `{"label":"ENGINE"}`. AI_COMPLETE retains its SQL string result type and preserves the returned content, including whitespace and case. It does not strip code fences, repair JSON, coerce a wrong value, or regenerate invalid content. An enum constrains the output domain, not the semantic correctness of the selected label.
+
+### Supported Contract
+
+Every Schema node must be an object with an explicit, single `type`. Root scalars and arrays are locally supported, but a particular service may require an object root or impose additional restrictions. Schema property names, enums and descriptions are sent unchanged; the local compiled Schema uses a separate copy and is reused across a constant-config batch.
+
+| Area | Supported keywords or values |
+| --- | --- |
+| Types | `object`, `array`, `string`, `integer`, `number`, `boolean`, `null` |
+| Allowed values | Nonempty `enum` with distinct JSON values |
+| Objects | Recursive `properties`, string-array `required`, boolean `additionalProperties` |
+| Arrays | One recursive `items` Schema, `minItems`, `maxItems`, `uniqueItems` |
+| Strings | `minLength`, `maxLength`, measured in Unicode code points, not UTF-8 bytes or graphemes |
+| Numbers | Inclusive `minimum`, `maximum` |
+| Metadata | String `title`, `description` |
+
+Unsupported keywords are rejected rather than ignored. This includes `$ref`, `$defs`, `definitions`, `$schema`, `const`, `pattern`, `format`, combinators such as `anyOf`, union-type arrays and boolean Schemas. Length/count constraints must be nonnegative integers. This is a deliberately limited Schema subset, not a claim of full JSON Schema support.
+
+The `json_schema` definition requires a nonempty string `name`, `strict: true` and an object `schema`. Streaming must be omitted or false; `n` must be omitted or 1. Combining this mode with `structured_outputs`, `guided_json`, `guided_grammar`, `guided_regex` or `guided_choice` is rejected. No automatic SQL type inference, new SQL function or new runtime dependency is added. Existing unconstrained calls and `json_object` mode do not gain Schema guarantees.
+
+### Failure Semantics
+
+The [completion provider](../../../../../src/sql/engine/expr/ob_expr_ai/ob_ai_func_utils.cpp#L140) checks configuration before HTTP submission. When a transfer completes, the [HTTP client](../../../../../src/sql/engine/expr/ob_expr_ai/ob_ai_func_client.cpp#L350) invokes provider validation before recording success. Constrained responses require exactly one choice, `finish_reason = "stop"`, string content, no non-null `refusal`, valid JSON and a matching Schema. Temporary validation data is freed after each check. Successful results are still returned only after the entire batch completes and are aligned with their original rows.
+
+| Failure | SQL behavior |
+| --- | --- |
+| Invalid configuration or unsupported Schema | 1210 before sending a request |
+| Native `aliyun-dashscope` provider with `response_format` | 1235 before HTTP; register an OpenAI-compatible endpoint for this feature |
+| Schema violation, missing/wrong finish reason, refusal or wrong response shape | 4070; no output-repair or regeneration attempt |
+| Invalid JSON content | JSON parser error, including 3140/5447; never silently converted to NULL or accepted text |
+| Endpoint rejects structured output with HTTP 400 | 4216; no retry without the constraints |
+
+Permanent validation failures terminate the local batch without waiting for held peers. Normal HTTP retry policy remains unchanged. Canceling local transfers does not retract requests already accepted by the service. Default concurrency still equals the current batch's eligible request count; constrained decoding does not add deduplication, prompt batching, cross-batch overlap or an independent task queue.
+
+**Service boundary:** local validation cannot prove that a service applied a token mask. A service that ignores `response_format` but happens to return valid content cannot be distinguished by this check alone. Real constrained generation requires a supporting model/backend and a compatible deployed API, such as a correctly configured vLLM structured-output endpoint. The copilot-api checks recorded below establish acceptance of requests carrying a Schema and valid SQL results, not token-level enforcement. No feature-negotiation handshake, GPU backend or token-level trace is included here.
+
+### Validation: 2026-09-18
+
+- The first negative control returned valid JSON with `"engine"` outside the `"ENGINE"`/`"BODY"` enum. It failed against the earlier binary because no SQL error was raised, then passed after local Schema validation was added.
+- A Unicode boundary test exposed byte-based string length in the shared JSON Schema validator. Both validator paths now count code points; direct JSON_SCHEMA_VALID and AI tests cover ASCII, Chinese, supplementary-plane characters, combining marks, empty strings and embedded NUL.
+- The first full run hit a 40-second client timeout in the 60-second large-batch query, invalidating the connection for subsequent tests. After correcting the client budget, the same query hit its SQL deadline with only 1470/2048 requests received. Changing only the mock listen backlog from 64 to 4096 completed all 2048 requests in 8.403s. Query deadlines, input counts and result assertions were not relaxed.
+- Full SQL contract suite: **43/43 passed** in 65.074s after the fixture corrections, including all 14 new constrained-output cases and the existing provider fail-fast case. The provider error-code and latency assertions remain strict.
+- Smoke suite passed: 24-row batch 0.824s versus scalar 6.105s. Database CPU including bootstrap and the smoke suite was 18.86s, peak RSS 365228KiB. This is mock evidence, not a constrained-decoding performance measurement.
+- Debug build and focused Unicode checks passed before the complete run. No real model service, existing debug database or Notebook was used or modified.
+
+Remaining work includes server-side decoding evidence, broader real-endpoint Schema coverage, resource-failure/sanitizer coverage and broader provider testing. Schema compilation/validation allocations are not included in the HTTP client's 64MiB logical byte budget; no constant-RSS or arbitrary-Schema complexity guarantee is claimed. The historical live JSON failure below has not been rerun and is not retroactively marked fixed.
 
 ## Real Model Service Tests
 
@@ -123,6 +203,10 @@ python tools/deploy/mysql_test/test_suite/ai_function/test_runtime_live.py --sel
 SEEKDB_AI_LIVE_CASE=scalar python tools/deploy/mysql_test/test_suite/ai_function/test_runtime_live.py \
   --binary "$PWD/build_debug/bin/src/observer/seekdb" --allow-live
 
+# Constrained single-row and three-row batch tests only: four planned requests.
+SEEKDB_AI_LIVE_CASE=constrained python tools/deploy/mysql_test/test_suite/ai_function/test_runtime_live.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb" --allow-live
+
 # Full live suite, stops at the first failing test.
 python tools/deploy/mysql_test/test_suite/ai_function/test_runtime_live.py \
   --binary "$PWD/build_debug/bin/src/observer/seekdb" --allow-live
@@ -135,7 +219,7 @@ Use `/volume/xicksys/.venv/bin/python` in the current workspace. The explicit `-
 | `SEEKDB_AI_API_BASE` | `http://copilot-api:4141/v1` |
 | `SEEKDB_AI_MODEL` | `gemini-3.8-flash`, sent verbatim |
 | `SEEKDB_AI_API_KEY` | `dummy`; provide real credentials via the process environment when needed |
-| `SEEKDB_AI_LIVE_CASE` | `all`, `scalar`, `batch`, `fallback`, `json`; default `all` |
+| `SEEKDB_AI_LIVE_CASE` | `all`, `scalar`, `batch`, `fallback`, `json`, `constrained-scalar`, `constrained-batch`, or the two-case group `constrained`; default `all` |
 
 The tests append `/chat/completions` to the API base. For the default `copilot-api` host, the isolated database process bypasses the proxy, matching the Notebook's native debugging setup. Existing proxy exceptions are retained; global shell settings are not changed. Custom endpoint hosts follow the caller's proxy settings.
 
@@ -145,8 +229,10 @@ The tests append `/chat/completions` to the API base. For the default `copilot-a
 | `batch` | 3 | Three rows with constant model/config each return the correct random row ID and arithmetic answer; a fourth NULL prompt in an unselected CASE branch yields `skipped` |
 | `fallback` | 3 | Dynamic model column query returns each row's independently computed answer |
 | `json` | 1 | `AI_PROMPT('{0}', ...)` passes a prompt yielding the expected row ID and sum |
+| `constrained-scalar` | 1 | Explicit Schema requires the generated row ID from an enum and an integer answer, with both fields required and no extra keys; independent arithmetic check |
+| `constrained-batch` | 3 | Same output contract for three row IDs; exact per-row answers and a fourth NULL input skipped by CASE |
 
-The full suite normally requests eight logical completions. These are planned SQL inputs, not measured upstream attempt counts: the existing client's retries may increase network calls. In the final runner, the scalar case runs first, followed by batch, fallback and JSON. Each SQL query has a 180-second budget and the SQL connection waits 210 seconds, unlike the Notebook's 30-minute debugger allowance. This is a bounded live-test budget, not a claim about the provider's latency SLA. Errors remain failures; the script does not silently change models, retry the whole suite or extend the budget.
+The full suite now plans twelve logical completions, or four when selecting only `constrained`. These are planned SQL inputs, not measured upstream attempt counts: the existing client's retries may increase network calls. The full runner starts with scalar, batch, fallback and JSON, followed by the two constrained cases. Each SQL query has a 180-second budget and the SQL connection waits 210 seconds, unlike the Notebook's 30-minute debugger allowance. This is a bounded live-test budget, not a claim about the provider's latency SLA. Errors remain failures; the script does not silently change models, retry the whole suite or extend the budget.
 
 Arithmetic cases use `temperature=0` and `max_tokens=256`. Expected answers are computed before calling the model. The oracle rejects wrong row IDs, wrong sums, empty text, extra keys and string/boolean answers; it does not strip Markdown fences to make invalid JSON pass. Model instruction-following failures are integration failures and require diagnosis, not automatic attribution to seekdb. Exact equality between two nondeterministic generations and speedup thresholds are not asserted.
 
@@ -160,7 +246,7 @@ Without provider-side instrumentation, this suite cannot prove actual upstream c
 - The isolated `scalar` case subsequently passed with the exact `SEEKDB_AI_OK` response; SQL wall time was 160.140s.
 - At that point, no successful live batch result had been established, and live fallback/JSON cases remained unexecuted. A reachable model-list endpoint does not establish inference health, and the batch timeout alone does not isolate a seekdb bug from provider latency or queuing.
 
-Temporary registrations, test database processes and directories were cleaned up after both live runs. This does not guarantee that an upstream model stops computation after a local timeout. The previously identified provider fail-fast defect in the independent mock contract suite remains unresolved.
+Temporary registrations, test database processes and directories were cleaned up after both live runs. This does not guarantee that an upstream model stops computation after a local timeout. At that time the provider fail-fast defect in the independent mock contract suite remained unresolved; it is fixed by the later per-response validation described above.
 
 ### Retest After Network Recovery: 2026-09-17
 
@@ -176,3 +262,19 @@ The user reported that the network issue had been resolved. The full live suite 
 Across the two invocations, all four cases were exercised: three passed and one failed, with eight planned logical completions and no query timeouts. The fallback case was not repeatedly retried until it passed, and its JSON assertion was not weakened. The actual upstream attempt count was not measured.
 
 The remaining failure is an output-format/integration failure, not the earlier network timeout. Its origin is not established: returned SQL text was not complete valid JSON, but this alone cannot distinguish model output or generation truncation from a database output issue. The existing output-token limit and all other test settings were left unchanged. Both isolated database instances and their temporary registrations were cleaned up.
+
+### Constrained Live Results: 2026-09-20
+
+With user authorization, the real `http://copilot-api:4141/v1/chat/completions` endpoint and `gemini-3.8-flash` model were tested using `temperature=0`, `max_tokens=256` and the existing 180-second budget. Only synthetic arithmetic prompts and random row IDs were sent. No mock service participated in these calls.
+
+| Check | Planned requests | Wall time | Result |
+| --- | --- | --- | --- |
+| Direct HTTP Schema probe, without seekdb | 1 | 4.137s | HTTP 200, `finish_reason="stop"`, no refusal, exact row ID and integer answer |
+| SQL `constrained-scalar` | 1 | 3.709s | Passed seekdb's output-contract validation and the independent row-ID/arithmetic oracle |
+| SQL `constrained-batch` | 3 | 4.147s | All three results matched their original rows; the fourth NULL input returned `skipped` |
+
+The SQL run used the `constrained` selector and an isolated temporary database. Both tests passed on the first run; registrations, process and temporary data were cleaned up. Five offline oracle/opt-in tests and Python syntax/editor diagnostics also passed. No production C++ code, Notebook or existing debug database was changed for this testing step.
+
+The direct probe issued one HTTP request with no retry. The SQL runner planned four requests; its existing per-request retry policy and the gateway's upstream attempts were not instrumented, so five logical calls must not be presented as a measured upstream request count. There was no retry-until-pass, model switch, token-budget increase or constraint downgrade.
+
+This establishes that the endpoint accepts this object/enum/integer Schema request and that seekdb can consume valid real-model results through single-row and batch SQL. It does not establish support for the entire local Schema subset, prove the exact remote concurrency, or prove token masking: the prompts also requested the same JSON format, and no decoding backend trace or constrained/unconstrained comparison was captured. The previous unconstrained dynamic-model fallback failure was not rerun or marked fixed.

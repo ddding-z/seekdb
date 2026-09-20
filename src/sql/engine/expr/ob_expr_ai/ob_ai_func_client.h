@@ -35,6 +35,7 @@ public:
   void reset();
   void set_timeout_sec(int64_t timeout_sec) { timeout_sec_ = timeout_sec; }
   void set_max_parallel(int64_t max_parallel) { max_parallel_ = max_parallel; }
+  void set_response_validator(ObAIFuncBase *validator) { response_validator_ = validator; }
   void set_status_checker(int (*checker)(void *), void *context)
   {
     status_checker_ = checker;
@@ -89,6 +90,7 @@ private:
   int batch_ret_;
   int (*status_checker_)(void *);
   void *status_context_;
+  ObAIFuncBase *response_validator_;
   int64_t batch_start_ts_;
   int64_t attempts_;
   int64_t retries_;

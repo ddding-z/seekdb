@@ -16,7 +16,7 @@ import pymysql
 
 
 class MockServer(ThreadingHTTPServer):
-    request_queue_size = 64
+    request_queue_size = 4096
     daemon_threads = True
 
     def __init__(self):

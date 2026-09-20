@@ -23,9 +23,18 @@ def answer(prompt):
     return 'result:"' + prompt + '"\n'
 
 
-def completion(content):
-    return json.dumps({"choices": [{"message": {"content": content}}]},
-                      ensure_ascii=False).encode("utf-8")
+def completion(content, *, finish_reason=None, refusal=None):
+    choice = {"message": {"content": content}}
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
+    if refusal is not None:
+        choice["message"]["refusal"] = refusal
+    return json.dumps({"choices": [choice]}, ensure_ascii=False).encode("utf-8")
+
+
+def constrained_options(schema):
+    return {"response_format": {"type": "json_schema", "json_schema": {
+        "name": "seekdb_output", "strict": True, "schema": schema}}}
 
 
 def sized_completion(size):
@@ -236,6 +245,12 @@ class RuntimeContracts(unittest.TestCase):
         self.cursor.execute(f"SELECT id, {expression} FROM inputs {suffix}")
         return self.cursor.fetchall()
 
+    def query_constrained(self, schema, model="'contract_model'", **options):
+        config = constrained_options(schema) | options
+        self.cursor.execute(f"SELECT id, AI_COMPLETE({model}, prompt, %s) FROM inputs ORDER BY id",
+                            (json.dumps(config),))
+        return self.cursor.fetchall()
+
     def gate(self):
         gate = threading.Event()
         self.gates.append(gate)
@@ -339,6 +354,205 @@ class RuntimeContracts(unittest.TestCase):
         self.assertEqual(Counter(body["messages"][0]["content"] for body in self.server.requests), Counter(prompts))
         self.assertTrue(all(entry["headers"]["authorization"] == "Bearer contract-test-only"
                             for entry in self.server.audit))
+
+    def test_constrained_output_rejects_schema_violation(self):
+        prompt = "schema-invalid"
+        self.load([prompt])
+        schema = {"type": "object", "properties": {"label": {"type": "string", "enum": ["ENGINE", "BODY"]}},
+                  "required": ["label"], "additionalProperties": False}
+        options = {"response_format": {"type": "json_schema", "json_schema": {
+            "name": "classification", "strict": True, "schema": schema}}}
+        response = {"choices": [{"finish_reason": "stop", "message": {"content": '{"label":"engine"}'}}]}
+        self.server.scenarios[prompt] = [Reply(body=json.dumps(response).encode())]
+        sql_error(self, 4070, lambda: self.cursor.execute(
+            "SELECT AI_COMPLETE('contract_model', prompt, %s) FROM inputs", (json.dumps(options),)))
+        self.assertEqual(self.server.counts, Counter({prompt: 1}))
+        self.assertEqual(self.server.requests[0]["response_format"], options["response_format"])
+
+    def test_constrained_output_preserves_batch_and_scalar_results(self):
+        prompts = [f"structured-{index}" for index in range(3)]
+        self.load(prompts)
+        schema = {"type": "object", "properties": {
+            "ID": {"type": "integer"}, "Label": {"type": "string", "enum": ["ENGINE", "BODY"]},
+            "Flags": {"type": "array", "items": {"type": "boolean"}, "minItems": 2, "maxItems": 2}},
+            "required": ["ID", "Label", "Flags"], "additionalProperties": False}
+        texts = [f' {{"ID": {index}, "Label": "ENGINE", "Flags": [true, false]}}\n'
+                 for index in range(len(prompts))]
+        for prompt, text in zip(prompts, texts):
+            self.server.scenarios[prompt] = [Reply(body=completion(text, finish_reason="stop"))]
+        self.server.scenarios[prompts[0]][0].peers = len(prompts)
+        expected = tuple(enumerate(texts))
+        self.assertEqual(self.query_constrained(schema, temperature=0), expected)
+        self.server.scenarios[prompts[0]][0].peers = 0
+        self.assertEqual(self.query_constrained(schema, model="model", temperature=0), expected)
+        self.assertEqual(self.server.counts, Counter({prompt: 2 for prompt in prompts}))
+        for body in self.server.requests:
+            self.assertEqual(body["response_format"], constrained_options(schema)["response_format"])
+            self.assertEqual(body["temperature"], 0)
+            self.assertEqual(body["model"], "mock")
+            self.assertEqual(len(body["messages"]), 1)
+            self.assertIn(body["messages"][0]["content"], prompts)
+
+    def test_constrained_output_handles_dynamic_config(self):
+        self.load(["integer-output", "boolean-output"])
+        configs = [constrained_options({"type": "integer"}), constrained_options({"type": "boolean"})]
+        self.server.scenarios["integer-output"] = [Reply(body=completion("7", finish_reason="stop"))]
+        self.server.scenarios["boolean-output"] = [Reply(body=completion("true", finish_reason="stop"))]
+        self.cursor.execute("SELECT id, AI_COMPLETE('contract_model', prompt, "
+                            "CASE WHEN id = 0 THEN %s ELSE %s END) FROM inputs ORDER BY id",
+                            tuple(json.dumps(config) for config in configs))
+        self.assertEqual(self.cursor.fetchall(), ((0, "7"), (1, "true")))
+        self.assertEqual([body["response_format"] for body in self.server.requests],
+                         [config["response_format"] for config in configs])
+
+    def test_constrained_output_supports_scalar_and_array_types(self):
+        cases = [({"type": "boolean"}, "true"), ({"type": "null"}, "null"),
+                 ({"type": "integer", "minimum": 0, "maximum": 10}, "7"),
+                 ({"type": "number", "minimum": 0, "maximum": 2}, "1.25"),
+                 ({"type": "string", "enum": ["ENGINE", "BODY"]}, '"ENGINE"'),
+                 ({"type": "string", "minLength": 1, "maxLength": 2}, '"\u6d4b\u8bd5"'),
+                 ({"type": "string", "minLength": 1, "maxLength": 1}, '"\U0001f642"'),
+                 ({"type": "string", "minLength": 2, "maxLength": 2}, '"e\u0301"'),
+                 ({"type": "string", "minLength": 0, "maxLength": 0}, '""'),
+                 ({"type": "string", "minLength": 3, "maxLength": 3}, '"a\\u0000b"'),
+                 ({"type": "array", "items": {"type": "integer"}, "minItems": 3,
+                   "maxItems": 3, "uniqueItems": True}, "[1,2,3]")]
+        for index, (schema, text) in enumerate(cases):
+            with self.subTest(schema=schema):
+                self.cursor.execute("TRUNCATE TABLE inputs")
+                prompt = f"typed-{index}"
+                self.load([prompt])
+                self.server.scenarios[prompt] = [Reply(body=completion(text, finish_reason="stop"))]
+                self.assertEqual(self.query_constrained(schema), ((0, text),))
+                self.assertEqual(self.server.counts[prompt], 1)
+
+    def test_constrained_output_checks_nested_and_length_constraints(self):
+        object_schema = {"type": "object", "properties": {"Value": {"type": "integer"}},
+                         "required": ["Value"], "additionalProperties": False}
+        array_schema = {"type": "array", "items": {"type": "integer"},
+                        "minItems": 2, "maxItems": 2, "uniqueItems": True}
+        cases = [(object_schema, '{}'), (object_schema, '{"Value":"1"}'),
+                 (object_schema, '{"Value":1,"extra":0}'), (array_schema, '[1]'),
+                 (array_schema, '[1,2,3]'), (array_schema, '[1,"2"]'), (array_schema, '[1,1]'),
+                 ({"type": "integer"}, "true"), ({"type": "integer"}, "1.5"),
+                 ({"type": "number", "minimum": 1, "maximum": 2}, "3"),
+                 ({"type": "string", "minLength": 2}, '"a"'),
+                 ({"type": "string", "minLength": 3}, '"\u6d4b\u8bd5"'),
+                 ({"type": "string", "minLength": 2}, '"\U0001f642"'),
+                 ({"type": "string", "maxLength": 0}, '"a"'),
+                 ({"type": "string", "maxLength": 2}, '"abc"')]
+        for index, (schema, text) in enumerate(cases):
+            with self.subTest(schema=schema, text=text):
+                self.cursor.execute("TRUNCATE TABLE inputs")
+                prompt = f"constraint-{index}"
+                self.load([prompt])
+                self.server.scenarios[prompt] = [Reply(body=completion(text, finish_reason="stop"))]
+                sql_error(self, 4070, lambda: self.query_constrained(schema))
+                self.assertEqual(self.server.counts[prompt], 1)
+
+    def test_constrained_schema_unicode_lengths_match_json_schema_valid(self):
+        for value, length in (("abc", 3), ("\u6d4b\u8bd5", 2), ("\U0001f642", 1),
+                              ("e\u0301", 2), ("", 0), ("a\x00b", 3)):
+            schemas = [({"maxLength": length}, 1), ({"minLength": length + 1}, 0),
+                       ({"type": "string", "minLength": length, "maxLength": length}, 1),
+                       ({"type": "string", "minLength": length + 1}, 0)]
+            for schema, expected in schemas:
+                with self.subTest(value=value, schema=schema):
+                    self.cursor.execute("SELECT JSON_SCHEMA_VALID(%s, %s)",
+                                        (json.dumps(schema), json.dumps(value)))
+                    self.assertEqual(self.cursor.fetchone(), (expected,))
+        self.assertFalse(self.server.audit)
+
+    def test_constrained_invalid_schema_is_rejected_before_http(self):
+        self.load(["invalid-schema"])
+        schemas = [None, False, [], {}, {"type": "invalid"}, {"type": ["string", "null"]},
+                   {"type": "string", "enum": []}, {"type": "string", "enum": "ENGINE"},
+                   {"type": "string", "minLength": "4"}, {"type": "string", "pattern": "^a$"},
+                   {"type": "string", "const": "ENGINE"}, {"type": "object", "$ref": "#/missing"},
+                   {"type": "object", "required": [42]}, {"type": "object", "properties": []},
+                   {"type": "object", "properties": {"nested": {"type": "string", "const": "X"}}},
+                   {"type": "object", "properties": {"nested": {}}},
+                   {"type": "array", "items": True}, {"type": "array", "minItems": -1}]
+        for schema in schemas:
+            with self.subTest(schema=schema):
+                sql_error(self, 1210, lambda: self.query_constrained(schema))
+                self.assertFalse(self.server.audit)
+
+    def test_constrained_invalid_config_is_rejected_before_http(self):
+        self.load(["invalid-config"])
+        config = constrained_options({"type": "boolean"})
+        definition = config["response_format"]["json_schema"]
+        configs = [{"response_format": []}, {"response_format": {}},
+                   {"response_format": {"type": "json_schema"}}]
+        for change in ({"strict": False}, {"strict": "true"}, {"name": ""}, {"name": 5}):
+            configs.append({"response_format": {"type": "json_schema", "json_schema": definition | change}})
+        configs.append({"response_format": {"type": "json_schema", "json_schema": {
+            "name": "missing_strict", "schema": {"type": "boolean"}}}})
+        for change in ({"stream": True}, {"stream": "false"}, {"n": 2}, {"n": 0},
+                       {"structured_outputs": {"json": {"type": "boolean"}}}, {"guided_grammar": "root ::= 'true'"}):
+            configs.append(config | change)
+        for invalid in configs:
+            with self.subTest(config=invalid):
+                sql_error(self, 1210, lambda: self.cursor.execute(
+                    "SELECT AI_COMPLETE('contract_model', prompt, %s) FROM inputs", (json.dumps(invalid),)))
+                self.assertFalse(self.server.audit)
+
+    def test_constrained_output_rejects_incomplete_or_refused_responses(self):
+        replies = [completion('"ENGINE"', finish_reason=reason)
+                   for reason in (None, "length", "content_filter", "tool_calls", "", 1)]
+        replies += [completion('"ENGINE"', finish_reason="stop", refusal=refusal)
+                    for refusal in ("refused", "", False)]
+        replies += [completion(content, finish_reason="stop") for content in (None, {}, ["ENGINE"])]
+        for index, body in enumerate(replies):
+            with self.subTest(index=index):
+                self.cursor.execute("TRUNCATE TABLE inputs")
+                prompt = f"incomplete-{index}"
+                self.load([prompt])
+                self.server.scenarios[prompt] = [Reply(body=body)]
+                sql_error(self, 4070, lambda: self.query_constrained({"type": "string", "enum": ["ENGINE"]}))
+                self.assertEqual(self.server.counts[prompt], 1)
+
+    def test_constrained_output_requires_strict_json(self):
+        cases = [({"type": "boolean"}, "TRUE"), ({"type": "boolean"}, "False"),
+                 ({"type": "number"}, "NaN"), ({"type": "number"}, "Infinity"),
+                 ({"type": "object"}, '{"value":1,}'), ({"type": "object"}, '{} trailing'),
+                 ({"type": "object"}, '```json\n{}\n```')]
+        for index, (schema, text) in enumerate(cases):
+            with self.subTest(text=text):
+                self.cursor.execute("TRUNCATE TABLE inputs")
+                prompt = f"json-syntax-{index}"
+                self.load([prompt])
+                self.server.scenarios[prompt] = [Reply(body=completion(text, finish_reason="stop"))]
+                sql_error(self, (4070, 3140, 5447), lambda: self.query_constrained(schema))
+                self.assertEqual(self.server.counts[prompt], 1)
+
+    def test_constrained_output_respects_case_skips(self):
+        self.load([None, "selected", ""])
+        self.server.scenarios["selected"] = [Reply(body=completion("true", finish_reason="stop"))]
+        config = json.dumps(constrained_options({"type": "boolean"}))
+        self.cursor.execute("SELECT id, CASE WHEN id = 1 THEN AI_COMPLETE('contract_model', prompt, %s) "
+                            "ELSE 'skip' END FROM inputs ORDER BY id", (config,))
+        self.assertEqual(self.cursor.fetchall(), ((0, "skip"), (1, "true"), (2, "skip")))
+        self.assertEqual(self.server.counts, Counter({"selected": 1}))
+
+    def test_constrained_endpoint_rejection_does_not_downgrade(self):
+        self.load(["unsupported-endpoint"])
+        self.server.scenarios["unsupported-endpoint"] = [Reply(400, b'{"error":"unsupported response_format"}')]
+        schema = {"type": "boolean"}
+        sql_error(self, 4216, lambda: self.query_constrained(schema))
+        self.assertEqual(self.server.counts, Counter({"unsupported-endpoint": 1}))
+        self.assertEqual(self.server.requests[0]["response_format"], constrained_options(schema)["response_format"])
+
+    def test_constrained_native_provider_is_rejected_before_http(self):
+        self.load(["native-provider"])
+        self.cursor.execute("CALL DBMS_AI_SERVICE.CREATE_AI_MODEL(%s, %s)",
+                            ("native_schema_model", json.dumps({"type": "completion", "model_name": "mock"})))
+        endpoint = {"ai_model_name": "native_schema_model", "url": f"http://127.0.0.1:{self.server.server_port}/",
+                    "access_key": "contract-test-only", "provider": "aliyun-dashscope", "request_model_name": "mock"}
+        self.cursor.execute("CALL DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT(%s, %s)",
+                            ("native_schema_endpoint", json.dumps(endpoint)))
+        sql_error(self, 1235, lambda: self.query_constrained({"type": "boolean"}, model="'native_schema_model'"))
+        self.assertFalse(self.server.audit)
 
     def test_case_skips_invalid_unselected_inputs(self):
         self.load([None, "", "valid", None])
@@ -510,7 +724,7 @@ class RuntimeContracts(unittest.TestCase):
         sql_error(self, 4019, self.query)
         self.assertFalse(self.server.audit)
 
-    def fail_fast(self, reply, code):
+    def fail_fast(self, reply, code, expression="AI_COMPLETE('contract_model', prompt)"):
         prompts = ["fatal"] + [f"held-{index}" for index in range(71)]
         self.load(prompts)
         gate = self.gate()
@@ -521,7 +735,7 @@ class RuntimeContracts(unittest.TestCase):
         self.cursor.execute("SET ob_query_timeout = 2000000")
         start = time.monotonic()
         with self.assertRaises(pymysql.MySQLError) as caught:
-            self.query()
+            self.query(expression)
         elapsed = time.monotonic() - start
         evidence = f"elapsed={elapsed:.3f}s submitted={len(self.server.audit)} error={caught.exception.args}"
         self.assertEqual(caught.exception.args[0], code, evidence)
@@ -535,6 +749,11 @@ class RuntimeContracts(unittest.TestCase):
 
     def test_provider_error_cancels_active_peers(self):
         self.fail_fast(Reply(body=b'{"unexpected":true}'), 4070)
+
+    def test_constrained_output_error_cancels_active_peers(self):
+        config = self.connection.escape(json.dumps(constrained_options({"type": "boolean"})))
+        self.fail_fast(Reply(body=completion('"not-a-boolean"', finish_reason="stop")), 4070,
+                       f"AI_COMPLETE('contract_model', prompt, {config})")
 
     def test_json_error_cancels_active_peers(self):
         self.fail_fast(Reply(body=b"[]"), 3140)
@@ -581,4 +800,4 @@ if __name__ == "__main__":
     if "--self-test" in sys.argv:
         unittest.main(argv=[sys.argv[0]], defaultTest="HarnessTests", verbosity=2)
     else:
-        runtime.main(run_contracts)
+        runtime.main(run_contracts, sql_timeout=75)

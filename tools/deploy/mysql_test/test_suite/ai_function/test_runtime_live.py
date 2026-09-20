@@ -25,7 +25,18 @@ CASES = {
     "batch": ("test_batch_row_mapping_and_case_skip", 3),
     "fallback": ("test_dynamic_model_scalar_fallback", 3),
     "json": ("test_json_prompt", 1),
+    "constrained-scalar": ("test_constrained_scalar", 1),
+    "constrained-batch": ("test_constrained_batch", 3),
 }
+
+
+def constrained_options(row_ids):
+    return OPTIONS | {"response_format": {"type": "json_schema", "json_schema": {
+        "name": "arithmetic_result", "strict": True,
+        "schema": {"type": "object", "properties": {
+            "row_id": {"type": "string", "enum": list(row_ids)},
+            "answer": {"type": "integer"}},
+            "required": ["row_id", "answer"], "additionalProperties": False}}}}
 
 
 def request_for(row_id, left, right):
@@ -80,6 +91,20 @@ class OracleTests(unittest.TestCase):
         prompt = request_for('row-"quoted', 3, 5)
         self.assertIn(json.dumps('row-"quoted'), prompt)
         self.assertIn("3 + 5", prompt)
+
+    def test_constrained_options_preserve_exact_row_ids(self):
+        row_ids = ['ROW-"quoted', "row-b"]
+        options = constrained_options(row_ids)
+        definition = options["response_format"]["json_schema"]
+        self.assertEqual(options["response_format"]["type"], "json_schema")
+        self.assertIs(definition["strict"], True)
+        self.assertEqual(definition["schema"], {
+            "type": "object", "properties": {
+                "row_id": {"type": "string", "enum": row_ids},
+                "answer": {"type": "integer"}},
+            "required": ["row_id", "answer"], "additionalProperties": False})
+        self.assertEqual({key: options[key] for key in OPTIONS}, OPTIONS)
+        self.assertNotIn("response_format", OPTIONS)
 
 
 class LiveSQLTests(unittest.TestCase):
@@ -178,15 +203,38 @@ class LiveSQLTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         validate_answer(rows[0][0], row_id, 17)
 
+    def test_constrained_scalar(self):
+        row_id = uuid.uuid4().hex
+        rows = self.execute("SELECT AI_COMPLETE(%s, %s, %s)",
+                            (self.model_name, request_for(row_id, 3, 5),
+                             json.dumps(constrained_options([row_id]))), 1)
+        self.assertEqual(len(rows), 1)
+        validate_answer(rows[0][0], row_id, 8)
+
+    def test_constrained_batch(self):
+        expected = self.load_arithmetic_inputs()
+        self.cursor.execute("INSERT INTO inputs VALUES (3, NULL, %s)", (self.model_name,))
+        options = constrained_options(row_id for row_id, _ in expected.values())
+        rows = self.execute("SELECT id, CASE WHEN id < 3 THEN AI_COMPLETE(%s, prompt, %s) "
+                            "ELSE 'skipped' END FROM inputs ORDER BY id",
+                            (self.model_name, json.dumps(options)), 3)
+        self.assertEqual(rows[-1], (3, "skipped"))
+        self.check_rows(rows[:-1], expected)
+
 
 def run_live_checks(connection, server, sql_socket):
     if server is not None:
         raise AssertionError("Live tests must not start a mock service")
     LiveSQLTests.connection = connection
     selected = os.environ.get("SEEKDB_AI_LIVE_CASE", "all")
-    if selected != "all" and selected not in CASES:
-        raise ValueError("SEEKDB_AI_LIVE_CASE must be all, scalar, batch, fallback or json")
-    cases = list(CASES.values()) if selected == "all" else [CASES[selected]]
+    if selected == "constrained":
+        cases = [CASES["constrained-scalar"], CASES["constrained-batch"]]
+    elif selected == "all":
+        cases = list(CASES.values())
+    elif selected in CASES:
+        cases = [CASES[selected]]
+    else:
+        raise ValueError("SEEKDB_AI_LIVE_CASE must be all, constrained, or " + ", ".join(CASES))
     logical_requests = sum(count for _, count in cases)
     print(f"LIVE provider=openai model={MODEL} host={urlsplit(API_BASE).hostname}; "
           f"case={selected} logical_requests={logical_requests} on success; "

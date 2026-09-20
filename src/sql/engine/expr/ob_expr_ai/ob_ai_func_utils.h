@@ -32,7 +32,7 @@ public:
   class ObOpenAIComplete : public ObAIFuncIComplete 
   {
   public:
-    ObOpenAIComplete() {}
+    ObOpenAIComplete() : output_config_(nullptr), output_schema_(nullptr) {}
     virtual ~ObOpenAIComplete() {}
     virtual int get_header(common::ObIAllocator &allocator,
                            common::ObString &api_key,
@@ -46,10 +46,16 @@ public:
     virtual int parse_output(common::ObIAllocator &allocator,
                              common::ObJsonObject *http_response,
                              common::ObIJsonBase *&result) override;
+    virtual int validate_response(common::ObIAllocator &allocator,
+                     common::ObJsonObject *http_response) override;
     virtual int set_config_json_format(common::ObIAllocator &allocator, common::ObJsonObject *config) override;
     static int construct_messages_array(ObIAllocator &allocator, ObString &prompt, ObString &content, ObJsonArray *&messages);
     static int construct_message_obj(ObIAllocator &allocator, ObString &role, ObString &content, ObJsonObject *&message);
   private:
+    int prepare_output_schema(ObIAllocator &allocator, ObJsonObject *config);
+    int validate_output_schema(ObIAllocator &allocator, ObJsonObject *response, ObIJsonBase *result);
+    ObJsonObject *output_config_;
+    ObIJsonBase *output_schema_;
     DISALLOW_COPY_AND_ASSIGN(ObOpenAIComplete);
   };
 

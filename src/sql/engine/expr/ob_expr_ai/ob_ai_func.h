@@ -67,6 +67,11 @@ public:
   virtual int parse_output(common::ObIAllocator &allocator,
                            common::ObJsonObject *http_response,
                            common::ObIJsonBase *&result) = 0;
+  virtual int validate_response(common::ObIAllocator &allocator, common::ObJsonObject *http_response)
+  {
+    common::ObIJsonBase *result = nullptr;
+    return parse_output(allocator, http_response, result);
+  }
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncBase);
 };

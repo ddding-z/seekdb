@@ -19,6 +19,7 @@
 #include <regex>
 #include "ob_json_bin.h"
 #include "ob_json_parse.h"
+#include "lib/charset/ob_charset.h"
 
 namespace oceanbase {
 namespace common {
@@ -3035,6 +3036,8 @@ int ObJsonSchemaValidator::check_number_and_integer(ObIJsonBase *json_doc, ObIJs
 int ObJsonSchemaValidator::check_string_type(ObIJsonBase *json_doc, ObIArray<ObIJsonBase*> &schema_vec, bool& is_valid)
 {
   INIT_SUCC(ret);
+  const int64_t char_length = ObCharset::strlen_char(CS_TYPE_UTF8MB4_BIN,
+      json_doc->get_data(), json_doc->get_data_length());
   int size = schema_vec.count();
   for (int i = 0; i < size && OB_SUCC(ret) && is_valid; ++i) {
     ObIJsonBase* tmp_schema = schema_vec.at(i);
@@ -3044,7 +3047,7 @@ int ObJsonSchemaValidator::check_string_type(ObIJsonBase *json_doc, ObIArray<ObI
         ret = OB_SUCCESS; // didn't found, its normal
       }
     } else if (OB_ISNULL(def_value)) {
-    } else if (json_doc->get_data_length() > def_value->get_int()) {
+    } else if (char_length > def_value->get_int()) {
       is_valid = false;
       failed_keyword_ = ObJsonSchemaItem::MAX_LEN;
     }
@@ -3056,7 +3059,7 @@ int ObJsonSchemaValidator::check_string_type(ObIJsonBase *json_doc, ObIArray<ObI
         ret = OB_SUCCESS; // didn't found, its normal
       }
     } else if (OB_ISNULL(def_value)) {
-    } else if (json_doc->get_data_length() < def_value->get_int()) {
+    } else if (char_length < def_value->get_int()) {
       is_valid = false;
       failed_keyword_ = ObJsonSchemaItem::MIN_LEN;
     }
@@ -3154,14 +3157,14 @@ int ObJsonSchemaValidator::check_string_type(ObIJsonBase *json_doc, ObIJsonBase 
         break;
       }
       case JS_STRMAX_LEN: {
+        const int64_t char_length = ObCharset::strlen_char(CS_TYPE_UTF8MB4_BIN,
+            json_doc->get_data(), json_doc->get_data_length());
         if (key_word[1] == 'a') { // maxLength
-          int data_len = json_doc->get_data_length();
-          int schema_len = value->get_int();  // must be int
-          is_valid = (data_len <= schema_len);
+          int64_t schema_len = value->get_int();  // must be int
+          is_valid = (char_length <= schema_len);
         } else if (key_word[1] == 'i') { // minLength
-          int data_len = json_doc->get_data_length();
-          int schema_len = value->get_int();
-          is_valid = (data_len >= schema_len);
+          int64_t schema_len = value->get_int();
+          is_valid = (char_length >= schema_len);
         }
         break;
       }
