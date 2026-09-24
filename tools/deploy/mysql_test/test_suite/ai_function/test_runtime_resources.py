@@ -22,7 +22,7 @@ WRAPPED = ("curl_easy_init", "curl_easy_cleanup", "curl_multi_init", "curl_multi
 
 def build_test(build_dir, output):
     entries = json.loads((ROOT / "compile_commands.json").read_text())
-    entry = next(item for item in entries if item["file"].endswith("/ob_ai_func_client.cpp"))
+    entry = next(item for item in entries if item["file"].endswith("/ob_ai_func_op.cpp"))
     directory = Path(entry["directory"])
     query = subprocess.run([
         sys.executable, str(ROOT / "bazel.py"), f"--build-dir={build_dir}", "aquery",

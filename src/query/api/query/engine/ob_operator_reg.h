@@ -154,6 +154,12 @@ REGISTER_OPERATOR(ObLogDistinct, PHY_HASH_DISTINCT, ObHashDistinctSpec,
                   ObHashDistinctOp, NOINPUT, VECTORIZED_OP);
 
 class ObLogMaterial;
+class LogAIFunc;
+class AIFuncSpec;
+class AIFuncOp;
+REGISTER_OPERATOR(LogAIFunc, PHY_AI_FUNC, AIFuncSpec, AIFuncOp, NOINPUT,
+                  VECTORIZED_OP);
+
 class ObMaterialSpec;
 class ObMaterialOp;
 class ObMaterialOpInput;

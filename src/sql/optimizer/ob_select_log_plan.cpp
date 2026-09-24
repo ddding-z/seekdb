@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_OPT
 #include "ob_select_log_plan.h"
+#include "ob_log_ai_func.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_log_table_scan.h"
 #include "sql/optimizer/ob_log_join.h"
@@ -4897,6 +4898,85 @@ int ObSelectLogPlan::generate_raw_plan_for_plain_select()
   return ret;
 }
 
+static int check_ai_pipeline_input(const ObRawExpr *expr, bool &supported)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (expr->is_column_ref_expr() || expr->is_static_scalar_const_expr()) {
+  } else if (!expr->is_op_expr()) {
+    supported = false;
+  } else {
+    for (int64_t index = 0; OB_SUCC(ret) && supported && index < expr->get_param_count(); ++index) {
+      ret = SMART_CALL(check_ai_pipeline_input(expr->get_param_expr(index), supported));
+    }
+  }
+  return ret;
+}
+
+int ObSelectLogPlan::candi_allocate_ai_func()
+{
+  int ret = OB_SUCCESS;
+  const ObSelectStmt &stmt = *get_stmt();
+  ObRawExpr *ai_expr = nullptr;
+  bool supported = is_final_root_plan() && stmt.is_single_table_stmt() &&
+                   stmt.get_table_item(0)->is_basic_table() && !stmt.is_set_stmt() &&
+                   !stmt.has_limit() && !stmt.has_group_by() && !stmt.has_having() &&
+                   !stmt.has_window_function() && !stmt.has_distinct() &&
+                   !stmt.has_for_update() && !stmt.has_select_into() && stmt.get_subquery_expr_size() == 0;
+  for (int64_t index = 0; supported && index < stmt.get_select_item_size(); ++index) {
+    ObRawExpr *expr = stmt.get_select_item(index).expr_;
+    const bool is_ai_function = expr->get_expr_type() == T_FUN_SYS_AI_EMBED ||
+                               expr->get_expr_type() == T_FUN_SYS_AI_COMPLETE;
+    const ObRawExpr *content = is_ai_function ? expr->get_param_expr(1) : nullptr;
+    while (nullptr != content && content->get_expr_type() == T_FUN_SYS_CAST) {
+      content = content->get_param_expr(0);
+    }
+    if (is_ai_function && ai_expr == nullptr &&
+        expr->get_param_expr(0)->is_static_scalar_const_expr() &&
+        nullptr != content && content->is_column_ref_expr() &&
+        (expr->get_param_count() == 2 || expr->get_param_expr(2)->is_static_scalar_const_expr())) {
+      ai_expr = expr;
+    } else if (!expr->is_column_ref_expr() && !expr->is_static_scalar_const_expr()) {
+      supported = false;
+    }
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && supported && index < stmt.get_condition_size(); ++index) {
+    ret = check_ai_pipeline_input(stmt.get_condition_exprs().at(index), supported);
+  }
+  for (int64_t index = 0; supported && index < stmt.get_order_item_size(); ++index) {
+    const ObRawExpr *expr = stmt.get_order_items().at(index).expr_;
+    supported = expr->is_column_ref_expr() || expr->is_static_scalar_const_expr();
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && supported && nullptr != ai_expr &&
+                        index < candidates_.candidate_plans_.count(); ++index) {
+    ObLogicalOperator *&top = candidates_.candidate_plans_.at(index).plan_tree_;
+    bool simple_plan = top->get_parallel() == 1;
+    for (ObLogicalOperator *node = top; simple_plan && nullptr != node;
+         node = node->get_child(ObLogicalOperator::first_child)) {
+      if (node->get_type() == log_op_def::LOG_TABLE_SCAN) {
+        break;
+      } else if (node->get_type() != log_op_def::LOG_SORT) {
+        simple_plan = false;
+      }
+    }
+    if (simple_plan) {
+      auto *pipeline = static_cast<LogAIFunc *>(get_log_op_factory().allocate(*this, log_op_def::LOG_AI_FUNC));
+      if (OB_ISNULL(pipeline)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        pipeline->set_ai_expr(ai_expr);
+        pipeline->set_child(ObLogicalOperator::first_child, top);
+        if (OB_FAIL(pipeline->compute_property())) {
+        } else {
+          top = pipeline;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObSelectLogPlan::allocate_plan_top()
 {
   int ret = OB_SUCCESS;
@@ -5022,6 +5102,9 @@ int ObSelectLogPlan::allocate_plan_top()
         LOG_TRACE("succeed to allocate select into clause",
             K(candidates_.candidate_plans_.count()));
       }
+    }
+
+    if (OB_SUCC(ret) && OB_FAIL(candi_allocate_ai_func())) {
     }
 
     // allocate root exchange

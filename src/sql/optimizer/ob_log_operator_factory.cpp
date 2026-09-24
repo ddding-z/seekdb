@@ -31,6 +31,7 @@
 #include "ob_log_json_table.h"
 #include "ob_log_values.h"
 #include "ob_log_material.h"
+#include "ob_log_ai_func.h"
 #include "ob_log_window_function.h"
 #include "ob_log_select_into.h"
 #include "ob_log_topk.h"
@@ -186,6 +187,13 @@ ObLogicalOperator *ObLogOperatorFactory::allocate(ObLogPlan &plan, ObLogOpType t
     if (NULL != ptr) {
       ret_op = new (ptr) ObLogValues(plan);
     } else { /* do nothing */ }
+    break;
+  }
+  case LOG_AI_FUNC: {
+    ptr = allocator_.alloc(sizeof(LogAIFunc));
+    if (NULL != ptr) {
+      ret_op = new (ptr) LogAIFunc(plan);
+    }
     break;
   }
   case LOG_MATERIAL: {

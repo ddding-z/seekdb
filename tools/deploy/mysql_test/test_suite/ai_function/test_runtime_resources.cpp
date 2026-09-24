@@ -1,4 +1,8 @@
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
+#include "sql/engine/basic/ob_ai_func_op.h"
+#include "sql/engine/ob_exec_context.h"
+#include "sql/engine/ob_physical_plan.h"
+#include "sql/session/ob_sql_session_info.h"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -8,6 +12,7 @@
 #include <unordered_set>
 
 using namespace oceanbase::common;
+using namespace oceanbase::sql;
 
 namespace
 {
@@ -244,8 +249,10 @@ void test_response_allocation_failure(const char *url)
 {
   Inputs inputs;
   TrackingAllocator allocator;
+  int64_t shared_bytes = 0;
   {
     ObAIFuncClient client;
+    client.set_shared_buffer_usage(shared_bytes);
     initialize(client, allocator, inputs, url);
     const size_t initialized = allocator.outstanding();
     require(client.send_post_batch_no_wait(inputs.data) == OB_SUCCESS, "submit response allocation test");
@@ -256,6 +263,7 @@ void test_response_allocation_failure(const char *url)
     require(responses.empty(), "response OOM exposed partial results");
     client.clean_up();
     require(allocator.outstanding() == initialized, "response OOM leaked request memory");
+    require(shared_bytes == 0, "response OOM leaked shared buffer quota");
   }
   require(allocator.outstanding() == 0, "response OOM destruction leaked memory");
   resources().check_empty();
@@ -303,6 +311,53 @@ void test_pending_lifecycle(const char *url)
   resources().check_empty();
 }
 
+void test_shared_pipeline_budget(const char *url)
+{
+  Inputs inputs(1);
+  TrackingAllocator first_allocator;
+  TrackingAllocator second_allocator;
+  int64_t shared_bytes = 0;
+  {
+    ObAIFuncClient first;
+    ObAIFuncClient second;
+    first.set_shared_buffer_usage(shared_bytes);
+    second.set_shared_buffer_usage(shared_bytes);
+    initialize(first, first_allocator, inputs, url);
+    initialize(second, second_allocator, inputs, url);
+    require(first.send_post_batch_no_wait(inputs.data) == OB_SUCCESS, "submit first shared-budget batch");
+    const int64_t first_bytes = shared_bytes;
+    require(first_bytes > 0, "requests must charge shared quota");
+    int64_t retained_bytes = ObAIFuncClient::MAX_BATCH_BYTES - first_bytes - 1;
+    shared_bytes += retained_bytes;
+    require(second.send_post_batch_no_wait(inputs.data) == OB_SIZE_OVERFLOW,
+            "request preparation must honor quota already retained by another batch");
+    require(shared_bytes == retained_bytes + first_bytes, "failed preparation released another batch's quota");
+    require(resources().attached.size() == 1, "failed admission affected the first batch or submitted another request");
+    second.clean_up();
+    shared_bytes -= retained_bytes;
+    require(second.send_post_batch_no_wait(inputs.data) == OB_SUCCESS, "released quota must allow resubmission");
+    require(resources().attached.size() == 2, "two batches must own independent active requests");
+    retained_bytes = ObAIFuncClient::MAX_BATCH_BYTES - shared_bytes;
+    shared_bytes += retained_bytes;
+    bool finished = false;
+    int result = OB_SUCCESS;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (!finished && result == OB_SUCCESS) {
+      require(std::chrono::steady_clock::now() < deadline, "shared response quota test exceeded deadline");
+      result = first.poll_batch(finished, 20);
+    }
+    require(finished && result == OB_SIZE_OVERFLOW, "response bytes must honor the same shared quota");
+    first.reset();
+    second.reset();
+    require(shared_bytes == retained_bytes, "cancellation did not return exactly the request/response quota");
+    shared_bytes -= retained_bytes;
+  }
+  require(shared_bytes == 0, "shared quota leaked after both batches were destroyed");
+  require(first_allocator.outstanding() == 0 && second_allocator.outstanding() == 0,
+          "shared-budget failure leaked client memory");
+  resources().check_empty();
+}
+
 void test_recovery_and_result_lifetime(const char *url)
 {
   Inputs inputs;
@@ -325,6 +380,75 @@ void test_recovery_and_result_lifetime(const char *url)
       require(responses.at(index) != nullptr && responses.at(index)->get_value("choices") != nullptr,
               "caller-owned results must survive client destruction");
     }
+    resources().check_empty();
+  }
+}
+
+class PipelineInput final : public ObOperator
+{
+public:
+  PipelineInput(ObExecContext &context, const ObOpSpec &spec)
+      : ObOperator(context, spec, nullptr), skip_storage_(0), pulls_(0), emit_rows_(false) {
+    brs_.skip_ = to_bit_vector(&skip_storage_);
+  }
+  int inner_get_next_row() override { return OB_ITER_END; }
+  void destroy() override { ObOperator::destroy(); }
+  int inner_get_next_batch(int64_t) override
+  {
+    ++pulls_;
+    brs_.size_ = emit_rows_ ? 2 : 0;
+    brs_.skip_->reset(2);
+    brs_.all_rows_active_ = true;
+    brs_.end_ = true;
+    return OB_SUCCESS;
+  }
+  uint64_t skip_storage_;
+  int64_t pulls_;
+  bool emit_rows_;
+};
+
+void test_pipeline_diagnosis_and_empty_rescan()
+{
+  for (ObItemType type : {T_FUN_SYS_AI_EMBED, T_FUN_SYS_AI_COMPLETE}) {
+    ObArenaAllocator allocator;
+    ObSQLSessionInfo session;
+    ObExecContext context(allocator);
+    context.set_my_session(&session);
+    require(context.create_physical_plan_ctx() == OB_SUCCESS, "create lifecycle plan context");
+    ObPhysicalPlan plan;
+    ObOpSpec input_spec(allocator, PHY_TABLE_SCAN);
+    input_spec.plan_ = &plan;
+    input_spec.max_batch_size_ = 16;
+    PipelineInput input(context, input_spec);
+    require(input.open() == OB_SUCCESS, "open lifecycle input");
+    ObExpr expression;
+    expression.type_ = type;
+    AIFuncSpec spec(allocator, PHY_AI_FUNC);
+    spec.plan_ = &plan;
+    spec.max_batch_size_ = 16;
+    spec.ai_expr_ = &expression;
+    auto *pipeline = OB_NEWx(AIFuncOp, &allocator, context, spec, nullptr);
+    require(pipeline != nullptr, "allocate lifecycle operator");
+    ObOperator *children[] = {&input};
+    require(pipeline->set_children_pointer(children, 1) == OB_SUCCESS, "attach lifecycle input");
+    uint64_t skip_storage = 0;
+    pipeline->get_brs().skip_ = to_bit_vector(&skip_storage);
+    require(pipeline->inner_open() == OB_SUCCESS, "open lifecycle operator");
+    for (int64_t iteration = 0; iteration < 3; ++iteration) {
+      require(pipeline->inner_get_next_batch(16) == OB_SUCCESS && pipeline->get_brs().end_,
+              "empty input must reach end");
+      require(input.pulls_ == iteration + 1, "rescan must pull the child again instead of retaining end-of-input");
+      require(pipeline->rescan() == OB_SUCCESS && !pipeline->get_brs().end_, "rescan must reset end state");
+    }
+    session.set_diagnosis_enabled(true);
+    input.emit_rows_ = true;
+    require(pipeline->inner_get_next_batch(16) == OB_SUCCESS && pipeline->get_brs().size_ == 2,
+            "diagnosis mode must pass child rows without preparing an AI request");
+    require(pipeline->rescan() == OB_SUCCESS, "rescan after diagnosis rows");
+    require(pipeline->inner_get_next_batch(16) == OB_SUCCESS && pipeline->get_brs().size_ == 2,
+            "diagnosis rows must remain available after rescan");
+    require(pipeline->inner_close() == OB_SUCCESS, "close lifecycle operator");
+    pipeline->destroy();
     resources().check_empty();
   }
 }
@@ -470,8 +594,12 @@ int main(int argc, char **argv)
     std::puts("PASS response allocation failure and peer cleanup");
     test_pending_lifecycle(url);
     std::puts("PASS 32 no_wait cancellations, queued work, reinitialization and pending destruction");
+    test_shared_pipeline_budget(url);
+    std::puts("PASS shared pipeline admission/response quota and exact rollback");
     test_recovery_and_result_lifetime(url);
     std::puts("PASS 16 failure/recovery cycles and caller-owned result lifetime");
+    test_pipeline_diagnosis_and_empty_rescan();
+    std::puts("PASS both AI functions: diagnosis passthrough and empty-input physical rescan");
     resources().check_empty();
     curl_global_cleanup();
     return 0;

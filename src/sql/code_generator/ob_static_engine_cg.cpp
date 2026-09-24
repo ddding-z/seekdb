@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "ob_static_engine_cg.h"
+#include "sql/optimizer/ob_log_ai_func.h"
+#include "sql/engine/basic/ob_ai_func_op.h"
 #include "sql/optimizer/ob_log_group_by.h"
 #include "sql/optimizer/ob_log_sort.h"
 #include "sql/optimizer/ob_log_limit.h"
@@ -1027,6 +1029,18 @@ int ObStaticEngineCG::generate_spec(ObLogMaterial &op, ObMaterialSpec &spec, con
   UNUSED(op);
   UNUSED(spec);
   UNUSED(in_root_job);
+  return ret;
+}
+
+int ObStaticEngineCG::generate_spec(LogAIFunc &op, AIFuncSpec &spec, const bool in_root_job)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(in_root_job);
+  if (OB_ISNULL(op.get_ai_expr())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(generate_rt_expr(*op.get_ai_expr(), spec.ai_expr_))) {
+  } else if (OB_FAIL(mark_expr_self_produced(op.get_ai_expr()))) {
+  }
   return ret;
 }
 
@@ -6347,6 +6361,10 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
     }
     case log_op_def::LOG_MATERIAL: {
       type = PHY_MATERIAL;
+      break;
+    }
+    case log_op_def::LOG_AI_FUNC: {
+      type = PHY_AI_FUNC;
       break;
     }
     case log_op_def::LOG_WINDOW_FUNCTION: {

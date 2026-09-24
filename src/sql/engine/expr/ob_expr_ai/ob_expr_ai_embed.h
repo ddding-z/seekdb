@@ -44,6 +44,7 @@ public:
                       ObExpr &rt_expr) const override;
   virtual bool need_rt_ctx() const override { return true; }
 private:
+  friend class AIFuncOp;
   static int prepare_input(const ObExpr &expr, ObEvalCtx &ctx,
                            MultimodeAlloctor &allocator, ObString &model_id,
                            ObString &content, ObJsonObject *&config);

@@ -59,7 +59,7 @@ ObAIFuncClient::ObAIFuncClient()
     batch_ret_(OB_SUCCESS), status_checker_(nullptr), status_context_(nullptr),
     response_validator_(nullptr),
     batch_start_ts_(0), attempts_(0), retries_(0), peak_active_(0),
-    buffered_bytes_(0), received_bytes_(0), submitted_bytes_(0)
+    buffered_bytes_(0), shared_buffered_bytes_(nullptr), received_bytes_(0), submitted_bytes_(0)
 {}
 
 ObAIFuncClient::~ObAIFuncClient()
@@ -85,8 +85,31 @@ void ObAIFuncClient::clean_up()
   requests_.reset();
   active_count_ = 0;
   completed_count_ = 0;
-  buffered_bytes_ = 0;
+  release_buffer(buffered_bytes_);
   is_finished_.store(false);
+}
+
+int ObAIFuncClient::reserve_buffer(int64_t bytes)
+{
+  int ret = OB_SUCCESS;
+  if (bytes < 0 || bytes > MAX_BATCH_BYTES - buffered_bytes_ ||
+      (nullptr != shared_buffered_bytes_ && bytes > MAX_BATCH_BYTES - *shared_buffered_bytes_)) {
+    ret = OB_SIZE_OVERFLOW;
+  } else {
+    buffered_bytes_ += bytes;
+    if (nullptr != shared_buffered_bytes_) {
+      *shared_buffered_bytes_ += bytes;
+    }
+  }
+  return ret;
+}
+
+void ObAIFuncClient::release_buffer(int64_t bytes)
+{
+  buffered_bytes_ -= bytes;
+  if (nullptr != shared_buffered_bytes_) {
+    *shared_buffered_bytes_ -= bytes;
+  }
 }
 
 void ObAIFuncClient::reset()
@@ -234,7 +257,7 @@ int ObAIFuncClient::send_post_batch_no_wait(ObArray<ObJsonObject *> &data_array)
   } else if (nullptr == curlm_ && nullptr == (curlm_ = curl_multi_init())) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
-    buffered_bytes_ = data_array.count() * static_cast<int64_t>(sizeof(Request));
+    ret = reserve_buffer(data_array.count() * static_cast<int64_t>(sizeof(Request)));
   }
   for (int64_t index = 0; OB_SUCC(ret) && index < data_array.count(); ++index) {
     Request *request = nullptr;
@@ -246,11 +269,9 @@ int ObAIFuncClient::send_post_batch_no_wait(ObArray<ObJsonObject *> &data_array)
     } else if (OB_FAIL(requests_.push_back(request))) {
       OB_DELETEx(Request, allocator_, request);
     } else if (OB_FAIL(data_array.at(index)->print(request->body_, false))) {
-    } else if (request->body_.length() > MAX_REQUEST_BYTES ||
-               buffered_bytes_ + request->body_.length() > MAX_BATCH_BYTES) {
+    } else if (request->body_.length() > MAX_REQUEST_BYTES) {
       ret = OB_SIZE_OVERFLOW;
-    } else {
-      buffered_bytes_ += request->body_.length();
+    } else if (OB_FAIL(reserve_buffer(request->body_.length()))) {
     }
   }
   if (OB_SUCC(ret)) {
@@ -267,7 +288,7 @@ int ObAIFuncClient::send_post_batch_no_wait(ObArray<ObJsonObject *> &data_array)
 int ObAIFuncClient::start_request(Request &request)
 {
   int ret = OB_SUCCESS;
-  buffered_bytes_ -= request.response_.length();
+  release_buffer(request.response_.length());
   request.response_.reset();
   request.callback_ret_ = OB_SUCCESS;
   request.retry_after_us_ = 0;
@@ -448,6 +469,19 @@ int ObAIFuncClient::get_batch_result(ObArray<ObJsonObject *> &responses)
   return ret;
 }
 
+int ObAIFuncClient::poll_batch(bool &finished, int64_t wait_ms)
+{
+  finished = check_batch_finished();
+  if (!finished && wait_ms > 0) {
+    int numfds = 0;
+    if (CURLM_OK != curl_multi_poll(curlm_, nullptr, 0, std::min<int64_t>(wait_ms, 20), &numfds)) {
+      batch_ret_ = OB_CURL_ERROR;
+    }
+    finished = check_batch_finished();
+  }
+  return batch_ret_;
+}
+
 size_t ObAIFuncClient::write_callback(void *contents, size_t size, size_t nmemb, void *userp)
 {
   Request &request = *static_cast<Request *>(userp);
@@ -456,16 +490,19 @@ size_t ObAIFuncClient::write_callback(void *contents, size_t size, size_t nmemb,
     return 0;
   }
   const size_t bytes = size * nmemb;
-  if (bytes > static_cast<size_t>(MAX_RESPONSE_BYTES - request.response_.length()) ||
-      bytes > static_cast<size_t>(MAX_BATCH_BYTES - request.owner_.buffered_bytes_)) {
+  if (bytes > static_cast<size_t>(MAX_RESPONSE_BYTES - request.response_.length())) {
     request.callback_ret_ = OB_SIZE_OVERFLOW;
+    return 0;
+  }
+  request.callback_ret_ = request.owner_.reserve_buffer(bytes);
+  if (OB_SUCCESS != request.callback_ret_) {
     return 0;
   }
   request.callback_ret_ = request.response_.append(static_cast<const char *>(contents), bytes, 0);
   if (OB_SUCCESS != request.callback_ret_) {
+    request.owner_.release_buffer(bytes);
     return 0;
   }
-  request.owner_.buffered_bytes_ += bytes;
   request.owner_.received_bytes_ += bytes;
   return bytes;
 }

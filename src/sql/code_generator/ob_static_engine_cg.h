@@ -35,6 +35,8 @@ class ObMergeDistinctSpec;
 class ObHashDistinctSpec;
 class ObLogMaterial;
 class ObMaterialSpec;
+class LogAIFunc;
+class AIFuncSpec;
 class ObLogSort;
 class ObSortSpec;
 class ObLogSet;
@@ -273,6 +275,7 @@ private:
   int generate_recursive_union_all_spec(ObLogSet &op, ObRecursiveUnionAllSpec &spec);
 
   int generate_spec(ObLogMaterial &op, ObMaterialSpec &spec, const bool in_root_job);
+  int generate_spec(LogAIFunc &op, AIFuncSpec &spec, const bool in_root_job);
 
   int generate_spec(ObLogSort &op, ObSortSpec &spec, const bool in_root_job);
 

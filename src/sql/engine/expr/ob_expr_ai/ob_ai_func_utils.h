@@ -348,6 +348,8 @@ private:
 };
 
 
+class AIFuncBatch;
+
 class ObAIFuncModel
 {
 public:
@@ -360,10 +362,12 @@ public:
    // completion
    int call_completion(ObString &prompt, ObJsonObject *config, ObString &result);
    int call_completion_vector(ObArray<ObString> &prompts, ObJsonObject *config, ObArray<ObString> &results);
+  int start_completion_batch(ObArray<ObString> &prompts, ObJsonObject *config, AIFuncBatch &batch);
    // dense_embedding
    int call_dense_embedding(ObString &content, ObJsonObject *config, ObString &result);
    int call_dense_embedding_vector(ObArray<ObString> &contents, ObJsonObject *config, ObArray<ObString> &results);
    int call_dense_embedding_vector_v2(ObArray<ObString> &contents, ObJsonObject *config, ObArray<ObString> &results);
+  int start_dense_embedding_batch(ObArray<ObString> &contents, ObJsonObject *config, AIFuncBatch &batch);
    // rerank
    int call_rerank(ObString &query, ObJsonArray *contents, ObJsonArray *&results);
  private:

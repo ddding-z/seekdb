@@ -1608,18 +1608,37 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
 int ObAIFuncModel::call_completion_vector(ObArray<ObString> &prompts, ObJsonObject *config, ObArray<ObString> &results)
 {
   int ret = OB_SUCCESS;
+  results.reset();
+  AIFuncBatch batch(*allocator_);
+  if (OB_FAIL(start_completion_batch(prompts, config, batch))) {
+  } else {
+    bool finished = false;
+    while (OB_SUCC(ret) && !finished) {
+      ret = batch.poll(finished, 20);
+    }
+    if (OB_SUCC(ret)) {
+      ret = batch.get_results(results);
+    }
+  }
+  return ret;
+}
+
+int ObAIFuncModel::start_completion_batch(ObArray<ObString> &prompts, ObJsonObject *config,
+                                         AIFuncBatch &batch)
+{
+  int ret = OB_SUCCESS;
+  batch.cancel();
   ObArray<ObString> headers;
   ObJsonObject *body = nullptr;
   ObArray<ObJsonObject *> body_array;
-  ObArray<ObJsonObject *> response_array;
-  ObIJsonBase *result_base = nullptr;
   ObAIFuncIComplete *complete_provider = nullptr;
   ObString prompt_str;
-  ObString result_str;
-  ObAIFuncClient client;
+  ObAIFuncClient &client = batch.client_;
   ObString unencrypted_access_key;
   ObString request_model_name = get_request_model_name();
-  if (!is_completion_type()) {
+  if (&batch.allocator_ != allocator_ || prompts.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (!is_completion_type()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("info type is not completion", K(ret));
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, info type is not completion");
@@ -1627,24 +1646,19 @@ int ObAIFuncModel::call_completion_vector(ObArray<ObString> &prompts, ObJsonObje
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
   } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
   } else {
-    client.set_response_validator(complete_provider);
-    for (int i = 0; OB_SUCC(ret) && i < prompts.count(); i++) {
-      ObString prompt = prompts[i];
+    batch.provider_ = complete_provider;
+    for (int64_t row = 0; OB_SUCC(ret) && row < prompts.count(); ++row) {
+      ObString prompt = prompts.at(row);
       if (OB_FAIL(complete_provider->get_body(*allocator_, request_model_name, prompt_str, prompt, config, body))) {
       } else if (OB_FAIL(body_array.push_back(body))) {
+      } else if (OB_FAIL(batch.input_counts_.push_back(1))) {
       }
     }
   }
-
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(client.send_post_batch(*allocator_, endpoint_info_.get_url(), headers, body_array, response_array))) {
-  } else {
-    for (int i = 0; OB_SUCC(ret) && i < response_array.count(); i++) {
-      ObJsonObject *response = response_array[i];
-      if (OB_FAIL(complete_provider->parse_output(*allocator_, response, result_base))) {
-      } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(*allocator_, result_base, result_str))) {
-      } else if (OB_FAIL(results.push_back(result_str))) {
-      }
+  if (OB_SUCC(ret)) {
+    client.set_response_validator(complete_provider);
+    if (OB_FAIL(client.init(*allocator_, endpoint_info_.get_url(), headers))) {
+    } else if (OB_FAIL(client.send_post_batch_no_wait(body_array))) {
     }
   }
   return ret;
@@ -1725,13 +1739,32 @@ int ObAIFuncModel::call_dense_embedding_vector_v2(ObArray<ObString> &contents, O
 {
   int ret = OB_SUCCESS;
   results.reset();
+  AIFuncBatch batch(*allocator_);
+  if (OB_FAIL(start_dense_embedding_batch(contents, config, batch))) {
+  } else {
+    bool finished = false;
+    while (OB_SUCC(ret) && !finished) {
+      ret = batch.poll(finished, 20);
+    }
+    if (OB_SUCC(ret)) {
+      ret = batch.get_results(results);
+    }
+  }
+  return ret;
+}
+
+int ObAIFuncModel::start_dense_embedding_batch(ObArray<ObString> &contents, ObJsonObject *config,
+                                             AIFuncBatch &batch)
+{
+  int ret = OB_SUCCESS;
+  batch.cancel();
+  batch.batched_response_ = true;
   ObArray<ObString> headers;
   ObArray<ObString> request_inputs;
   ObArray<ObJsonObject *> bodies;
-  ObArray<ObJsonObject *> responses;
-  ObArray<int64_t> input_counts;
+  ObArray<int64_t> &input_counts = batch.input_counts_;
   ObAIFuncIEmbed *embed_provider = nullptr;
-  ObAIFuncClient client;
+  ObAIFuncClient &client = batch.client_;
   int64_t dimension = 0;
   if (OB_NOT_NULL(config)) {
     ObJsonNode *dimension_node = config->get_value("dimensions");
@@ -1746,7 +1779,7 @@ int ObAIFuncModel::call_dense_embedding_vector_v2(ObArray<ObString> &contents, O
   ObString unencrypted_access_key;
   ObString request_model_name = get_request_model_name();
   if (OB_FAIL(ret)) {
-  } else if (!is_dense_embedding_type() || contents.empty()) {
+  } else if (&batch.allocator_ != allocator_ || !is_dense_embedding_type() || contents.empty()) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(ObAIFuncUtils::get_embed_provider(*allocator_, endpoint_info_.get_provider(), embed_provider))) {
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
@@ -1820,22 +1853,50 @@ int ObAIFuncModel::call_dense_embedding_vector_v2(ObArray<ObString> &contents, O
     ret = append_request();
   }
   if (OB_SUCC(ret)) {
+    batch.provider_ = embed_provider;
     embed_provider->set_response_constraints(input_counts, dimension);
     client.set_response_validator(embed_provider);
-    if (OB_FAIL(client.send_post_batch(*allocator_, endpoint_info_.get_url(), headers, bodies, responses))) {
-    } else if (responses.count() != input_counts.count()) {
+    if (OB_FAIL(client.init(*allocator_, endpoint_info_.get_url(), headers))) {
+    } else if (OB_FAIL(client.send_post_batch_no_wait(bodies))) {
+    }
+  }
+  return ret;
+}
+
+int AIFuncBatch::get_results(ObArray<ObString> &results)
+{
+  int ret = OB_SUCCESS;
+  results.reset();
+  ObArray<ObJsonObject *> responses;
+  const auto append_result = [&](ObIJsonBase *value) -> int {
+    int ret = OB_SUCCESS;
+    ObString result;
+    if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(allocator_, value, result))) {
+    } else if (OB_FAIL(results.push_back(result))) {
+    }
+    return ret;
+  };
+  if (OB_ISNULL(provider_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(client_.get_batch_result(responses))) {
+  } else {
+    if (responses.count() != input_counts_.count()) {
       ret = OB_ERR_UNEXPECTED;
     } else {
       for (int64_t request = 0; OB_SUCC(ret) && request < responses.count(); ++request) {
         ObIJsonBase *result_base = nullptr;
-        if (OB_FAIL(embed_provider->parse_output(*allocator_, responses.at(request), result_base))) {
+        if (OB_FAIL(provider_->parse_output(allocator_, responses.at(request), result_base))) {
+        } else if (OB_ISNULL(result_base)) {
+          ret = OB_INVALID_DATA;
+        } else if (!batched_response_) {
+          ret = append_result(result_base);
+        } else if (result_base->json_type() != ObJsonNodeType::J_ARRAY ||
+                   result_base->element_count() != input_counts_.at(request)) {
+          ret = OB_INVALID_DATA;
         } else {
           ObJsonArray *result_array = static_cast<ObJsonArray *>(result_base);
           for (int64_t row = 0; OB_SUCC(ret) && row < result_array->element_count(); ++row) {
-            ObString result;
-            if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(*allocator_, result_array->get_value(row), result))) {
-            } else if (OB_FAIL(results.push_back(result))) {
-            }
+            ret = append_result(result_array->get_value(row));
           }
         }
       }
@@ -1844,7 +1905,7 @@ int ObAIFuncModel::call_dense_embedding_vector_v2(ObArray<ObString> &contents, O
   if (OB_FAIL(ret)) {
     results.reset();
     if (ret == OB_INVALID_DATA) {
-      FORWARD_USER_ERROR(ret, "unexpected embedding response");
+      FORWARD_USER_ERROR(ret, "unexpected AI function response");
     }
   }
   return ret;

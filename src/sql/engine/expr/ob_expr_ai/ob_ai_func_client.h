@@ -35,6 +35,7 @@ public:
   void reset();
   void set_timeout_sec(int64_t timeout_sec) { timeout_sec_ = timeout_sec; }
   void set_max_parallel(int64_t max_parallel) { max_parallel_ = max_parallel; }
+  void set_shared_buffer_usage(int64_t &bytes) { shared_buffered_bytes_ = &bytes; }
   void set_response_validator(ObAIFuncBase *validator) { response_validator_ = validator; }
   void set_status_checker(int (*checker)(void *), void *context)
   {
@@ -58,6 +59,7 @@ public:
   // embedding service interface
   int send_post_batch_no_wait(ObArray<ObJsonObject *> &data_array);
   bool check_batch_finished();
+  int poll_batch(bool &finished, int64_t wait_ms = 0);
   int get_batch_result(ObArray<ObJsonObject *> &responses);
 private:
   struct Request;
@@ -67,6 +69,8 @@ private:
   int start_request(Request &request);
   int advance_batch();
   int check_status();
+  int reserve_buffer(int64_t bytes);
+  void release_buffer(int64_t bytes);
   int finish_request(Request &request, CURLcode result);
   static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp);
   static size_t header_callback(char *contents, size_t size, size_t nmemb, void *userp);
@@ -96,9 +100,36 @@ private:
   int64_t retries_;
   int64_t peak_active_;
   int64_t buffered_bytes_;
+  int64_t *shared_buffered_bytes_;
   int64_t received_bytes_;
   int64_t submitted_bytes_;
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncClient);
+};
+
+class AIFuncBatch
+{
+public:
+  explicit AIFuncBatch(ObIAllocator &allocator)
+      : allocator_(allocator), provider_(nullptr), batched_response_(false) {}
+  int poll(bool &finished, int64_t wait_ms = 0) { return client_.poll_batch(finished, wait_ms); }
+  int get_results(ObArray<ObString> &results);
+  void cancel()
+  {
+    client_.reset();
+    provider_ = nullptr;
+    input_counts_.reset();
+    batched_response_ = false;
+  }
+  void set_shared_buffer_usage(int64_t &bytes) { client_.set_shared_buffer_usage(bytes); }
+  void set_max_parallel(int64_t count) { client_.set_max_parallel(count); }
+private:
+  friend class ObAIFuncModel;
+  ObIAllocator &allocator_;
+  ObAIFuncBase *provider_;
+  bool batched_response_;
+  ObArray<int64_t> input_counts_;
+  ObAIFuncClient client_;
+  DISALLOW_COPY_AND_ASSIGN(AIFuncBatch);
 };
 
 } // namespace common

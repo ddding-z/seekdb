@@ -121,7 +121,8 @@ class ContractHandler(runtime.MockHandler):
                           "request_bytes": len(raw_body),
                           "headers": {name.lower(): value for name, value in self.headers.items()}}
                 server.audit.append(record)
-                sequence = server.scenarios.get(prompt, [Reply()])
+                sequence = server.scenarios.get(prompt, server.scenarios.get(
+                    inputs[0] if inputs else prompt, [server.default_reply]))
                 reply = sequence[min(server.counts[prompt] - 1, len(sequence) - 1)]
                 server.condition.notify_all()
                 if reply.peers:
@@ -168,6 +169,7 @@ def configure_mock(server):
     server.RequestHandlerClass = ContractHandler
     server.audit = []
     server.scenarios = {}
+    server.default_reply = Reply()
     server.fixture_errors = []
     server.embedding_vectors = {}
     server.embedding_format = "openai"
@@ -316,6 +318,11 @@ class RuntimeContracts(unittest.TestCase):
         self.cursor.execute(f"SELECT id, {expression} FROM inputs {suffix}")
         return self.cursor.fetchall()
 
+    def query_pipeline(self, expression="AI_COMPLETE('contract_model', prompt)", suffix="ORDER BY id"):
+        self.cursor.execute("SELECT /*+ OPT_PARAM('rowsets_max_rows', 16) */ "
+                            f"id, {expression} FROM inputs {suffix}")
+        return self.cursor.fetchall()
+
     def query_constrained(self, schema, model="'contract_model'", **options):
         config = constrained_options(schema) | options
         self.cursor.execute(f"SELECT id, AI_COMPLETE({model}, prompt, %s) FROM inputs ORDER BY id",
@@ -326,6 +333,270 @@ class RuntimeContracts(unittest.TestCase):
         gate = threading.Event()
         self.gates.append(gate)
         return gate
+
+    def test_completion_pipeline_submits_next_batch_before_first_response(self):
+        prompts = [f"completion-pipeline-{index}" for index in range(50)]
+        self.load(prompts)
+        gate = self.gate()
+        self.server.default_reply = Reply(gate=gate)
+        worker, outcome = self.start_embedding_query(self.query_pipeline)
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(lambda: len(self.server.audit) > 16, timeout=3),
+                                f"only {len(self.server.audit)} requests submitted before the first response")
+                self.assertLessEqual(len(self.server.audit), 32, "at most two SQL batches may be pending")
+                self.assertTrue(all(record["response"] is None for record in self.server.audit))
+        finally:
+            gate.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive(), "completion pipeline did not drain its final batch")
+        self.assertEqual(outcome, [tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))])
+        self.assertEqual(self.server.counts, Counter(prompts))
+
+    def test_completion_pipeline_refills_after_first_batch_finishes(self):
+        prompts = [f"completion-refill-{index}" for index in range(50)]
+        self.load(prompts)
+        first_gate, other_gate = self.gate(), self.gate()
+        self.server.default_reply = Reply(gate=other_gate)
+        for prompt in prompts[:16]:
+            self.server.scenarios[prompt] = [Reply(gate=first_gate)]
+        worker, outcome = self.start_embedding_query(self.query_pipeline)
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(lambda: len(self.server.audit) == 32, timeout=3))
+            first_gate.set()
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(lambda: len(self.server.audit) >= 48, timeout=3),
+                                "the completed first batch must free a slot while the second is unfinished")
+                self.assertEqual(len(self.server.audit), 48)
+                self.assertEqual(sum(record["response"] is None for record in self.server.audit), 32)
+        finally:
+            first_gate.set()
+            other_gate.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome, [tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))])
+        self.assertEqual(self.server.counts, Counter(prompts))
+
+    def test_completion_pipeline_later_error_cancels_held_first_batch(self):
+        prompts = [f"completion-later-error-{index}" for index in range(50)]
+        self.load(prompts)
+        process_id = struct.unpack("3i", self.connection._sock.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
+        config = self.connection.escape(json.dumps(constrained_options({"type": "boolean"})))
+        cases = [(Reply(body=b'{"unexpected":true}'), 4070, None),
+                 (Reply(400, b"{}"), 4216, None),
+                 (Reply(body=completion('"not-a-boolean"', finish_reason="stop")), 4070, config)]
+        for reply, code, options in cases:
+            with self.subTest(code=code, constrained=options is not None):
+                gate = self.gate()
+                before = len(self.server.audit)
+                valid_body = completion("true", finish_reason="stop") if options else None
+                self.server.default_reply = Reply(body=valid_body)
+                for prompt in prompts[:16]:
+                    self.server.scenarios[prompt] = [Reply(body=valid_body, gate=gate)]
+                reply.peers = before + 17
+                self.server.scenarios[prompts[16]] = [reply]
+                expression = (f"AI_COMPLETE('contract_model', prompt, {options})" if options else
+                              "AI_COMPLETE('contract_model', prompt)")
+                self.cursor.execute("SET ob_query_timeout = 3000000")
+                try:
+                    start = time.monotonic()
+                    sql_error(self, code, lambda: self.query_pipeline(expression))
+                    self.assertLess(time.monotonic() - start, 2.5)
+                    self.assertGreater(len(self.server.audit) - before, 16)
+                    self.assertLessEqual(len(self.server.audit) - before, 32)
+                    self.assertTrue(any(record["response"] is None for record in self.server.audit[before:]))
+                    self.assertFalse(model_socket_fds(process_id, self.server.server_port))
+                finally:
+                    gate.set()
+                self.server.scenarios.clear()
+                self.server.default_reply = Reply()
+                self.cursor.execute("SET ob_query_timeout = 20000000")
+                self.assertEqual(self.query_pipeline(),
+                                 tuple((index, answer(prompt)) for index, prompt in enumerate(prompts)))
+
+    def test_completion_pipeline_cancel_releases_both_batches_and_recovers(self):
+        prompts = [f"completion-cancel-{index}" for index in range(50)]
+        self.load(prompts)
+        gate = self.gate()
+        self.server.default_reply = Reply(gate=gate)
+        worker, outcome = self.start_embedding_query(self.query_pipeline)
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(lambda: len(self.server.audit) == 32, timeout=3))
+            process_id = struct.unpack("3i", self.connection._sock.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
+            self.assertEqual(len(model_socket_fds(process_id, self.server.server_port)), 32)
+            with pymysql.connect(unix_socket=self.sql_socket, user="root", autocommit=True) as control:
+                with control.cursor() as cursor:
+                    cursor.execute(f"KILL QUERY {self.connection.thread_id()}")
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(outcome), 1)
+            self.assertIsInstance(outcome[0], pymysql.MySQLError)
+            self.assertEqual(outcome[0].args[0], 1317)
+            self.assertEqual(len(self.server.audit), 32)
+            self.assertFalse(model_socket_fds(process_id, self.server.server_port))
+        finally:
+            gate.set()
+            worker.join(5)
+        self.server.default_reply = Reply()
+        self.assertEqual(self.query_pipeline(), tuple((index, answer(prompt)) for index, prompt in enumerate(prompts)))
+
+    def test_completion_pipeline_deadline_releases_both_batches_and_recovers(self):
+        prompts = [f"completion-deadline-{index}" for index in range(50)]
+        self.load(prompts)
+        gate = self.gate()
+        self.server.default_reply = Reply(gate=gate)
+        self.cursor.execute("SET ob_query_timeout = 1000000")
+        try:
+            sql_error(self, 4012, self.query_pipeline)
+            self.assertEqual(len(self.server.audit), 32)
+            process_id = struct.unpack("3i", self.connection._sock.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
+            self.assertFalse(model_socket_fds(process_id, self.server.server_port))
+        finally:
+            gate.set()
+        self.server.default_reply = Reply()
+        self.cursor.execute("SET ob_query_timeout = 20000000")
+        self.assertEqual(self.query_pipeline(), tuple((index, answer(prompt)) for index, prompt in enumerate(prompts)))
+
+    def test_completion_pipeline_out_of_order_preserves_other_columns(self):
+        prompts = [f"completion-owned-{index}:" + "\u4e2d\n\x00" * (2048 + index % 13) for index in range(50)]
+        prompts[10] = prompts[8]
+        self.load(prompts)
+        self.cursor.execute("UPDATE inputs SET model = CONCAT('row-model-', id)")
+        gate = self.gate()
+        self.server.scenarios[prompts[-1]] = [Reply(gate=gate)]
+
+        def query():
+            self.cursor.execute("SELECT /*+ OPT_PARAM('rowsets_max_rows', 16) */ "
+                                "id, prompt, model, AI_COMPLETE('contract_model', prompt) FROM inputs ORDER BY id DESC")
+            return self.cursor.fetchall()
+
+        worker, outcome = self.start_embedding_query(query)
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(
+                    lambda: len(self.server.audit) >= 32 and len(self.server.finished) >= 31, timeout=3))
+                self.assertEqual(len(self.server.audit), 32, "ready results behind the first batch must stay bounded")
+                self.assertTrue(any(record["response"] is None for record in self.server.audit))
+        finally:
+            gate.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        expected = tuple((index, prompts[index], f"row-model-{index}", answer(prompts[index]))
+                         for index in reversed(range(len(prompts))))
+        self.assertEqual(outcome, [expected])
+        self.assertEqual(self.server.counts, Counter(prompts))
+
+    def test_completion_pipeline_schema_and_retry_preserve_requests(self):
+        prompts = [f"completion-schema-{index}" for index in range(50)]
+        self.load(prompts)
+        expected = tuple((index, json.dumps({"row": index})) for index in range(len(prompts)))
+        schema = {"type": "object", "properties": {"row": {"type": "integer"}},
+                  "required": ["row"], "additionalProperties": False}
+        options = constrained_options(schema) | {"temperature": 0}
+        config = self.connection.escape(json.dumps(options))
+        for index, prompt in enumerate(prompts):
+            self.server.scenarios[prompt] = [Reply(body=completion(expected[index][1], finish_reason="stop"))]
+        self.server.scenarios[prompts[19]].insert(0, Reply(429, b"{}", {"Retry-After": "0"}))
+        gate = self.gate()
+        self.server.scenarios[prompts[0]][0].gate = gate
+        worker, outcome = self.start_embedding_query(
+            lambda: self.query_pipeline(f"AI_COMPLETE('contract_model', prompt, {config})"))
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(lambda: self.server.counts[prompts[19]] == 2, timeout=4),
+                                "the second batch must retry while the first response is held")
+                self.assertFalse(gate.is_set())
+        finally:
+            gate.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome, [expected])
+        self.assertEqual(self.server.counts, Counter(prompts) + Counter({prompts[19]: 1}))
+        for body in self.server.requests:
+            self.assertEqual(body["response_format"], options["response_format"])
+            self.assertEqual(body["temperature"], 0)
+
+    def test_completion_pipeline_plan_selection_and_fallback(self):
+        base = "SELECT id, AI_COMPLETE('contract_model', prompt) FROM inputs"
+        cases = [(base + " ORDER BY id", True), (base + " WHERE id > 0 ORDER BY id DESC", True),
+                 ("SELECT id, AI_COMPLETE('contract_model', prompt, '{\"temperature\":0}') FROM inputs", True),
+                 (base + " ORDER BY id LIMIT 3", False), (base + " ORDER BY 2", False),
+                 ("SELECT id, CASE WHEN id > 0 THEN AI_COMPLETE('contract_model', prompt) END FROM inputs", False),
+                 ("SELECT id, AI_COMPLETE(model, prompt) FROM inputs", False),
+                 ("SELECT id, AI_COMPLETE('contract_model', prompt, JSON_OBJECT('temperature', id)) FROM inputs", False),
+                 ("SELECT id, AI_COMPLETE('contract_model', CONCAT(prompt, 'suffix')) FROM inputs", False),
+                 ("SELECT AI_COMPLETE('contract_model', prompt), AI_EMBED('contract_embed', prompt) FROM inputs", False),
+                 ("SELECT AI_COMPLETE('contract_model', 'constant')", False)]
+        for query, expected in cases:
+            with self.subTest(query=query):
+                self.cursor.execute("EXPLAIN " + query)
+                plan = "\n".join(str(row[0]) for row in self.cursor.fetchall())
+                self.assertEqual("AI FUNCTION PIPELINE" in plan, expected, plan)
+        self.assertFalse(self.server.requests)
+
+    def test_completion_pipeline_json_column_preserves_prompt_contract(self):
+        prompts = [f'json-column-{index}:\u4e2d\n"\x00' for index in range(50)]
+        self.load(prompts)
+        self.cursor.execute("CREATE TABLE pipeline_json_inputs (id INT PRIMARY KEY, prompt JSON)")
+        self.addCleanup(lambda: self.cursor.execute("DROP TABLE pipeline_json_inputs"))
+        self.cursor.execute("INSERT INTO pipeline_json_inputs "
+                            "SELECT id, AI_PROMPT('hello {0}', CAST(prompt AS CHAR)) FROM inputs")
+        query_sql = ("SELECT /*+ OPT_PARAM('rowsets_max_rows', 16) */ "
+                     "id, AI_COMPLETE('contract_model', prompt) FROM pipeline_json_inputs ORDER BY id")
+        self.cursor.execute("EXPLAIN " + query_sql)
+        self.assertIn("AI FUNCTION PIPELINE", "\n".join(str(row[0]) for row in self.cursor.fetchall()))
+
+        def query():
+            self.cursor.execute(query_sql)
+            return self.cursor.fetchall()
+
+        gate = self.gate()
+        self.server.default_reply = Reply(gate=gate)
+        worker, outcome = self.start_embedding_query(query)
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(lambda: len(self.server.audit) == 32, timeout=3))
+        finally:
+            gate.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome, [tuple((index, answer("hello " + prompt)) for index, prompt in enumerate(prompts))])
+        self.assertEqual(self.server.counts, Counter("hello " + prompt for prompt in prompts))
+        before = len(self.server.requests)
+        self.cursor.execute("UPDATE pipeline_json_inputs SET prompt = JSON_OBJECT('unexpected', TRUE) WHERE id = 0")
+        sql_error(self, 1210, query)
+        self.assertEqual(len(self.server.requests), before, "invalid first-batch input must fail before HTTP")
+
+    def test_completion_pipeline_scalar_engine_fallback(self):
+        prompts = ["completion-scalar-left", "completion-scalar-middle", "completion-scalar-right"]
+        self.load(prompts)
+        expected = tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))
+        for batch_size in (0, 1):
+            with self.subTest(batch_size=batch_size):
+                query = (f"SELECT /*+ OPT_PARAM('rowsets_max_rows', {batch_size}) */ "
+                         "id, AI_COMPLETE('contract_model', prompt) FROM inputs ORDER BY id")
+                self.cursor.execute("EXPLAIN " + query)
+                self.assertIn("AI FUNCTION PIPELINE", "\n".join(str(row[0]) for row in self.cursor.fetchall()))
+                before = len(self.server.requests)
+                self.cursor.execute(query)
+                self.assertEqual(self.cursor.fetchall(), expected)
+                self.assertEqual(Counter(body["messages"][-1]["content"] for body in self.server.requests[before:]),
+                                 Counter(prompts))
+
+    def test_completion_pipeline_filtered_rows_and_limit_do_not_add_calls(self):
+        prompts = [f"completion-filter-{index}" for index in range(100)]
+        self.load(prompts)
+        expected = tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))
+        self.assertEqual(self.query_pipeline(suffix="WHERE id % 3 = 0 ORDER BY id"), expected[::3])
+        self.assertEqual(self.server.counts, Counter(prompts[::3]))
+        before = len(self.server.requests)
+        self.assertEqual(self.query_pipeline(suffix="ORDER BY id LIMIT 3"), expected[:3])
+        self.assertEqual([body["messages"][-1]["content"] for body in self.server.requests[before:]], prompts[:3])
 
     def test_default_parallelism_matches_batch_size(self):
         prompts = [f"parallel-{index}" for index in range(72)]
@@ -923,6 +1194,217 @@ class RuntimeContracts(unittest.TestCase):
         self.assertTrue(all(0 < size <= 128 for size in sizes), sizes)
         self.assertTrue(any(size < 128 for size in sizes), sizes)
         self.assertEqual(Counter(text for body in self.server.requests for text in body["input"]), Counter(prompts))
+
+    def test_embedding_pipeline_submits_next_batch_before_first_response(self):
+        prompts = [f"pipeline-{index}" for index in range(270)]
+        expected = self.load_embeddings(prompts)
+        gate = self.gate()
+        self.server.default_reply = Reply(gate=gate)
+        outcome = []
+
+        def execute():
+            try:
+                outcome.append(self.query_embeddings())
+            except Exception as error:
+                outcome.append(error)
+
+        worker = threading.Thread(target=execute, daemon=True)
+        worker.start()
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(lambda: len(self.server.audit) >= 2, timeout=3),
+                                f"only {len(self.server.audit)} SQL batches submitted before the first response")
+                self.assertEqual(len(self.server.audit), 2, "the pipeline must bound the number of pending batches")
+                self.assertTrue(all(record["response"] is None for record in self.server.audit))
+        finally:
+            gate.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive(), "pipeline did not drain its final batch")
+        self.assertEqual(outcome, [expected])
+        self.assertTrue(all(0 < len(body["input"]) <= 128 for body in self.server.requests))
+        self.assertGreater(len(self.server.requests), 2)
+        self.assertEqual(Counter(text for body in self.server.requests for text in body["input"]), Counter(prompts))
+
+    def start_embedding_query(self, operation=None):
+        outcome = []
+
+        def execute():
+            try:
+                outcome.append((operation or self.query_embeddings)())
+            except Exception as error:
+                outcome.append(error)
+
+        worker = threading.Thread(target=execute, daemon=True)
+        worker.start()
+        return worker, outcome
+
+    def test_embedding_pipeline_refills_after_first_batch_finishes(self):
+        prompts = [f"refill-{index}" for index in range(400)]
+        expected = self.load_embeddings(prompts)
+        first_gate, other_gate = self.gate(), self.gate()
+        self.server.default_reply = Reply(gate=other_gate)
+        self.server.scenarios[prompts[0]] = [Reply(gate=first_gate)]
+        worker, outcome = self.start_embedding_query()
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(lambda: len(self.server.audit) == 2, timeout=3))
+            first_gate.set()
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(lambda: len(self.server.audit) >= 3, timeout=3),
+                                "a completed batch must free a slot without waiting for its unfinished peer")
+                self.assertEqual(len(self.server.audit), 3)
+                self.assertEqual(sum(record["response"] is None for record in self.server.audit), 2)
+        finally:
+            first_gate.set()
+            other_gate.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome, [expected])
+        self.assertEqual(Counter(text for body in self.server.requests for text in body["input"]), Counter(prompts))
+
+    def test_embedding_pipeline_later_error_cancels_held_first_batch(self):
+        prompts = [f"later-error-{index}" for index in range(270)]
+        expected = self.load_embeddings(prompts)
+        process_id = struct.unpack("3i", self.connection._sock.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
+        for reply, code in ((Reply(body=b'{"unexpected":true}'), 4070), (Reply(400, b"{}"), 4216)):
+            with self.subTest(code=code):
+                gate = self.gate()
+                before = len(self.server.audit)
+                self.server.scenarios[prompts[0]] = [Reply(gate=gate)]
+                reply.peers = before + 2
+                self.server.default_reply = reply
+                self.cursor.execute("SET ob_query_timeout = 3000000")
+                try:
+                    start = time.monotonic()
+                    sql_error(self, code, self.query_embeddings)
+                    self.assertLess(time.monotonic() - start, 2.5)
+                    self.assertEqual(len(self.server.audit), before + 2)
+                    self.assertTrue(any(record["response"] is None for record in self.server.audit[before:]))
+                    self.assertFalse(model_socket_fds(process_id, self.server.server_port))
+                finally:
+                    gate.set()
+                self.server.scenarios.clear()
+                self.server.default_reply = Reply()
+                self.cursor.execute("SET ob_query_timeout = 20000000")
+                self.assertEqual(self.query_embeddings(), expected)
+
+    def test_embedding_pipeline_cancel_releases_both_requests_and_recovers(self):
+        prompts = [f"cancel-pipeline-{index}" for index in range(270)]
+        expected = self.load_embeddings(prompts)
+        gate = self.gate()
+        self.server.default_reply = Reply(gate=gate)
+        worker, outcome = self.start_embedding_query()
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(lambda: len(self.server.audit) == 2, timeout=3))
+            process_id = struct.unpack("3i", self.connection._sock.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
+            self.assertEqual(len(model_socket_fds(process_id, self.server.server_port)), 2)
+            with pymysql.connect(unix_socket=self.sql_socket, user="root", autocommit=True) as control:
+                with control.cursor() as cursor:
+                    cursor.execute(f"KILL QUERY {self.connection.thread_id()}")
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(outcome), 1)
+            self.assertIsInstance(outcome[0], pymysql.MySQLError)
+            self.assertEqual(outcome[0].args[0], 1317)
+            self.assertEqual(len(self.server.audit), 2)
+            self.assertFalse(model_socket_fds(process_id, self.server.server_port))
+        finally:
+            gate.set()
+            worker.join(5)
+        self.server.default_reply = Reply()
+        self.assertEqual(self.query_embeddings(), expected)
+
+    def test_embedding_pipeline_deadline_releases_both_requests_and_recovers(self):
+        prompts = [f"deadline-pipeline-{index}" for index in range(270)]
+        expected = self.load_embeddings(prompts)
+        gate = self.gate()
+        self.server.default_reply = Reply(gate=gate)
+        self.cursor.execute("SET ob_query_timeout = 500000")
+        try:
+            sql_error(self, 4012, self.query_embeddings)
+            self.assertEqual(len(self.server.audit), 2)
+            process_id = struct.unpack("3i", self.connection._sock.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
+            self.assertFalse(model_socket_fds(process_id, self.server.server_port))
+        finally:
+            gate.set()
+        self.server.default_reply = Reply()
+        self.cursor.execute("SET ob_query_timeout = 20000000")
+        self.assertEqual(self.query_embeddings(), expected)
+
+    def test_embedding_pipeline_out_of_order_preserves_other_columns(self):
+        prompts = [f"owned-{index}:" + "\u4e2d\n\x00" * (2048 + index % 13) for index in range(400)]
+        prompts[10] = prompts[8]
+        self.load_embeddings(prompts)
+        self.cursor.execute("UPDATE inputs SET model = CONCAT('row-model-', id)")
+        gate = self.gate()
+        self.server.scenarios[prompts[-1]] = [Reply(gate=gate)]
+
+        def query():
+            self.cursor.execute("SELECT /*+ OPT_PARAM('rowsets_max_rows', 128) */ "
+                                "id, prompt, model, AI_EMBED('contract_embed', prompt, 3) FROM inputs ORDER BY id DESC")
+            return tuple((row, text, model, json.loads(vector))
+                         for row, text, model, vector in self.cursor.fetchall())
+
+        worker, outcome = self.start_embedding_query(query)
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(
+                    lambda: len(self.server.audit) >= 2 and bool(self.server.finished), timeout=3))
+                self.assertEqual(len(self.server.audit), 2, "ready results behind the first batch must remain bounded")
+                self.assertTrue(any(record["response"] is None for record in self.server.audit))
+        finally:
+            gate.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        expected = tuple((index, prompts[index], f"row-model-{index}", self.server.embedding_vectors[prompts[index]])
+                         for index in reversed(range(len(prompts))))
+        self.assertEqual(outcome, [expected])
+        self.assertEqual(Counter(text for body in self.server.requests for text in body["input"]), Counter(prompts))
+
+    def test_embedding_pipeline_plan_selection_and_fallback(self):
+        base = "SELECT id, AI_EMBED('contract_embed', prompt, 3) FROM inputs"
+        cases = [(base + " ORDER BY id", True), (base + " WHERE id > 0 ORDER BY id DESC", True),
+                 (base + " ORDER BY id LIMIT 3", False), (base + " ORDER BY 2", False),
+                 ("SELECT id, CASE WHEN id > 0 THEN AI_EMBED('contract_embed', prompt, 3) END FROM inputs", False),
+                 ("SELECT id, AI_EMBED(model, prompt, 3) FROM inputs", False),
+                 ("SELECT id, AI_EMBED('contract_embed', prompt, id + 1) FROM inputs", False),
+                 ("SELECT AI_EMBED('contract_embed', 'constant', 3)", False)]
+        for query, expected in cases:
+            with self.subTest(query=query):
+                self.cursor.execute("EXPLAIN " + query)
+                plan = "\n".join(str(row[0]) for row in self.cursor.fetchall())
+                self.assertEqual("AI FUNCTION PIPELINE" in plan, expected, plan)
+        self.assertFalse(self.server.requests)
+
+    def test_embedding_pipeline_scalar_engine_fallback(self):
+        prompts = ["scalar-pipeline-left", "scalar-pipeline-middle", "scalar-pipeline-right"]
+        expected = self.load_embeddings(prompts)
+        for batch_size in (0, 1):
+            with self.subTest(batch_size=batch_size):
+                query = (f"SELECT /*+ OPT_PARAM('rowsets_max_rows', {batch_size}) */ "
+                         "id, AI_EMBED('contract_embed', prompt, 3) FROM inputs ORDER BY id")
+                self.cursor.execute("EXPLAIN " + query)
+                self.assertIn("AI FUNCTION PIPELINE", "\n".join(str(row[0]) for row in self.cursor.fetchall()))
+                before = len(self.server.requests)
+                self.cursor.execute(query)
+                self.assertEqual(tuple((row, json.loads(value)) for row, value in self.cursor.fetchall()), expected)
+                self.assertEqual([body["input"] for body in self.server.requests[before:]], [[text] for text in prompts])
+
+    def test_embedding_pipeline_filtered_rows_and_limit_do_not_add_calls(self):
+        prompts = [f"filter-pipeline-{index}" for index in range(400)]
+        expected = self.load_embeddings(prompts)
+        self.cursor.execute("SELECT /*+ OPT_PARAM('rowsets_max_rows', 128) */ "
+                            "id, AI_EMBED('contract_embed', prompt, 3) FROM inputs WHERE id % 3 = 0 ORDER BY id")
+        self.assertEqual(tuple((row, json.loads(value)) for row, value in self.cursor.fetchall()), expected[::3])
+        self.assertEqual(Counter(text for body in self.server.requests for text in body["input"]), Counter(prompts[::3]))
+        before = len(self.server.requests)
+        self.cursor.execute("SELECT id, AI_EMBED('contract_embed', prompt, 3) FROM inputs ORDER BY id LIMIT 3")
+        self.assertEqual(tuple((row, json.loads(value)) for row, value in self.cursor.fetchall()), expected[:3])
+        self.assertEqual([text for body in self.server.requests[before:] for text in body["input"]], prompts[:3])
 
     def test_embedding_native_provider_formats_and_dimensions(self):
         prompts = ["provider-left", "provider-right"]

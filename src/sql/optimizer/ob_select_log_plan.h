@@ -549,6 +549,7 @@ private:
      *  @retval otherwise, failed to generate the top operators of plan tree
      */
   int allocate_plan_top();
+  int candi_allocate_ai_func();
   /**
    * Process subqueries in the select clause, generate SubPlan
    * @param

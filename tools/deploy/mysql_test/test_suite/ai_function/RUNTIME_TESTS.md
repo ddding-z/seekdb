@@ -1,6 +1,6 @@
 # AI Function Runtime Regression
 
-Latest validation (2026-09-20): all **62 SQL contracts**, including **19 embedding cases**, and the [resource reliability tests](#resource-reliability-tests) passed after implementing [native embedding batches](#native-embedding-batches). The earlier smoke, constrained-output and resource-only results are retained below as historical evidence.
+Latest validation (2026-09-24): all **82 SQL contracts**, including **28 embedding cases** and **11 completion pipeline cases**, passed after extending the [shared cross-batch pipeline](#shared-completion-pipeline-2026-09-24) to AI_COMPLETE. The [resource reliability tests](#resource-reliability-tests), including shared-buffer quota rollback, diagnosis passthrough and empty-input physical rescan, also passed. Earlier native-batch, smoke, constrained-output and resource-only results are retained below as historical evidence.
 
 Run from the repository root after a Debug build:
 
@@ -59,6 +59,9 @@ Expected behavior comes from the execution plan, SQL evaluation boundaries, HTTP
 | Embedding splitting | Raw texts fit 4MiB but JSON escaping does not; two native subrequests are formed, only the failing one retries | Raw-byte-only sizing, unnecessarily splitting every row or retrying successful subrequests |
 | Embedding validation | Exact counts, unique in-range integer indices, nonempty finite numeric vectors and consistent/requested dimensions; malformed response cancels a held subrequest | Unsafe casts, ignored indices, dimension drift or late validation |
 | Shared client | Dynamic-model scalar embedding preserves vectors/dimensions and 502 retry; native requests preserve deadline, cancellation and socket cleanup | Native batching breaking fallback or resource ownership |
+| Cross-batch overlap | Hold every response for the first two SQL batches; both batches must reach the service before a response, with no third pending batch; completion remains one request per row | A synchronous per-batch barrier, unintended prompt merging or an unbounded prefetch queue |
+| Pipeline lifecycle | Release the first batch while its peer remains held and require slot refill; check later-batch fatal errors, cancellation, deadlines, large LOB side columns and row-mode fallback | Waiting for the whole window, hidden errors, reused datum pointers or scalar-mode initialization failures |
+| Completion pipeline inputs | Preserve static Schema/options, retry only a failed second-batch request, and expand stored JSON prompt objects exactly; reject malformed first-batch input before HTTP | Lost configuration, a retry blocked by the preceding batch, duplicate calls or broken JSON-column handling |
 | Credentials | Endpoint key rotation applies to the same SQL on next execution | Stale credentials retained across executions |
 
 Five fixture self-tests check exact valid-JSON byte lengths, scripted HTTP responses, case-insensitive header names, independently specified reordered embedding vectors, and negative controls: wrong SQL codes and unexpected success must fail. Threading events hold peer responses for fail-fast tests; no arbitrary sleep is used to infer their completion. Retry timing assertions allow 50ms scheduling/measurement tolerance. HTTP-date tests assume the local wall clock is not stepped during the run.
@@ -137,7 +140,7 @@ In this workspace, source `.vscode/seekdb-env.sh` and use `/volume/xicksys/.venv
 
 ### Failure Injection And Ownership
 
-The native test calls the production client with a tracking allocator and link-time wrappers around curl resource APIs. Except for the selected injected failure, curl calls execute the real implementation. No production fault switch or alternate client implementation is added.
+The native test calls the production client with a tracking allocator and link-time wrappers around curl resource APIs. It also constructs the production AI operator with a controlled child to exercise diagnosis and empty-input rescan. Except for the selected injected failure, curl calls execute the real implementation. No production fault switch or alternate client implementation is added.
 
 | Check | Required result |
 | --- | --- |
@@ -145,9 +148,11 @@ The native test calls the production client with a tracking allocator and link-t
 | Every reachable request-preparation allocation | Fail each allocation in turn until a successful preparation is reached; six failure sites for the three-row fixture; no residual request memory or handles |
 | Eight curl faults | First/second header append, multi creation, first/second request-handle creation, second handle attachment, perform and poll failures return the expected error and roll back resources |
 | Response buffer allocation | Propagate allocation failure, expose no partial results and release peer requests and buffers |
+| Shared pipeline budget | Two clients charge one 64MiB counter together with simulated retained row data; reject overflowing preparation and response writes, return exactly the owning client's quota on failure/cancel, and allow resubmission after quota is released |
 | `no_wait` lifetime | 32 cancellation cycles with an explicit window of two for three rows; pending reads return EAGAIN, queued work stays unsubmitted, repeated cleanup is safe |
 | Reinitialization/destruction while pending | Release the old allocator's resources when switching allocators, and detach/clean requests before destroying their multi handle |
 | Failure followed by success | 16 cycles complete actual loopback requests using the same client after a failed preparation; returned JSON remains valid after client destruction because the caller still owns its allocator |
+| Operator diagnosis/rescan | For both AI function types, an empty stream can be rescanned repeatedly and must pull its child again; diagnosis passes child rows through without preparing AI requests, including after rescan |
 | Detector negative controls | Deliberately omit one allocation release or one request-handle cleanup in separate test processes; each must fail with its specific leak diagnostic |
 
 Request memory is compared with the post-initialization baseline before releasing the caller's allocator. Client-owned easy handles, multi handles and header nodes must be balanced at client destruction. A live multi may retain connections; its internally created cache handles are not counted as application request handles because their internal cleanup bypasses the public easy-cleanup API. The test does not pretend to instrument every libcurl allocation.
@@ -172,7 +177,7 @@ SELECT id, AI_EMBED('my_embedding_model', prompt, 1536) AS embedding
 FROM inputs;
 ```
 
-The model/endpoint must already be registered and support the optional requested dimension. Omitting the third argument uses the service's default dimension. Inputs are not concatenated into a prompt, deduplicated or cached; CASE/skip and already-evaluated rows are excluded. The SQL worker still synchronously waits for the batch. This does not collect rows from future SQL batches or add a physical prediction operator.
+The model/endpoint must already be registered and support the optional requested dimension. Omitting the third argument uses the service's default dimension. Inputs are not concatenated into a prompt, deduplicated or cached; CASE/skip and already-evaluated rows are excluded. The batch evaluator itself synchronously waits for the batch. The separate pipeline below can overlap eligible SQL batches without merging their input arrays.
 
 ### Request And Result Contract
 
@@ -194,6 +199,62 @@ Only the local serialized-byte bound drives splitting. There is no model-specifi
 - During implementation, the first new SQL run exposed a missing allocator on JSON measurement buffers (4152); the production buffers were corrected and the same tests rerun. Provider tests initially used unregistered short names; they now use the declared provider registry and explicitly retain rejection of Ollama. Result assertions were not relaxed.
 
 No existing debug database or Notebook was accessed or modified. The separate smoke timing comparison and real-model tests were not rerun for this change.
+
+## Cross-Batch Embedding Pipeline
+
+Simple projections can now send the next SQL batch while the preceding batch is waiting for its response. Existing SQL needs no new option:
+
+```sql
+EXPLAIN SELECT id, AI_EMBED('my_embedding_model', prompt, 1536)
+FROM inputs ORDER BY id;
+```
+
+An eligible plan now contains `AI FUNCTION PIPELINE` (originally `AI EMBED PIPELINE`). The [logical operator](../../../../../src/sql/optimizer/ob_log_ai_func.cpp) owns the AI expression so the child cannot evaluate it synchronously. The [physical operator](../../../../../src/sql/engine/basic/ob_ai_func_op.cpp) maintains two owned batch slots, each with its own persistent `AIFuncBatch` request state. Native embedding input arrays, byte splitting, provider validation and per-request retries are unchanged; batches are not combined and duplicate inputs are retained.
+
+### Scope And Scheduling
+
+- The pipeline accepts one top-level AI_EMBED or AI_COMPLETE projection over a single basic table, a static model and static/omitted dimension or completion configuration, and a column input optionally wrapped in casts. Completion also accepts a stored JSON prompt object. Other projected values must be columns or static constants. Eligible physical inputs are single-worker scan/sort plans; ordinary operator-only filters and column ordering are allowed.
+- LIMIT, CASE/complex projections, dynamic parameters, multiple AI projections, joins, aggregates, subqueries and AI-dependent filters/orderings retain the existing path. AI_RERANK is not connected to the pipeline. A plan with `rowsets_max_rows=0` runs the scalar path without allocating batch state; diagnosis mode retains synchronous evaluation.
+- Before pulling another child batch, the operator polls every active batch and returns the front result if ready. It does not wait for both slots to fill before checking completion. After the parent consumes a batch, that slot can be refilled while its peer is still pending.
+- Results remain in input order. A later completed batch is validated and its request memory released, but its owned results wait behind the first batch. This deliberately retains bounded head-of-line blocking. Later-batch permanent errors are checked even while the first batch is pending and cancel both local clients.
+- Rows, side columns and completed results outlive reused evaluation frames. `ObDatum::deep_copy` owns row payloads; `ObBatchResultHolder` restores the child's original datum pointers before another pull. Request allocation is separate from retained output allocation. Close, rescan, error and destruction reset requests before releasing their allocators.
+
+The SQL thread drives both curl multi instances. A wait polls for at most 20ms before checking all batches again; cancellation and retries use the existing query deadline. There is **no background I/O thread, worker suspension/resumption, or new EAGAIN protocol** in the executor. A blocking child read can delay network progress. Each slot retains its curl multi for its own lifetime, but model/endpoint resolution and authentication still happen for each batch; no cross-query cache or tenant-wide scheduler is added.
+
+### Shared Budget
+
+The two slots share **one 64MiB logical budget**, including copied row datums/payloads, retained result strings, request-state objects, serialized bodies and raw responses. The existing 4MiB request and 8MiB response limits also apply. Retry response reset, failure, cancellation and slot reuse return the owning allocation's quota rather than clearing the other slot's usage.
+
+When the combined logical budget is exceeded, the query returns 4019 and cancels local requests. This version does not spill rows, adapt its window to byte pressure, or restart as scalar after submission. Consequently, a workload that fits one batch at a time may exceed the stricter pipeline-wide budget. Earlier requests may already have reached the service when a later batch fails admission. Slots provide count backpressure, not automatic recovery from byte-budget overflow.
+
+JSON trees, temporary conversions, SQL evaluation frames/snapshots, container capacity, arena slack and curl internals are not fully counted. This is not a hard heap/RSS cap, a database-wide quota, or proof that remote work stops when a query is canceled.
+
+### Pipeline Results: 2026-09-20
+
+- The 270-row gate test failed against the previous binary with only one SQL batch submitted before the first response. The same assertions now observe two pending batches, no third pending batch, and all rows including the final tail exactly once.
+- Nine pipeline contracts cover slot refill, later-batch HTTP/provider failures, both sockets closing on cancellation/deadline, same-connection recovery, reversed completion with 400 rows of greater-than-10KiB LONGTEXT and other columns, plan eligibility, filtering/LIMIT, and rowsets of 0/1.
+- Final complete suite: **71/71 passed in 98.875s**. Database CPU including bootstrap and all tests was 57.19s, peak RSS 491244KiB. These are context measurements, not a pipeline speedup or leak-proof claim.
+- Shared-budget native tests and all earlier allocation/curl lifetime checks passed, including both deliberate cleanup-leak negative controls. Debug build, five fixture self-tests and Pylance syntax validation passed.
+- Tests caught and fixed two ownership/execution defects: corrupted tail IDs from overwriting child datum pointers, and zero-length snapshot allocation in scalar mode. The result, request-count and error assertions were not weakened.
+
+At this milestone, diagnosis mode and forced physical-operator rescan had not been independently exercised. The later shared-pipeline work below adds bounded native coverage. Fault injection covers the client, not every new operator/JSON allocation; no whole-heap sanitizer, real embedding endpoint, performance benchmark or worker-release test was run. The existing debug database and Notebook were not used or modified.
+
+### Shared Completion Pipeline: 2026-09-24
+
+AI_COMPLETE now uses the same `LogAIFunc` / `AIFuncSpec` / `AIFuncOp` pipeline as AI_EMBED. A single scheduling loop owns row copies, two slots, the shared 64MiB budget, ordered output, error propagation and cleanup. Function-specific branches retain their existing input preparation and request construction. `AIFuncBatch` owns provider validation and request state; the synchronous completion batch helper also drives this same object to completion, rather than maintaining a separate request implementation.
+
+```sql
+EXPLAIN SELECT id, AI_COMPLETE('my_completion_model', prompt)
+FROM inputs ORDER BY id;
+```
+
+Each completion prompt remains an independent HTTP request with unchanged options and Schema validation. Two SQL batches do not mean two HTTP requests: a batch of N rows may submit N requests, and both batches share the operator budget. Default per-batch parallelism is unchanged. The scope, synchronous SQL-thread ownership and byte-overflow behavior described above still apply; there is no background thread, worker release, adaptive admission, cross-query scheduler or automatic support for other AI functions.
+
+- Negative control: the new completion gate contract failed against the old binary with only 16 requests arriving before any response. The unchanged contract passed after integration, proving overlap beyond one 16-row SQL batch.
+- Eleven completion pipeline cases cover submission, refill before a peer completes, later-batch HTTP/provider/Schema errors, 32 live model socket FDs on cancel and zero afterward, deadline/recovery, out-of-order large LOB side columns, selective retry with unchanged Schema/options, plan eligibility, rowsets 0/1, filter/LIMIT boundaries, and stored JSON prompt objects with invalid-input rejection.
+- Full SQL suite: **82/82 passed in 113.991s**. Database CPU including bootstrap and all contracts was 62.52s, peak RSS 495616KiB. These are context measurements, not a performance comparison. Five fixture self-tests also passed.
+- Debug build and native resource tests passed, including both deliberately broken cleanup controls. Native operator tests directly exercise diagnosis passthrough and repeated empty-stream `rescan()` for both AI function types. They do not claim to exercise full SQL diagnostic reporting or rescan with retained rows/in-flight model requests.
+- No real model service, existing debug database or Notebook was used. Active-request rescan, all operator allocation failures, whole-heap sanitizers and real-provider performance remain verification gaps.
 
 ## Constrained Output
 
