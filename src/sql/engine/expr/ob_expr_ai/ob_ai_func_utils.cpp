@@ -1567,6 +1567,11 @@ int ObAIFuncUtils::get_ai_func_info(ObIAllocator &allocator, const ObString &mod
   return ret;
 }
 
+void ObAIFuncUtils::stop_async_scheduler()
+{
+  ObAIFuncClient::stop_async_scheduler();
+}
+
 int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObString &result)
 {
   int ret = OB_SUCCESS;
@@ -1659,6 +1664,7 @@ int ObAIFuncModel::start_completion_batch(ObArray<ObString> &prompts, ObJsonObje
     client.set_response_validator(complete_provider);
     if (OB_FAIL(client.init(*allocator_, endpoint_info_.get_url(), headers))) {
     } else if (OB_FAIL(client.send_post_batch_no_wait(body_array))) {
+    } else if (OB_FAIL(client.start_async())) {
     }
   }
   return ret;
@@ -1858,6 +1864,7 @@ int ObAIFuncModel::start_dense_embedding_batch(ObArray<ObString> &contents, ObJs
     client.set_response_validator(embed_provider);
     if (OB_FAIL(client.init(*allocator_, endpoint_info_.get_url(), headers))) {
     } else if (OB_FAIL(client.send_post_batch_no_wait(bodies))) {
+    } else if (OB_FAIL(client.start_async())) {
     }
   }
   return ret;

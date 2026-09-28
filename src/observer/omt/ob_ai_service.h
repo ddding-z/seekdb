@@ -51,7 +51,7 @@ public:
   static int server_module_init(ObAiService* &ai_service);
   int init();
   int start() { return OB_SUCCESS; }
-  void stop() {};
+  void stop();
   void wait() {};
   void destroy();
 public:

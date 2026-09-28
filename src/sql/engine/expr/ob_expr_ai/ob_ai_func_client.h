@@ -23,8 +23,10 @@
 
 namespace oceanbase 
 {
+namespace sql { class ObSQLSessionInfo; }
 namespace common 
 {
+class AIFuncScheduler;
 class ObAIFuncClient: public ObAIFuncHandle
 {
 public:
@@ -58,11 +60,16 @@ public:
                               ObArray<ObJsonObject *> &responses) override;
   // embedding service interface
   int send_post_batch_no_wait(ObArray<ObJsonObject *> &data_array);
+  int start_async();
+  static void stop_async_scheduler();
   bool check_batch_finished();
   int poll_batch(bool &finished, int64_t wait_ms = 0);
   int get_batch_result(ObArray<ObJsonObject *> &responses);
 private:
+  friend class AIFuncScheduler;
   struct Request;
+  bool drive_batch();
+  void cancel_async();
   int error_handle(CURLcode res);
   int send_post(ObJsonObject *data, ObJsonObject *&response);
   int send_post_batch(ObArray<ObJsonObject *> &data_array, ObArray<ObJsonObject *> &responses);
@@ -85,6 +92,10 @@ private:
   ObArray<Request *> requests_;
   // atomic boolean value, used to check if the batch task is finished
   std::atomic<bool> is_finished_;
+  bool async_mode_;
+  std::atomic<bool> async_done_;
+  std::atomic<int> cancel_ret_;
+  sql::ObSQLSessionInfo *request_session_;
   int64_t max_retry_times_;
   int64_t abs_timeout_ts_;
   int64_t timeout_sec_;

@@ -20,6 +20,12 @@
 #include <algorithm>
 #include <limits>
 #include <cstdlib>
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include "lib/thread/threads.h"
+#include "lib/thread/ob_thread_name.h"
 
 namespace oceanbase
 {
@@ -27,6 +33,120 @@ namespace common
 {
 
 const int64_t ObAIFuncClient::CURL_MAX_TIMEOUT_SEC = INT_MAX / 1000;
+
+class AIFuncScheduler final : public lib::Threads
+{
+public:
+  AIFuncScheduler() : lib::Threads(1), clients_{}, started_(false), stopping_(false) {}
+  ~AIFuncScheduler() override { shutdown(); }
+
+  void shutdown()
+  {
+    std::lock_guard<std::mutex> lifecycle_guard(lifecycle_mutex_);
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      stopping_.store(true);
+      stop();
+    }
+    changed_.notify_all();
+    wait();
+  }
+
+  static AIFuncScheduler &instance()
+  {
+    static AIFuncScheduler scheduler;
+    return scheduler;
+  }
+
+  int submit(ObAIFuncClient &client)
+  {
+    int ret = OB_SUCCESS;
+    std::unique_lock<std::mutex> guard(mutex_);
+    if (stopping_.load()) {
+      ret = OB_CANCELED;
+    } else if (!started_) {
+      ret = start();
+      started_ = OB_SUCC(ret);
+    }
+    while (OB_SUCC(ret)) {
+      if (stopping_.load()) {
+        ret = OB_CANCELED;
+      } else if (OB_FAIL(client.check_status())) {
+      } else {
+        auto available = std::find(clients_.begin(), clients_.end(), nullptr);
+        if (available != clients_.end()) {
+          client.async_mode_ = true;
+          client.async_done_.store(false);
+          *available = &client;
+          changed_.notify_all();
+          break;
+        }
+        changed_.wait_for(guard, std::chrono::milliseconds(20));
+      }
+    }
+    return ret;
+  }
+
+  void wait_for(ObAIFuncClient &client, int64_t wait_ms)
+  {
+    std::unique_lock<std::mutex> guard(mutex_);
+    changed_.notify_all();
+    if (wait_ms < 0) {
+      changed_.wait(guard, [&] { return client.async_done_.load(); });
+    } else {
+      changed_.wait_for(guard, std::chrono::milliseconds(wait_ms),
+                        [&] { return client.async_done_.load(); });
+    }
+  }
+
+  void run(int64_t) override
+  {
+    lib::set_thread_name("AINetwork");
+    for (;;) {
+      bool pending = false;
+      for (int64_t index = 0; index < clients_.size(); ++index) {
+        ObAIFuncClient *client = nullptr;
+        {
+          std::lock_guard<std::mutex> guard(mutex_);
+          client = clients_[index];
+        }
+        if (nullptr != client) {
+          if (stopping_.load()) {
+            client->cancel_ret_.store(OB_CANCELED);
+          }
+          if (client->drive_batch()) {
+            std::lock_guard<std::mutex> guard(mutex_);
+            clients_[index] = nullptr;
+            client->async_done_.store(true);
+            changed_.notify_all();
+          } else {
+            pending = true;
+          }
+        }
+      }
+      std::unique_lock<std::mutex> guard(mutex_);
+      const auto has_clients = [&] {
+        return std::any_of(clients_.begin(), clients_.end(),
+                           [](ObAIFuncClient *client) { return nullptr != client; });
+      };
+      if (stopping_.load() && !has_clients()) {
+        break;
+      } else if (pending) {
+        changed_.wait_for(guard, std::chrono::milliseconds(5));
+      } else {
+        changed_.wait(guard, [&] { return stopping_.load() || has_clients(); });
+      }
+    }
+  }
+
+private:
+  std::mutex lifecycle_mutex_;
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  std::array<ObAIFuncClient *, 64> clients_;
+  bool started_;
+  std::atomic<bool> stopping_;
+};
 
 struct ObAIFuncClient::Request
 {
@@ -54,7 +174,8 @@ struct ObAIFuncClient::Request
 
 ObAIFuncClient::ObAIFuncClient()
   : allocator_(nullptr), url_(nullptr), header_list_(nullptr), curlm_(nullptr),
-    requests_(), is_finished_(false), max_retry_times_(3), abs_timeout_ts_(0),
+    requests_(), is_finished_(false), async_mode_(false), async_done_(true),
+    cancel_ret_(OB_SUCCESS), request_session_(nullptr), max_retry_times_(3), abs_timeout_ts_(0),
     timeout_sec_(60), max_parallel_(0), active_count_(0), completed_count_(0),
     batch_ret_(OB_SUCCESS), status_checker_(nullptr), status_context_(nullptr),
     response_validator_(nullptr),
@@ -72,6 +193,7 @@ ObAIFuncClient::~ObAIFuncClient()
 
 void ObAIFuncClient::clean_up()
 {
+  cancel_async();
   for (int64_t index = 0; index < requests_.count(); ++index) {
     Request *request = requests_.at(index);
     if (nullptr != request->handle_) {
@@ -87,18 +209,29 @@ void ObAIFuncClient::clean_up()
   completed_count_ = 0;
   release_buffer(buffered_bytes_);
   is_finished_.store(false);
+  cancel_ret_.store(OB_SUCCESS);
 }
 
 int ObAIFuncClient::reserve_buffer(int64_t bytes)
 {
   int ret = OB_SUCCESS;
-  if (bytes < 0 || bytes > MAX_BATCH_BYTES - buffered_bytes_ ||
-      (nullptr != shared_buffered_bytes_ && bytes > MAX_BATCH_BYTES - *shared_buffered_bytes_)) {
+  if (bytes < 0 || bytes > MAX_BATCH_BYTES - buffered_bytes_) {
     ret = OB_SIZE_OVERFLOW;
   } else {
-    buffered_bytes_ += bytes;
     if (nullptr != shared_buffered_bytes_) {
-      *shared_buffered_bytes_ += bytes;
+      int64_t used = ATOMIC_LOAD(shared_buffered_bytes_);
+      while (OB_SUCC(ret)) {
+        if (bytes > MAX_BATCH_BYTES - used) {
+          ret = OB_SIZE_OVERFLOW;
+        } else if (ATOMIC_BCAS(shared_buffered_bytes_, used, used + bytes)) {
+          break;
+        } else {
+          used = ATOMIC_LOAD(shared_buffered_bytes_);
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      buffered_bytes_ += bytes;
     }
   }
   return ret;
@@ -108,7 +241,7 @@ void ObAIFuncClient::release_buffer(int64_t bytes)
 {
   buffered_bytes_ -= bytes;
   if (nullptr != shared_buffered_bytes_) {
-    *shared_buffered_bytes_ -= bytes;
+    ATOMIC_FAA(shared_buffered_bytes_, -bytes);
   }
 }
 
@@ -124,6 +257,7 @@ void ObAIFuncClient::reset()
   }
   url_ = nullptr;
   allocator_ = nullptr;
+  request_session_ = nullptr;
   batch_ret_ = OB_SUCCESS;
 }
 
@@ -135,6 +269,7 @@ int ObAIFuncClient::init(ObIAllocator &allocator, const ObString &url, ObArray<O
     ret = OB_INVALID_ARGUMENT;
   } else {
     allocator_ = &allocator;
+    request_session_ = THIS_WORKER.get_session();
     const int64_t configured_us = std::min(timeout_sec_, CURL_MAX_TIMEOUT_SEC) * 1000000;
     const int64_t remaining_us = THIS_WORKER.is_timeout_ts_valid()
         ? THIS_WORKER.get_timeout_remain() : configured_us;
@@ -164,13 +299,14 @@ int ObAIFuncClient::init(ObIAllocator &allocator, const ObString &url, ObArray<O
 
 int ObAIFuncClient::check_status()
 {
-  int ret = OB_SUCCESS;
-  if (ObTimeUtility::current_time() >= abs_timeout_ts_) {
+  int ret = cancel_ret_.load();
+  if (OB_FAIL(ret)) {
+  } else if (ObTimeUtility::current_time() >= abs_timeout_ts_) {
     ret = OB_TIMEOUT;
   } else if (nullptr != status_checker_) {
     ret = status_checker_(status_context_);
-  } else if (nullptr != THIS_WORKER.get_session()) {
-    THIS_WORKER.get_session()->is_terminate(ret);
+  } else if (nullptr != request_session_) {
+    request_session_->is_terminate(ret);
   }
   return ret;
 }
@@ -429,7 +565,39 @@ int ObAIFuncClient::advance_batch()
   return ret;
 }
 
+void ObAIFuncClient::stop_async_scheduler()
+{
+  AIFuncScheduler::instance().shutdown();
+}
+
+int ObAIFuncClient::start_async()
+{
+  int ret = OB_SUCCESS;
+  if (async_mode_) {
+    ret = OB_INIT_TWICE;
+  } else if (nullptr == curlm_ || requests_.empty()) {
+    ret = OB_NOT_INIT;
+  } else {
+    ret = AIFuncScheduler::instance().submit(*this);
+  }
+  return ret;
+}
+
+void ObAIFuncClient::cancel_async()
+{
+  if (async_mode_) {
+    cancel_ret_.store(OB_CANCELED);
+    AIFuncScheduler::instance().wait_for(*this, -1);
+    async_mode_ = false;
+  }
+}
+
 bool ObAIFuncClient::check_batch_finished()
+{
+  return async_mode_ ? async_done_.load() : drive_batch();
+}
+
+bool ObAIFuncClient::drive_batch()
 {
   if (!is_finished_.load()) {
     if (OB_SUCCESS == batch_ret_) {
@@ -457,6 +625,9 @@ bool ObAIFuncClient::check_batch_finished()
 int ObAIFuncClient::get_batch_result(ObArray<ObJsonObject *> &responses)
 {
   responses.reset();
+  if (async_mode_ && !async_done_.load()) {
+    return OB_EAGAIN;
+  }
   int ret = batch_ret_;
   if (OB_SUCC(ret) && !is_finished_.load()) {
     ret = OB_EAGAIN;
@@ -471,6 +642,13 @@ int ObAIFuncClient::get_batch_result(ObArray<ObJsonObject *> &responses)
 
 int ObAIFuncClient::poll_batch(bool &finished, int64_t wait_ms)
 {
+  if (async_mode_) {
+    if (wait_ms > 0 && !async_done_.load()) {
+      AIFuncScheduler::instance().wait_for(*this, std::min<int64_t>(wait_ms, 20));
+    }
+    finished = async_done_.load();
+    return finished ? batch_ret_ : OB_SUCCESS;
+  }
   finished = check_batch_finished();
   if (!finished && wait_ms > 0) {
     int numfds = 0;

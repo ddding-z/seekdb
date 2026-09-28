@@ -4,9 +4,11 @@
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/session/ob_sql_session_info.h"
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,6 +40,7 @@ struct CurlResources
 
   void inject(Fault operation, int64_t attempt)
   {
+    std::lock_guard<std::recursive_mutex> guard(mutex);
     fault = operation;
     fail_at = attempt;
     attempts = 0;
@@ -46,12 +49,14 @@ struct CurlResources
 
   void check_empty() const
   {
+    std::lock_guard<std::recursive_mutex> guard(mutex);
     require(attached.empty(), "curl requests remained attached");
     require(easy.empty(), "curl easy handles were not released");
     require(multi.empty(), "curl multi handles were not released");
     require(headers.empty(), "curl header nodes were not released");
   }
 
+  mutable std::recursive_mutex mutex;
   std::unordered_set<CURL *> easy;
   std::unordered_set<CURLM *> multi;
   std::unordered_set<curl_slist *> headers;
@@ -71,6 +76,9 @@ CurlResources &resources()
 }
 
 bool omit_allocation_release = false;
+std::mutex completion_mutex;
+std::condition_variable completion_changed;
+int64_t completed_transfers = 0;
 
 class TrackingAllocator final : public ObIAllocator
 {
@@ -84,6 +92,7 @@ public:
 
   void *alloc(const int64_t size) override
   {
+    std::lock_guard<std::mutex> guard(mutex_);
     if (++attempts_ == fail_at_) {
       injected_ = true;
       return nullptr;
@@ -99,6 +108,7 @@ public:
 
   void free(void *pointer) override
   {
+    std::lock_guard<std::mutex> guard(mutex_);
     if (pointer != nullptr) {
       if (omit_allocation_release) {
         omit_allocation_release = false;
@@ -109,11 +119,26 @@ public:
     }
   }
 
-  void fail_at(int64_t attempt) { attempts_ = 0; fail_at_ = attempt; injected_ = false; }
-  bool injected() const { return injected_; }
-  size_t outstanding() const { return allocations_.size(); }
+  void fail_at(int64_t attempt)
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    attempts_ = 0;
+    fail_at_ = attempt;
+    injected_ = false;
+  }
+  bool injected() const
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return injected_;
+  }
+  size_t outstanding() const
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return allocations_.size();
+  }
 
 private:
+  mutable std::mutex mutex_;
   std::unordered_map<void *, int64_t> allocations_;
   int64_t attempts_ = 0;
   int64_t fail_at_ = 0;
@@ -122,7 +147,8 @@ private:
 
 struct Inputs
 {
-  explicit Inputs(int64_t count = 3)
+  explicit Inputs(int64_t count = 3,
+                  const char *body = "{\"messages\":[{\"content\":\"native-resource\"}]}")
   {
     require(headers.push_back(ObString::make_string("Content-Type: application/json")) == OB_SUCCESS,
             "prepare content header");
@@ -130,7 +156,7 @@ struct Inputs
             "prepare authorization header");
     ObIJsonBase *json = nullptr;
     require(ObJsonBaseFactory::get_json_base(&arena,
-                ObString::make_string("{\"messages\":[{\"content\":\"native-resource\"}]}"),
+                ObString::make_string(body),
                 ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, json) == OB_SUCCESS,
             "prepare request JSON");
     for (int64_t index = 0; index < count; ++index) {
@@ -311,7 +337,165 @@ void test_pending_lifecycle(const char *url)
   resources().check_empty();
 }
 
-void test_shared_pipeline_budget(const char *url)
+void test_background_progress(const char *url, bool schedule = true)
+{
+  Inputs inputs;
+  TrackingAllocator allocator;
+  {
+    ObAIFuncClient client;
+    initialize(client, allocator, inputs, url);
+    int64_t expected = 0;
+    {
+      std::lock_guard<std::mutex> guard(completion_mutex);
+      expected = completed_transfers + inputs.data.count();
+    }
+    require(client.send_post_batch_no_wait(inputs.data) == OB_SUCCESS, "prepare background batch");
+    if (schedule) {
+      require(client.start_async() == OB_SUCCESS, "schedule background batch");
+    }
+    {
+      std::unique_lock<std::mutex> guard(completion_mutex);
+      require(completion_changed.wait_for(guard, std::chrono::seconds(3),
+                  [&] { return completed_transfers >= expected; }),
+              "requests must complete while the SQL thread does not poll");
+    }
+    bool finished = false;
+    require(client.poll_batch(finished, 20) == OB_SUCCESS && finished,
+            "background completion must be observable by the SQL thread");
+    ObArray<ObJsonObject *> responses;
+    require(client.get_batch_result(responses) == OB_SUCCESS && responses.count() == inputs.data.count(),
+            "background batch must retain every result");
+    client.reset();
+  }
+  resources().check_empty();
+}
+
+void test_background_cancellation(const char *url)
+{
+  Inputs held(1, "{\"messages\":[{\"content\":\"native-hold\"}]}");
+  Inputs ready(1);
+  TrackingAllocator allocator;
+  {
+    ObAIFuncClient client;
+    for (int64_t iteration = 0; iteration < 16; ++iteration) {
+      initialize(client, allocator, held, url);
+      require(client.send_post_batch_no_wait(held.data) == OB_SUCCESS, "prepare cancel race");
+      require(client.start_async() == OB_SUCCESS, "submit cancel race");
+      require(client.start_async() == OB_INIT_TWICE, "duplicate scheduling must be rejected");
+      client.reset();
+      client.reset();
+      require(allocator.outstanding() == 0, "background cancel retained caller memory");
+    }
+    initialize(client, allocator, ready, url);
+    require(client.send_post_batch_no_wait(ready.data) == OB_SUCCESS, "prepare recovery after cancel");
+    require(client.start_async() == OB_SUCCESS, "schedule recovery after cancel");
+    bool finished = false;
+    while (!finished) {
+      require(client.poll_batch(finished, 20) == OB_SUCCESS, "recovery after cancel failed");
+    }
+    ObArray<ObJsonObject *> responses;
+    require(client.get_batch_result(responses) == OB_SUCCESS && responses.count() == 1,
+            "recovery exposed stale or missing results");
+  }
+  resources().check_empty();
+}
+
+void test_background_deadline_and_peer_progress(const char *url)
+{
+  Inputs held(1, "{\"messages\":[{\"content\":\"native-hold\"}]}");
+  Inputs ready;
+  int64_t expected = 0;
+  {
+    std::lock_guard<std::mutex> guard(completion_mutex);
+    expected = completed_transfers + held.data.count() + ready.data.count();
+  }
+  TrackingAllocator allocator;
+  {
+    ObAIFuncClient client;
+    client.set_timeout_sec(1);
+    require(client.init(allocator, ObString::make_string(url), held.headers) == OB_SUCCESS,
+            "initialize background deadline");
+    require(client.send_post_batch_no_wait(held.data) == OB_SUCCESS, "prepare background deadline");
+    require(client.start_async() == OB_SUCCESS, "schedule background deadline");
+    TrackingAllocator ready_allocator;
+    ObAIFuncClient peer;
+    initialize(peer, ready_allocator, ready, url);
+    require(peer.send_post_batch_no_wait(ready.data) == OB_SUCCESS, "prepare independent peer");
+    require(peer.start_async() == OB_SUCCESS, "schedule independent peer");
+    bool finished = false;
+    while (!finished) {
+      require(peer.poll_batch(finished, 20) == OB_SUCCESS, "held batch blocked an independent peer");
+    }
+    require(!client.check_batch_finished(), "independent peer must finish before held batch deadline");
+    {
+      std::unique_lock<std::mutex> guard(completion_mutex);
+      require(completion_changed.wait_for(guard, std::chrono::seconds(3),
+                  [&] { return completed_transfers >= expected; }),
+              "background must enforce deadline without SQL-thread polling");
+    }
+    require(client.poll_batch(finished, 20) == OB_TIMEOUT && finished, "background deadline must propagate");
+    ObArray<ObJsonObject *> responses;
+    require(client.get_batch_result(responses) == OB_TIMEOUT && responses.empty(),
+            "timed-out background request must not expose results");
+  }
+  resources().check_empty();
+}
+
+void test_background_admission(const char *url)
+{
+  Inputs held(1, "{\"messages\":[{\"content\":\"native-admission\"}]}");
+  TrackingAllocator allocator;
+  {
+    ObAIFuncClient clients[65];
+    for (int64_t index = 0; index < 64; ++index) {
+      initialize(clients[index], allocator, held, url);
+      require(clients[index].send_post_batch_no_wait(held.data) == OB_SUCCESS, "prepare bounded admission");
+      require(clients[index].start_async() == OB_SUCCESS, "fill bounded scheduler");
+    }
+    clients[64].set_timeout_sec(1);
+    require(clients[64].init(allocator, ObString::make_string(url), held.headers) == OB_SUCCESS,
+            "initialize admission deadline");
+    require(clients[64].send_post_batch_no_wait(held.data) == OB_SUCCESS, "prepare queued admission");
+    require(clients[64].start_async() == OB_TIMEOUT, "full scheduler must honor admission deadline");
+    for (ObAIFuncClient &client : clients) {
+      client.reset();
+    }
+    require(allocator.outstanding() == 0, "bounded admission or destruction retained request memory");
+    Inputs ready(1);
+    initialize(clients[0], allocator, ready, url);
+    require(clients[0].send_post_batch_no_wait(ready.data) == OB_SUCCESS, "prepare after full scheduler");
+    require(clients[0].start_async() == OB_SUCCESS, "released scheduler slots must admit new work");
+  }
+  resources().check_empty();
+}
+
+void test_background_shutdown(const char *url)
+{
+  Inputs held(1, "{\"messages\":[{\"content\":\"native-hold\"}]}");
+  TrackingAllocator allocator;
+  {
+    ObAIFuncClient clients[2];
+    for (ObAIFuncClient &client : clients) {
+      initialize(client, allocator, held, url);
+      require(client.send_post_batch_no_wait(held.data) == OB_SUCCESS, "prepare scheduler shutdown");
+      require(client.start_async() == OB_SUCCESS, "submit before scheduler shutdown");
+    }
+    ObAIFuncClient::stop_async_scheduler();
+    ObAIFuncClient::stop_async_scheduler();
+    for (ObAIFuncClient &client : clients) {
+      bool finished = false;
+      require(client.poll_batch(finished) == OB_CANCELED && finished, "shutdown must cancel in-flight work");
+      client.reset();
+    }
+    require(allocator.outstanding() == 0, "shutdown retained caller request memory");
+    initialize(clients[0], allocator, held, url);
+    require(clients[0].send_post_batch_no_wait(held.data) == OB_SUCCESS, "prepare after shutdown");
+    require(clients[0].start_async() == OB_CANCELED, "shutdown must reject new work");
+  }
+  resources().check_empty();
+}
+
+void test_shared_pipeline_budget(const char *url, bool background = false)
 {
   Inputs inputs(1);
   TrackingAllocator first_allocator;
@@ -339,6 +523,10 @@ void test_shared_pipeline_budget(const char *url)
     require(resources().attached.size() == 2, "two batches must own independent active requests");
     retained_bytes = ObAIFuncClient::MAX_BATCH_BYTES - shared_bytes;
     shared_bytes += retained_bytes;
+    if (background) {
+      require(first.start_async() == OB_SUCCESS, "schedule first shared-budget batch");
+      require(second.start_async() == OB_SUCCESS, "schedule second shared-budget batch");
+    }
     bool finished = false;
     int result = OB_SUCCESS;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
@@ -347,6 +535,15 @@ void test_shared_pipeline_budget(const char *url)
       result = first.poll_batch(finished, 20);
     }
     require(finished && result == OB_SIZE_OVERFLOW, "response bytes must honor the same shared quota");
+    if (background) {
+      finished = false;
+      result = OB_SUCCESS;
+      while (!finished && result == OB_SUCCESS) {
+        require(std::chrono::steady_clock::now() < deadline, "second shared-budget batch exceeded deadline");
+        result = second.poll_batch(finished, 20);
+      }
+      require(finished && result == OB_SIZE_OVERFLOW, "background peers must share the response quota");
+    }
     first.reset();
     second.reset();
     require(shared_bytes == retained_bytes, "cancellation did not return exactly the request/response quota");
@@ -469,6 +666,7 @@ void __real_curl_slist_free_all(curl_slist *list);
 
 CURL *__wrap_curl_easy_init()
 {
+  std::lock_guard<std::recursive_mutex> guard(resources().mutex);
   if (resources().creating_multi) {
     return __real_curl_easy_init();
   }
@@ -481,6 +679,7 @@ CURL *__wrap_curl_easy_init()
 
 void __wrap_curl_easy_cleanup(CURL *handle)
 {
+  std::lock_guard<std::recursive_mutex> guard(resources().mutex);
   if (handle == nullptr || resources().easy.count(handle) == 0) {
     __real_curl_easy_cleanup(handle);
     return;
@@ -496,6 +695,7 @@ void __wrap_curl_easy_cleanup(CURL *handle)
 
 CURLM *__wrap_curl_multi_init()
 {
+  std::lock_guard<std::recursive_mutex> guard(resources().mutex);
   resources().creating_multi = true;
   CURLM *handle = resources().fail(Fault::MULTI) ? nullptr : __real_curl_multi_init();
   resources().creating_multi = false;
@@ -507,6 +707,7 @@ CURLM *__wrap_curl_multi_init()
 
 CURLMcode __wrap_curl_multi_cleanup(CURLM *handle)
 {
+  std::lock_guard<std::recursive_mutex> guard(resources().mutex);
   for (const auto &entry : resources().attached) {
     require(entry.second != handle, "multi cleanup before request removal");
   }
@@ -516,6 +717,7 @@ CURLMcode __wrap_curl_multi_cleanup(CURLM *handle)
 
 CURLMcode __wrap_curl_multi_add_handle(CURLM *multi, CURL *easy)
 {
+  std::lock_guard<std::recursive_mutex> guard(resources().mutex);
   const CURLMcode result = resources().fail(Fault::ADD) ? CURLM_OUT_OF_MEMORY
                                                       : __real_curl_multi_add_handle(multi, easy);
   if (result == CURLM_OK) {
@@ -526,26 +728,35 @@ CURLMcode __wrap_curl_multi_add_handle(CURLM *multi, CURL *easy)
 
 CURLMcode __wrap_curl_multi_remove_handle(CURLM *multi, CURL *easy)
 {
+  std::lock_guard<std::recursive_mutex> guard(resources().mutex);
   const CURLMcode result = __real_curl_multi_remove_handle(multi, easy);
   if (result == CURLM_OK) {
     require(resources().attached.erase(easy) == 1, "duplicate request removal");
+    {
+      std::lock_guard<std::mutex> guard(completion_mutex);
+      ++completed_transfers;
+    }
+    completion_changed.notify_all();
   }
   return result;
 }
 
 CURLMcode __wrap_curl_multi_perform(CURLM *multi, int *running)
 {
+  std::lock_guard<std::recursive_mutex> guard(resources().mutex);
   return resources().fail(Fault::PERFORM) ? CURLM_INTERNAL_ERROR : __real_curl_multi_perform(multi, running);
 }
 
 CURLMcode __wrap_curl_multi_poll(CURLM *multi, curl_waitfd *extra, unsigned int count, int timeout, int *ready)
 {
+  std::lock_guard<std::recursive_mutex> guard(resources().mutex);
   return resources().fail(Fault::POLL) ? CURLM_INTERNAL_ERROR
                                       : __real_curl_multi_poll(multi, extra, count, timeout, ready);
 }
 
 curl_slist *__wrap_curl_slist_append(curl_slist *list, const char *value)
 {
+  std::lock_guard<std::recursive_mutex> guard(resources().mutex);
   curl_slist *result = resources().fail(Fault::HEADER) ? nullptr : __real_curl_slist_append(list, value);
   for (curl_slist *node = result; node != nullptr; node = node->next) {
     resources().headers.insert(node);
@@ -555,6 +766,7 @@ curl_slist *__wrap_curl_slist_append(curl_slist *list, const char *value)
 
 void __wrap_curl_slist_free_all(curl_slist *list)
 {
+  std::lock_guard<std::recursive_mutex> guard(resources().mutex);
   for (curl_slist *node = list; node != nullptr; node = node->next) {
     resources().headers.erase(node);
   }
@@ -578,6 +790,10 @@ int main(int argc, char **argv)
       test_curl_failure(Fault::EASY, 2, OB_ALLOCATE_MEMORY_FAILED, url);
       require(false, "negative control unexpectedly passed");
     }
+    if (argc == 3 && std::strcmp(argv[2], "--negative-control=progress") == 0) {
+      test_background_progress(url, false);
+      require(false, "progress negative control unexpectedly passed");
+    }
     test_initialization_allocation_failures();
     std::puts("PASS initialization allocation failures and repeated cleanup");
     test_preparation_allocation_failures(url);
@@ -594,12 +810,24 @@ int main(int argc, char **argv)
     std::puts("PASS response allocation failure and peer cleanup");
     test_pending_lifecycle(url);
     std::puts("PASS 32 no_wait cancellations, queued work, reinitialization and pending destruction");
+    test_background_progress(url);
+    std::puts("PASS network completion without SQL-thread polling");
+    test_background_cancellation(url);
+    std::puts("PASS 16 background cancel/reuse races and duplicate scheduling rejection");
+    test_background_deadline_and_peer_progress(url);
+    std::puts("PASS independent background peer progress and autonomous deadline");
+    test_background_admission(url);
+    std::puts("PASS bounded background admission, deadline and slot recovery");
     test_shared_pipeline_budget(url);
     std::puts("PASS shared pipeline admission/response quota and exact rollback");
+    test_shared_pipeline_budget(url, true);
+    std::puts("PASS background batches share admission/response quota and exact rollback");
     test_recovery_and_result_lifetime(url);
     std::puts("PASS 16 failure/recovery cycles and caller-owned result lifetime");
     test_pipeline_diagnosis_and_empty_rescan();
     std::puts("PASS both AI functions: diagnosis passthrough and empty-input physical rescan");
+    test_background_shutdown(url);
+    std::puts("PASS scheduler shutdown cancels in-flight work and rejects new submissions");
     resources().check_empty();
     curl_global_cleanup();
     return 0;

@@ -54,11 +54,16 @@ int AIFuncOp::inner_open()
 int AIFuncOp::reserve(Slot &slot, int64_t bytes)
 {
   int ret = OB_SUCCESS;
-  if (bytes < 0 || bytes > ObAIFuncClient::MAX_BATCH_BYTES - buffered_bytes_) {
-    ret = OB_SIZE_OVERFLOW;
-  } else {
-    buffered_bytes_ += bytes;
-    slot.retained_bytes_ += bytes;
+  int64_t used = ATOMIC_LOAD(&buffered_bytes_);
+  while (OB_SUCC(ret)) {
+    if (bytes < 0 || bytes > ObAIFuncClient::MAX_BATCH_BYTES - used) {
+      ret = OB_SIZE_OVERFLOW;
+    } else if (ATOMIC_BCAS(&buffered_bytes_, used, used + bytes)) {
+      slot.retained_bytes_ += bytes;
+      break;
+    } else {
+      used = ATOMIC_LOAD(&buffered_bytes_);
+    }
   }
   return ret;
 }
@@ -69,7 +74,7 @@ void AIFuncOp::reset_slot(Slot &slot)
   slot.request_allocator_.reset();
   slot.results_.reset();
   slot.data_allocator_.reset();
-  buffered_bytes_ -= slot.retained_bytes_;
+  ATOMIC_FAA(&buffered_bytes_, -slot.retained_bytes_);
   slot.datums_ = nullptr;
   slot.size_ = slot.offset_ = slot.retained_bytes_ = 0;
   slot.ready_ = false;

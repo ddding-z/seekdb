@@ -343,6 +343,7 @@ public:
   static int get_ai_func_info(ObIAllocator &allocator, const ObString &model_id,
                               share::schema::ObSchemaGetterGuard &guard, ObAIFuncExprInfo *&info);
   static int get_ai_func_info(ObIAllocator &allocator, const ObString &model_id, ObAIFuncExprInfo *&info);
+  static void stop_async_scheduler();
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncUtils);
 };

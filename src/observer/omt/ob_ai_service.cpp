@@ -20,6 +20,7 @@
 #include "sql/privilege_check/ob_ai_model_priv_util.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "sql/engine/ob_exec_context.h"
+#include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
 
 using namespace oceanbase::share;
 using namespace oceanbase::common;
@@ -61,8 +62,16 @@ int ObAiService::init()
   return ret;
 }
 
+void ObAiService::stop()
+{
+  if (is_inited_) {
+    ObAIFuncUtils::stop_async_scheduler();
+  }
+}
+
 void ObAiService::destroy()
 {
+  stop();
   is_inited_ = false;
 }
 
