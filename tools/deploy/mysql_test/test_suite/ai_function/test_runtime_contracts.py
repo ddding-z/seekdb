@@ -5,7 +5,9 @@ from dataclasses import dataclass, field
 from email.utils import formatdate, parsedate_to_datetime
 from http.client import HTTPConnection
 import json
+import os
 from pathlib import Path
+import signal
 import socket
 import struct
 import sys
@@ -284,6 +286,7 @@ class RuntimeContracts(unittest.TestCase):
         self.cursor = self.connection.cursor()
         self.addCleanup(self.cursor.close)
         self.cursor.execute("SET ob_query_timeout = 20000000")
+        self.cursor.execute("SET ai_pipeline_slots = DEFAULT, ai_pipeline_memory_limit = DEFAULT")
         for endpoint in ("contract_endpoint", "contract_embed_endpoint"):
             self.cursor.execute("CALL DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT(%s, %s)",
                                 (endpoint, json.dumps({"url": f"http://127.0.0.1:{self.server.server_port}/",
@@ -334,6 +337,358 @@ class RuntimeContracts(unittest.TestCase):
         self.gates.append(gate)
         return gate
 
+    def test_completion_pipeline_releases_request_workers(self):
+        self.assert_pipeline_releases_request_workers(False)
+
+    def test_pipeline_configurable_settings(self):
+        self.cursor.execute("SELECT @@ai_pipeline_slots, @@ai_pipeline_memory_limit")
+        self.assertEqual(self.cursor.fetchone(), (2, 64 * 1024 * 1024))
+        self.cursor.execute("SET ai_pipeline_slots = 3, ai_pipeline_memory_limit = 268435456")
+        with pymysql.connect(unix_socket=self.sql_socket, user="root", autocommit=True) as peer:
+            with peer.cursor() as cursor:
+                cursor.execute("SELECT @@ai_pipeline_slots, @@ai_pipeline_memory_limit")
+                self.assertEqual(cursor.fetchone(), (2, 64 * 1024 * 1024))
+        for name, invalid_values in (("ai_pipeline_slots", (-1, 0, 1025)),
+                                     ("ai_pipeline_memory_limit", (0, 1048575, 1099511627777))):
+            for value in invalid_values:
+                with self.subTest(name=name, value=value):
+                    sql_error(self, 1231, lambda: self.cursor.execute(f"SET {name} = %s", (value,)))
+        self.cursor.execute("SELECT @@ai_pipeline_slots, @@ai_pipeline_memory_limit")
+        self.assertEqual(self.cursor.fetchone(), (3, 256 * 1024 * 1024))
+
+    def test_pipeline_configurable_slots(self):
+        for slot_count in (1, 3, 5):
+            for embedding in (False, True):
+                with self.subTest(slots=slot_count, embedding=embedding):
+                    self.cursor.execute("TRUNCATE TABLE inputs")
+                    self.cursor.execute("SET ai_pipeline_slots = %s", (slot_count,))
+                    prompts = [f"slots-{slot_count}-{embedding}-{index}"
+                               for index in range(16 * (slot_count + 2) + 3)]
+                    if embedding:
+                        expected = self.load_embeddings(prompts)
+                        expression = "AI_EMBED('contract_embed', prompt, 3)"
+                    else:
+                        self.load(prompts)
+                        expected = tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))
+                        expression = "AI_COMPLETE('contract_model', prompt)"
+                    gate = self.gate()
+                    self.server.default_reply = Reply(gate=gate)
+                    before = len(self.server.audit)
+                    window = slot_count if embedding else slot_count * 16
+
+                    def query():
+                        rows = self.query_pipeline(expression)
+                        return tuple((row, json.loads(value)) for row, value in rows) if embedding else rows
+
+                    worker, outcome = self.start_embedding_query(query)
+                    try:
+                        with self.server.condition:
+                            self.assertTrue(self.server.condition.wait_for(
+                                lambda: len(self.server.audit) >= before + window, timeout=3),
+                                f"expected {window} in-flight requests, got {len(self.server.audit) - before}")
+                            self.assertFalse(self.server.condition.wait_for(
+                                lambda: len(self.server.audit) > before + window, timeout=0.1),
+                                "pipeline submitted beyond its configured slots")
+                            self.assertTrue(all(record["response"] is None for record in self.server.audit[before:]))
+                    finally:
+                        gate.set()
+                        worker.join(5)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(outcome, [expected])
+                    submitted = [text for body in self.server.requests[before:]
+                                 for text in (body["input"] if embedding else [body["messages"][-1]["content"]])]
+                    self.assertEqual(Counter(submitted), Counter(prompts))
+
+    def test_pipeline_memory_backpressure(self):
+        prompts = [f"memory-window-{index}" for index in range(51)]
+        self.load_embeddings(prompts)
+        self.cursor.execute("ALTER TABLE inputs ADD COLUMN side_data VARBINARY(60000)")
+        self.addCleanup(lambda: self.cursor.execute("ALTER TABLE inputs DROP COLUMN side_data"))
+        self.cursor.execute("UPDATE inputs SET side_data = REPEAT('x', IF(id < 16, 16384, 53248))")
+        self.cursor.execute("SET ai_pipeline_slots = 5")
+        for embedding in (False, True):
+            for memory_limit, batches in ((1048576, 1), (4194304, 4)):
+                with self.subTest(embedding=embedding, memory_limit=memory_limit):
+                    self.cursor.execute("SET ai_pipeline_memory_limit = %s", (memory_limit,))
+                    expression = ("AI_EMBED('contract_embed', prompt, 3)" if embedding else
+                                  "AI_COMPLETE('contract_model', prompt)")
+                    query_sql = ("SELECT /*+ OPT_PARAM('rowsets_max_rows', 16) */ "
+                                 f"id, side_data, {expression} FROM inputs ORDER BY id")
+                    self.cursor.execute("EXPLAIN " + query_sql)
+                    self.assertIn("AI FUNCTION PIPELINE", "\n".join(str(row[0]) for row in self.cursor.fetchall()))
+
+                    def query():
+                        self.cursor.execute(query_sql)
+                        return tuple((row, side, json.loads(value) if embedding else value)
+                                     for row, side, value in self.cursor.fetchall())
+
+                    gate = self.gate()
+                    self.server.default_reply = Reply(gate=gate)
+                    before = len(self.server.audit)
+                    window = batches if embedding else min(batches * 16, len(prompts))
+                    worker, outcome = self.start_embedding_query(query)
+                    try:
+                        with self.server.condition:
+                            self.assertTrue(self.server.condition.wait_for(
+                                lambda: len(self.server.audit) >= before + window, timeout=3))
+                            self.assertFalse(self.server.condition.wait_for(
+                                lambda: len(self.server.audit) > before + window, timeout=0.1),
+                                "memory pressure must stop prefetch before filling all slots")
+                    finally:
+                        gate.set()
+                        worker.join(5)
+                    self.assertFalse(worker.is_alive())
+                    expected = tuple((index, b"x" * (16384 if index < 16 else 53248),
+                                      self.server.embedding_vectors[prompt] if embedding else answer(prompt))
+                                     for index, prompt in enumerate(prompts))
+                    self.assertEqual(outcome, [expected])
+                    submitted = [text for body in self.server.requests[before:]
+                                 for text in (body["input"] if embedding else [body["messages"][-1]["content"]])]
+                    self.assertEqual(Counter(submitted), Counter(prompts))
+
+    def test_pipeline_global_memory_limit(self):
+        prompts = [f"global-memory-{index}" for index in range(16)]
+        self.load_embeddings(prompts)
+        self.cursor.execute("ALTER TABLE inputs ADD COLUMN side_data VARBINARY(60000)")
+        self.addCleanup(lambda: self.cursor.execute("ALTER TABLE inputs DROP COLUMN side_data"))
+        self.cursor.execute("UPDATE inputs SET side_data = REPEAT('x', 40000)")
+        self.cursor.execute("SHOW PARAMETERS LIKE 'ai_pipeline_total_memory_limit'")
+        columns = [description[0].lower() for description in self.cursor.description]
+        old_limit = self.cursor.fetchone()[columns.index("value")]
+        self.addCleanup(lambda: self.cursor.execute(
+            "ALTER SYSTEM SET ai_pipeline_total_memory_limit = %s", (old_limit,)))
+        self.cursor.execute("ALTER SYSTEM SET ai_pipeline_total_memory_limit = '1M'")
+        with pymysql.connect(unix_socket=self.sql_socket, user="root", database="ai_contract_test",
+                             autocommit=True, read_timeout=5, write_timeout=3) as peer:
+            for embedding in (False, True):
+                with self.subTest(embedding=embedding):
+                    expression = ("AI_EMBED('contract_embed', prompt, 3)" if embedding else
+                                  "AI_COMPLETE('contract_model', prompt)")
+                    query_sql = ("SELECT /*+ OPT_PARAM('rowsets_max_rows', 16) */ "
+                                 f"id, side_data, {expression} FROM inputs ORDER BY id")
+
+                    def query(cursor):
+                        cursor.execute(query_sql)
+                        return tuple((row, side, json.loads(value) if embedding else value)
+                                     for row, side, value in cursor.fetchall())
+
+                    expected = tuple((index, b"x" * 40000,
+                                      self.server.embedding_vectors[prompt] if embedding else answer(prompt))
+                                     for index, prompt in enumerate(prompts))
+                    gate = self.gate()
+                    self.server.default_reply = Reply(gate=gate)
+                    before = len(self.server.audit)
+                    window = 1 if embedding else 16
+                    worker, outcome = self.start_embedding_query(lambda: query(self.cursor))
+                    try:
+                        with self.server.condition:
+                            self.assertTrue(self.server.condition.wait_for(
+                                lambda: len(self.server.audit) == before + window, timeout=3))
+                        with peer.cursor() as cursor:
+                            sql_error(self, 4019, lambda: query(cursor))
+                        self.assertEqual(len(self.server.audit), before + window,
+                                         "global admission failure must occur before another model request")
+                    finally:
+                        gate.set()
+                        worker.join(5)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(outcome, [expected])
+                    with peer.cursor() as cursor:
+                        self.assertEqual(query(cursor), expected, "released global quota must be reusable")
+                    self.assertEqual(len(self.server.audit), before + 2 * window)
+
+    def test_pipeline_network_admission_releases_request_workers(self):
+        self.assert_pipeline_releases_request_workers(True, saturate_network=True)
+
+    def test_embedding_pipeline_releases_request_workers(self):
+        self.assert_pipeline_releases_request_workers(True)
+
+    def assert_pipeline_releases_request_workers(self, embedding, *, saturate_network=False):
+        filler_expected = None
+        if saturate_network:
+            prompts = ["worker-release"] + [f"network-full-{index}" for index in range(16 * 66)]
+            filler_expected = self.load_embeddings(prompts)
+            expected = filler_expected[:1]
+            self.cursor.execute("SET ai_pipeline_slots = 65")
+        elif embedding:
+            expected = self.load_embeddings(["worker-release"])
+        else:
+            self.load(["worker-release"])
+            expected = ((0, answer("worker-release")),)
+        expression = ("AI_EMBED('contract_embed', prompt, 3)" if embedding else
+                      "AI_COMPLETE('contract_model', prompt)")
+        predicate = "WHERE id = 0 " if saturate_network else ""
+        query = ("SELECT /*+ OPT_PARAM('rowsets_max_rows', 16) */ "
+             f"id, {expression} FROM inputs {predicate}ORDER BY id")
+        self.cursor.execute("EXPLAIN " + query)
+        self.assertIn("AI FUNCTION PIPELINE", str(self.cursor.fetchall()))
+        process_id = struct.unpack("3i", self.connection._sock.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
+
+        def request_workers():
+            threads = set()
+            for task in (Path("/proc") / str(process_id) / "task").iterdir():
+                try:
+                    name = (task / "comm").read_text().strip()
+                except FileNotFoundError:
+                    continue
+                if name.endswith("_ReqWorker"):
+                    threads.add(int(task.name))
+            return threads
+
+        gate = self.gate()
+        self.server.default_reply = Reply(gate=gate)
+        connections = []
+        workers = []
+        outcomes = []
+        filler_worker = None
+        filler_outcome = []
+        control = pymysql.connect(unix_socket=self.sql_socket, user="root", autocommit=True,
+                                  read_timeout=3, write_timeout=3)
+        self.addCleanup(control.close)
+
+        def run_query(index):
+            try:
+                with connections[index].cursor() as cursor:
+                    cursor.execute(query)
+                    rows = cursor.fetchall()
+                    outcomes[index] = (tuple((row, json.loads(value)) for row, value in rows)
+                                       if embedding else rows)
+            except Exception as error:
+                outcomes[index] = error
+
+        try:
+            self.assertTrue(request_workers(), "fixture must observe the database request threads")
+            while len(connections) <= len(request_workers()):
+                self.assertLess(len(connections), 63, "fixture exceeds background batch capacity")
+                connections.append(pymysql.connect(
+                    unix_socket=self.sql_socket, user="root", database="ai_contract_test",
+                    autocommit=True, read_timeout=8, write_timeout=3))
+            before = request_workers()
+            self.assertGreater(len(connections), len(before))
+            outcomes = [None] * len(connections)
+            if saturate_network:
+                def fill_network():
+                    return tuple((row, json.loads(value)) for row, value in self.query_pipeline(expression))
+                filler_worker, filler_outcome = self.start_embedding_query(fill_network)
+                with self.server.condition:
+                    self.assertTrue(self.server.condition.wait_for(lambda: len(self.server.audit) == 64, timeout=3))
+            for index in range(len(connections)):
+                worker = threading.Thread(target=run_query, args=(index,), daemon=True)
+                workers.append(worker)
+                worker.start()
+                if saturate_network:
+                    with control.cursor(pymysql.cursors.DictCursor) as cursor:
+                        def entered_execution():
+                            cursor.execute("SHOW FULL PROCESSLIST")
+                            return any(row["Id"] == connections[index].thread_id() and row["Command"] == "Query"
+                                       and "AI_EMBED" in (row["Info"] or "") for row in cursor.fetchall())
+                        with self.server.condition:
+                            self.assertTrue(self.server.condition.wait_for(entered_execution, timeout=0.2),
+                                            "queued query must enter SQL execution before probing worker availability")
+                else:
+                    with self.server.condition:
+                        self.assertTrue(self.server.condition.wait_for(
+                            lambda: len(self.server.audit) == index + 1, timeout=3),
+                            f"waiting query {index + 1} did not reach the model")
+                with control.cursor() as cursor:
+                    cursor.execute("SELECT 1")
+                    self.assertEqual(cursor.fetchall(), ((1,),))
+            with self.server.condition:
+                expected_requests = 64 if saturate_network else len(connections)
+                self.assertTrue(self.server.condition.wait_for(
+                    lambda: len(self.server.audit) == expected_requests, timeout=3),
+                    f"only {len(self.server.audit)} waiting queries reached the model")
+                self.assertTrue(all(record["response"] is None for record in self.server.audit))
+            with control.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                self.assertEqual(cursor.fetchall(), ((1,),))
+            after = request_workers()
+            self.assertTrue(after.issubset(before),
+                            f"AI waits grew request threads from {len(before)} to {len(after)}")
+        finally:
+            gate.set()
+            if filler_worker is not None:
+                filler_worker.join(5)
+            for worker in workers:
+                worker.join(5)
+            for connection in connections:
+                connection.close()
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(outcomes, [expected] * len(connections))
+        if saturate_network:
+            self.assertFalse(filler_worker.is_alive())
+            self.assertEqual(filler_outcome, [filler_expected])
+            submitted = [text for body in self.server.requests for text in body["input"]]
+            self.assertEqual(Counter(submitted), Counter(prompts) + Counter({"worker-release": len(connections)}))
+        else:
+            self.assertEqual(self.server.counts, Counter({"worker-release": len(connections)}))
+
+    def test_completion_pipeline_disconnect_releases_waiting_requests(self):
+        self.assert_pipeline_disconnect(False)
+
+    def test_embedding_pipeline_disconnect_releases_waiting_requests(self):
+        self.assert_pipeline_disconnect(True)
+
+    def test_completion_multislot_disconnect_releases_requests(self):
+        self.assert_pipeline_disconnect(False, slot_count=5)
+
+    def test_embedding_multislot_disconnect_releases_requests(self):
+        self.assert_pipeline_disconnect(True, slot_count=5)
+
+    def test_pipeline_pending_admission_disconnect_releases_requests(self):
+        self.assert_pipeline_disconnect(True, slot_count=65)
+
+    def assert_pipeline_disconnect(self, embedding, *, slot_count=2):
+        prompts = [f"disconnect-{index}" for index in range(16 * (slot_count + 1) + 2)]
+        if embedding:
+            self.load_embeddings(prompts)
+        else:
+            self.load(prompts)
+        expression = ("AI_EMBED('contract_embed', prompt, 3)" if embedding else
+                      "AI_COMPLETE('contract_model', prompt)")
+        gate = self.gate()
+        self.server.default_reply = Reply(gate=gate)
+        connection = pymysql.connect(unix_socket=self.sql_socket, user="root",
+                                     database="ai_contract_test", autocommit=True,
+                                     read_timeout=5, write_timeout=3)
+        self.addCleanup(connection.close)
+        with connection.cursor() as cursor:
+            cursor.execute("SET ob_query_timeout = 20000000")
+            cursor.execute("SET ai_pipeline_slots = %s", (slot_count,))
+        process_id = struct.unpack("3i", connection._sock.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
+
+        def execute():
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT /*+ OPT_PARAM('rowsets_max_rows', 16) */ "
+                               f"id, {expression} FROM inputs ORDER BY id")
+                return cursor.fetchall()
+
+        worker, outcome = self.start_embedding_query(execute)
+        expected_requests = min(slot_count, 64) * (1 if embedding else 16)
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(
+                    lambda: len(self.server.audit) == expected_requests, timeout=3))
+            self.assertEqual(len(model_socket_fds(process_id, self.server.server_port)), expected_requests)
+            connection._sock.shutdown(socket.SHUT_RDWR)
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(outcome), 1)
+            self.assertIsInstance(outcome[0], pymysql.MySQLError)
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(
+                    lambda: not model_socket_fds(process_id, self.server.server_port), timeout=3),
+                    "client disconnect retained suspended model requests")
+            self.assertEqual(len(self.server.audit), expected_requests)
+            self.assertTrue(all(record["response"] is None for record in self.server.audit))
+            self.cursor.execute("SELECT 1")
+            self.assertEqual(self.cursor.fetchall(), ((1,),))
+        finally:
+            gate.set()
+            worker.join(5)
+
     def test_completion_pipeline_submits_next_batch_before_first_response(self):
         prompts = [f"completion-pipeline-{index}" for index in range(50)]
         self.load(prompts)
@@ -352,6 +707,50 @@ class RuntimeContracts(unittest.TestCase):
         self.assertFalse(worker.is_alive(), "completion pipeline did not drain its final batch")
         self.assertEqual(outcome, [tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))])
         self.assertEqual(self.server.counts, Counter(prompts))
+
+    def check_shutdown_with_suspended_queries(self):
+        self.load_embeddings([f"shutdown-{index}" for index in range(50)])
+        gate = self.gate()
+        self.server.default_reply = Reply(gate=gate)
+        process_id = struct.unpack("3i", self.connection._sock.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
+        connection = pymysql.connect(unix_socket=self.sql_socket, user="root",
+                                     database="ai_contract_test", autocommit=True,
+                                     read_timeout=10, write_timeout=3)
+        self.addCleanup(connection.close)
+        with connection.cursor() as cursor:
+            cursor.execute("SET ob_query_timeout = 20000000")
+
+        def embedding_query():
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT /*+ OPT_PARAM('rowsets_max_rows', 16) */ "
+                               "id, AI_EMBED('contract_embed', prompt, 3) FROM inputs ORDER BY id")
+                return cursor.fetchall()
+
+        completion_worker, completion_outcome = self.start_embedding_query(self.query_pipeline)
+        embedding_worker, embedding_outcome = self.start_embedding_query(embedding_query)
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(lambda: len(self.server.audit) == 34, timeout=3))
+            exit_waiter, exit_status = self.start_embedding_query(
+                lambda: os.waitid(os.P_PID, process_id, os.WEXITED | os.WNOWAIT))
+            os.kill(process_id, signal.SIGUSR1)
+            exit_waiter.join(9)
+            self.assertFalse(exit_waiter.is_alive(), "shutdown waited for suspended query deadlines")
+            self.assertEqual(len(exit_status), 1)
+            status = exit_status[0]
+            self.assertEqual((status.si_code, status.si_status), (os.CLD_EXITED, 0))
+            for worker, outcome in ((completion_worker, completion_outcome),
+                                    (embedding_worker, embedding_outcome)):
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(len(outcome), 1)
+                self.assertIsInstance(outcome[0], pymysql.MySQLError)
+            self.assertTrue(all(record["response"] is None for record in self.server.audit))
+        finally:
+            gate.set()
+            completion_worker.join(5)
+            embedding_worker.join(5)
 
     def test_completion_pipeline_refills_after_first_batch_finishes(self):
         prompts = [f"completion-refill-{index}" for index in range(50)]
@@ -1675,11 +2074,13 @@ class RuntimeContracts(unittest.TestCase):
                                 ("contract_endpoint", '{"access_key":"contract-test-only"}'))
 
 
-def run_contracts(connection, server, sql_socket):
+def run_contracts(connection, server, sql_socket, *, shutdown_only=False):
     RuntimeContracts.connection = connection
     RuntimeContracts.server = server
     RuntimeContracts.sql_socket = sql_socket
-    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(RuntimeContracts))
+    suite = (unittest.TestSuite([RuntimeContracts("check_shutdown_with_suspended_queries")])
+             if shutdown_only else unittest.defaultTestLoader.loadTestsFromTestCase(RuntimeContracts))
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
     if not result.wasSuccessful():
         raise SystemExit(1)
 
@@ -1687,5 +2088,8 @@ def run_contracts(connection, server, sql_socket):
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         unittest.main(argv=[sys.argv[0]], defaultTest="HarnessTests", verbosity=2)
+    elif "--shutdown-test" in sys.argv:
+        sys.argv.remove("--shutdown-test")
+        runtime.main(lambda *args: run_contracts(*args, shutdown_only=True), sql_timeout=75)
     else:
         runtime.main(run_contracts, sql_timeout=75)

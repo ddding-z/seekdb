@@ -1,4 +1,34 @@
 {
+  "ai_pipeline_slots": {
+    "id": 10754,
+    "name": "ai_pipeline_slots",
+    "default_value": "2",
+    "base_value": "2",
+    "data_type": "int",
+    "info": "Maximum number of buffered SQL batches per AI function pipeline",
+    "flags": "GLOBAL | SESSION | NEED_SERIALIZE",
+    "min_val": "1",
+    "max_val": "1024",
+    "publish_version": "1.0.0.0",
+    "info_cn": "",
+    "background_cn": "",
+    "ref_url": ""
+  },
+  "ai_pipeline_memory_limit": {
+    "id": 10755,
+    "name": "ai_pipeline_memory_limit",
+    "default_value": "67108864",
+    "base_value": "67108864",
+    "data_type": "int",
+    "info": "Shared logical buffer budget in bytes for all slots of one AI function pipeline",
+    "flags": "GLOBAL | SESSION | NEED_SERIALIZE",
+    "min_val": "1048576",
+    "max_val": "1099511627776",
+    "publish_version": "1.0.0.0",
+    "info_cn": "",
+    "background_cn": "",
+    "ref_url": ""
+  },
   "auto_increment_increment": {
     "id": 0,
     "name": "auto_increment_increment",

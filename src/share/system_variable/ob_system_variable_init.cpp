@@ -9911,13 +9911,43 @@ static struct VarsInit{
     ObSysVars[718].alias_ = "OB_SV_SPARSE_DROP_RATIO_SEARCH" ;
     }();
 
+    [&] (){
+      ObSysVars[719].id_ = SYS_VAR_AI_PIPELINE_SLOTS ;
+      cur_max_var_id = MAX(cur_max_var_id, static_cast<int64_t>(SYS_VAR_AI_PIPELINE_SLOTS)) ;
+      ObSysVarsIdToArrayIdx[SYS_VAR_AI_PIPELINE_SLOTS] = 719 ;
+      ObSysVars[719].name_ = "ai_pipeline_slots" ;
+      ObSysVars[719].default_value_ = "2" ;
+      ObSysVars[719].base_value_ = "2" ;
+      ObSysVars[719].data_type_ = ObIntType ;
+      ObSysVars[719].info_ = "Maximum number of buffered SQL batches per AI function pipeline" ;
+      ObSysVars[719].flags_ = ObSysVarFlag::GLOBAL_SCOPE | ObSysVarFlag::SESSION_SCOPE | ObSysVarFlag::NEED_SERIALIZE ;
+      ObSysVars[719].min_val_ = "1" ;
+      ObSysVars[719].max_val_ = "1024" ;
+    ObSysVars[719].alias_ = "OB_SV_AI_PIPELINE_SLOTS" ;
+    }();
+
+    [&] (){
+      ObSysVars[720].id_ = SYS_VAR_AI_PIPELINE_MEMORY_LIMIT ;
+      cur_max_var_id = MAX(cur_max_var_id, static_cast<int64_t>(SYS_VAR_AI_PIPELINE_MEMORY_LIMIT)) ;
+      ObSysVarsIdToArrayIdx[SYS_VAR_AI_PIPELINE_MEMORY_LIMIT] = 720 ;
+      ObSysVars[720].name_ = "ai_pipeline_memory_limit" ;
+      ObSysVars[720].default_value_ = "67108864" ;
+      ObSysVars[720].base_value_ = "67108864" ;
+      ObSysVars[720].data_type_ = ObIntType ;
+      ObSysVars[720].info_ = "Shared logical buffer budget in bytes for all slots of one AI function pipeline" ;
+      ObSysVars[720].flags_ = ObSysVarFlag::GLOBAL_SCOPE | ObSysVarFlag::SESSION_SCOPE | ObSysVarFlag::NEED_SERIALIZE ;
+      ObSysVars[720].min_val_ = "1048576" ;
+      ObSysVars[720].max_val_ = "1099511627776" ;
+    ObSysVars[720].alias_ = "OB_SV_AI_PIPELINE_MEMORY_LIMIT" ;
+    }();
+
     if (cur_max_var_id >= ObSysVarMeta::OB_MAX_SYS_VAR_ID) {
       HasInvalidSysVar = true;
     }
   }
 }vars_init;
 
-static int64_t var_amount = 719;
+static int64_t var_amount = 721;
 
 int64_t ObSysVariables::get_all_sys_var_count(){ return ObSysVarMeta::ALL_SYS_VARS_COUNT;}
 ObSysVarClassType ObSysVariables::get_sys_var_id(int64_t i){ return ObSysVars[i].id_;}

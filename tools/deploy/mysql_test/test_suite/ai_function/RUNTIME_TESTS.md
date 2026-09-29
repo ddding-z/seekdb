@@ -1,6 +1,6 @@
 # AI Function Runtime Regression
 
-Latest validation (2026-09-28): all **82 SQL contracts**, **five fixture self-tests**, and the expanded [resource reliability tests](#resource-reliability-tests) passed with [background network scheduling](#background-network-scheduling-2026-09-28). The new native checks cover progress without caller polling, background cancellation/deadlines, bounded admission, shared-budget rollback and scheduler shutdown. SQL workers still retain their synchronous call stacks; worker suspension/resumption is a separate milestone. Earlier results are retained below as historical evidence.
+Latest validation (2026-09-28): all **86 SQL contracts**, **five fixture self-tests**, the expanded [resource reliability tests](#resource-reliability-tests), and a separate server-shutdown contract passed with [SQL worker suspension](#sql-worker-suspension-2026-09-28). Eligible single-statement AI pipeline SELECTs now return their worker while waiting and resume from the retained result cursor. Earlier results are retained below as historical evidence.
 
 Run from the repository root after a Debug build:
 
@@ -61,6 +61,8 @@ Expected behavior comes from the execution plan, SQL evaluation boundaries, HTTP
 | Shared client | Dynamic-model scalar embedding preserves vectors/dimensions and 502 retry; native requests preserve deadline, cancellation and socket cleanup | Native batching breaking fallback or resource ownership |
 | Cross-batch overlap | Hold every response for the first two SQL batches; both batches must reach the service before a response, with no third pending batch; completion remains one request per row | A synchronous per-batch barrier, unintended prompt merging or an unbounded prefetch queue |
 | Pipeline lifecycle | Release the first batch while its peer remains held and require slot refill; check later-batch fatal errors, cancellation, deadlines, large LOB side columns and row-mode fallback | Waiting for the whole window, hidden errors, reused datum pointers or scalar-mode initialization failures |
+| Worker release | Hold more AI queries than the initial request-thread count; every model request must arrive, a control SELECT must finish, and no additional request thread may appear | Moving HTTP work to the background while leaving SQL workers blocked, or relying on replacement threads |
+| Suspended client disconnect | Close the SQL connection while both batches are held; model socket FDs disappear before responses are released and other queries remain usable | Retaining a session, request or model connection after the client disappears |
 | Completion pipeline inputs | Preserve static Schema/options, retry only a failed second-batch request, and expand stored JSON prompt objects exactly; reject malformed first-batch input before HTTP | Lost configuration, a retry blocked by the preceding batch, duplicate calls or broken JSON-column handling |
 | Credentials | Endpoint key rotation applies to the same SQL on next execution | Stale credentials retained across executions |
 
@@ -156,6 +158,8 @@ The native test calls the production client with a tracking allocator and link-t
 | Background deadline and peer progress | A held batch expires without caller polling while an independent batch completes first; timeout exposes no partial results |
 | Bounded admission | Fill all 64 scheduler slots with held batches; a 65th submission honors its original deadline, and cancellation restores admission capacity |
 | Scheduler shutdown | Stop with held requests, wait for cancellation, release caller memory, allow repeated stop and reject subsequent submissions |
+| Request await protocol | Default-off authorization, matching execution-context ownership, readiness, nested TLS isolation, cancellation without re-suspension, and reset without stale authorization |
+| Exception on resume | A retained processor throws on its second dispatch; preserve the error code, do not translate another processor, and release it exactly once instead of retaining an unwakeable request |
 | Failure followed by success | 16 cycles complete actual loopback requests using the same client after a failed preparation; returned JSON remains valid after client destruction because the caller still owns its allocator |
 | Operator diagnosis/rescan | For both AI function types, an empty stream can be rescanned repeatedly and must pull its child again; diagnosis passes child rows through without preparing AI requests, including after rescan |
 | Detector negative controls | Deliberately omit one allocation release, one request-handle cleanup, or background scheduling in separate test processes; each must fail with its specific leak/progress diagnostic |
@@ -214,25 +218,25 @@ EXPLAIN SELECT id, AI_EMBED('my_embedding_model', prompt, 1536)
 FROM inputs ORDER BY id;
 ```
 
-An eligible plan now contains `AI FUNCTION PIPELINE` (originally `AI EMBED PIPELINE`). The [logical operator](../../../../../src/sql/optimizer/ob_log_ai_func.cpp) owns the AI expression so the child cannot evaluate it synchronously. The [physical operator](../../../../../src/sql/engine/basic/ob_ai_func_op.cpp) maintains two owned batch slots, each with its own persistent `AIFuncBatch` request state. Native embedding input arrays, byte splitting, provider validation and per-request retries are unchanged; batches are not combined and duplicate inputs are retained.
+An eligible plan now contains `AI FUNCTION PIPELINE` (originally `AI EMBED PIPELINE`). The [logical operator](../../../../../src/sql/optimizer/ob_log_ai_func.cpp) owns the AI expression so the child cannot evaluate it synchronously. The [physical operator](../../../../../src/sql/engine/basic/ob_ai_func_op.cpp) maintains a configurable number of owned batch slots, defaulting to two, each with its own persistent `AIFuncBatch` request state. Native embedding input arrays, byte splitting, provider validation and per-request retries are unchanged; batches are not combined and duplicate inputs are retained. See [multi-slot configuration](#configurable-multi-slot-pipelines-2026-09-29) for current controls and limits.
 
 ### Scope And Scheduling
 
 - The pipeline accepts one top-level AI_EMBED or AI_COMPLETE projection over a single basic table, a static model and static/omitted dimension or completion configuration, and a column input optionally wrapped in casts. Completion also accepts a stored JSON prompt object. Other projected values must be columns or static constants. Eligible physical inputs are single-worker scan/sort plans; ordinary operator-only filters and column ordering are allowed.
 - LIMIT, CASE/complex projections, dynamic parameters, multiple AI projections, joins, aggregates, subqueries and AI-dependent filters/orderings retain the existing path. AI_RERANK is not connected to the pipeline. A plan with `rowsets_max_rows=0` runs the scalar path without allocating batch state; diagnosis mode retains synchronous evaluation.
-- Before pulling another child batch, the operator polls every active batch and returns the front result if ready. It does not wait for both slots to fill before checking completion. After the parent consumes a batch, that slot can be refilled while its peer is still pending.
-- Results remain in input order. A later completed batch is validated and its request memory released, but its owned results wait behind the first batch. This deliberately retains bounded head-of-line blocking. Later-batch permanent errors are checked even while the first batch is pending and cancel both local clients.
+- Before pulling another child batch, the operator polls every active batch and returns the front result if ready. It does not wait for the entire window to fill before checking completion. After the parent consumes a batch, that slot can be refilled while other batches are pending.
+- Results remain in input order. A later completed batch is validated and its request memory released, but its owned results wait behind the first batch. This deliberately retains bounded head-of-line blocking. Later-batch permanent errors are checked even while the first batch is pending and cancel all local clients.
 - Rows, side columns and completed results outlive reused evaluation frames. `ObDatum::deep_copy` owns row payloads; `ObBatchResultHolder` restores the child's original datum pointers before another pull. Request allocation is separate from retained output allocation. Close, rescan, error and destruction reset requests before releasing their allocators.
 
-At the cross-batch-only milestone, the SQL thread drove both curl multi instances and a blocking child read could delay network progress. The [background scheduler](#background-network-scheduling-2026-09-28) now advances submitted batches independently. The SQL caller waits for notifications for at most 20ms before checking all batches again, retaining the existing query deadline. There is still **no worker suspension/resumption or new EAGAIN protocol** in the executor. Each slot retains its curl multi for its own lifetime; model/endpoint resolution and authentication still happen for each batch, without a cross-query configuration cache.
+At the cross-batch-only milestone, the SQL thread drove both curl multi instances and a blocking child read could delay network progress. The [background scheduler](#background-network-scheduling-2026-09-28) now advances submitted batches independently. Eligible requests use [worker suspension](#sql-worker-suspension-2026-09-28); other callers retain their synchronous wait, checking all batches at most 20ms apart. Each slot retains its curl multi for its own lifetime; model/endpoint resolution and authentication still happen for each batch, without a cross-query configuration cache.
 
 ### Shared Budget
 
-The two slots share **one 64MiB logical budget**, including copied row datums/payloads, retained result strings, request-state objects, serialized bodies and raw responses. The existing 4MiB request and 8MiB response limits also apply. Retry response reset, failure, cancellation and slot reuse return the owning allocation's quota rather than clearing the other slot's usage.
+All slots share **one configurable per-operator logical budget**, defaulting to 64MiB, including copied row datums/payloads, retained result strings, request-state objects, serialized bodies and raw responses. The same charges also count toward the server's pipeline-wide limit, defaulting to 1GiB. The existing 4MiB request, 8MiB response and 64MiB per-client batch limits also apply. Retry response reset, failure, cancellation and slot reuse return the owning allocation's quota rather than clearing another slot or query's usage.
 
-When the combined logical budget is exceeded, the query returns 4019 and cancels local requests. This version does not spill rows, adapt its window to byte pressure, or restart as scalar after submission. Consequently, a workload that fits one batch at a time may exceed the stricter pipeline-wide budget. Earlier requests may already have reached the service when a later batch fails admission. Slots provide count backpressure, not automatic recovery from byte-budget overflow.
+The initial two-slot implementation failed whenever combined usage exceeded its budget. The current implementation stops prefetching at half the per-operator limit and can retain the next child batch without submitting it when its copied rows cannot yet fit alongside active batches. This does not guarantee every response will fit: a first batch, prepared request, raw response or retained result that exceeds a hard budget still returns 4019 and cancels local requests. There is no spilling or restart as scalar after submission.
 
-JSON trees, temporary conversions, SQL evaluation frames/snapshots, container capacity, arena slack and curl internals are not fully counted. This is not a hard heap/RSS cap, a database-wide quota, or proof that remote work stops when a query is canceled.
+JSON trees, temporary conversions, SQL evaluation frames/snapshots, container capacity, arena slack and curl internals are not fully counted. The server budget covers pipeline charges, not all SQL or scalar AI memory. Neither budget is a hard heap/RSS cap or proof that remote work stops when a query is canceled.
 
 ### Pipeline Results: 2026-09-20
 
@@ -263,6 +267,8 @@ Each completion prompt remains an independent HTTP request with unchanged option
 
 ## Background Network Scheduling: 2026-09-28
 
+This section records the original network-scheduling milestone. Pipeline callers now use the [nonblocking admission and shared byte limits](#configurable-multi-slot-pipelines-2026-09-29) described below; synchronous callers retain their existing admission behavior.
+
 The completion and native embedding batch entry points now call `start_async()` after preparing their existing client state. A process-wide `AIFuncScheduler` lazily starts one `AINetwork` thread. The low-level `send_post_batch_no_wait()` API itself remains caller-driven unless explicitly handed to the scheduler. Direct scalar completion and AI_RERANK paths have not been converted.
 
 ### Ownership And Admission
@@ -276,7 +282,7 @@ The completion and native embedding batch entry points now call `start_async()` 
 
 Admission waiters have already prepared their requests. The 64 slots therefore do not cap all waiting request memory, HTTP connections or database RSS. There is no tenant fairness, endpoint quota, global byte budget, adaptive single-batch fallback or shared connection pool across clients.
 
-**This does not release the SQL worker.** The operator and synchronous batch wrappers still wait on their existing call stacks. The current `Worker::sched_wait()`/`sched_run()` do not implement query continuation, and `get_next_batch()` has no pending/resume contract. Re-executing SQL or adding replacement workers would not provide that contract. Worker suspension/resumption was explicitly deferred to a separate implementation scope.
+**Background scheduling alone does not release the SQL worker.** At this milestone the operator and synchronous batch wrappers still waited on their existing call stacks. The subsequent [worker-suspension milestone](#sql-worker-suspension-2026-09-28) adds an opt-in continuation protocol for a restricted request path; it does not turn `Worker::sched_wait()`/`sched_run()` into general coroutine primitives.
 
 ### Verification And Limits
 
@@ -285,6 +291,86 @@ Admission waiters have already prepared their requests. The 64 slots therefore d
 - SQL resource checks again observed 36 failed batches and 36 recoveries, with eight model socket FDs in flight and zero after each query. Existing request-count, ordering, retry, Schema and error-code assertions were unchanged.
 - Physical rescan coverage remains diagnosis passthrough and empty input, not retained rows or in-flight requests. No ASan/LSan/TSan, complete operator allocation sweep, real-provider benchmark or worker-release test was run. Local cancellation does not prove remote inference or billing stopped.
 - No real model service, existing debug database or Notebook was used or modified.
+
+## SQL Worker Suspension: 2026-09-28
+
+The [AI operator](../../../../../src/sql/engine/basic/ob_ai_func_op.cpp) can now register a `RequestAwait` and return EAGAIN when its pipeline has no deliverable result. This is only a suspension when the request layer explicitly authorizes that exact execution context and a pending readiness probe is registered. Other EAGAIN errors and unmanaged callers retain their existing behavior.
+
+### Request Ownership And Resume
+
+- Only single-statement `COM_QUERY` SELECTs with a vectorized `AI FUNCTION PIPELINE` root are eligible. Multi-statement/batched requests, prepared execution/cursors, internal SQL, diagnosis, debug-sync and statement retries retain synchronous execution. The existing optimizer eligibility rules still apply.
+- Each request worker retains at most **64 suspended requests**, with readiness checked on a 5ms queue wait. It executes other requests while AI responses are pending and resumes a ready request on the original worker. A worker with pending requests does not shrink out of the pool. There is no new SQL execution thread or cross-worker migration.
+- Request memory is rooted independently of the temporary per-dispatch arena and does not borrow thread-local pages. The query processor no longer occupies the reusable TLS query buffer. Result set, driver, row count, header/open state, SQL statistics, session reference, original deadline and memory-statistics baseline survive suspension.
+- Resume reacquires the session lock and restores warning/trace/allocator state. It does not parse, optimize, execute or open the plan again, resend metadata, or retry the whole SQL after a suspension. Completion/error releases the result and session before destroying request memory. The network thread still never writes SQL evaluation frames.
+- Original deadline, KILL QUERY, disconnected sessions and network failures make the retained batches resumable through the existing background client. Worker stop cancels retained requests and drains them before exit. Cancellation/reset returns network ownership before releasing provider and request storage.
+- If a worker's request slots are full or a retained context cannot be allocated, that new request uses the original synchronous path. The separate **64 network-batch slots** can also block submission before suspension; this change does not make admission, input preparation, child scans or response encoding nonblocking.
+
+At this milestone the 64MiB logical quota was per AI operator, without a global byte budget, and full network admission could block before suspension. The [multi-slot implementation](#configurable-multi-slot-pipelines-2026-09-29) adds configurable local/global logical budgets and nonblocking pipeline admission. There is still no tenant fairness, work stealing or unified socket-event scheduler. Scalar/nonpipeline callers do not gain worker release, even where their HTTP client uses the network thread.
+
+### Worker Suspension Verification
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_runtime_contracts.py \
+  --shutdown-test --binary "$PWD/build_debug/bin/src/observer/seekdb"
+```
+
+- Complete SQL suite: **86/86 passed in 121.091s**, including worker release and client-disconnect checks for both completion and embedding. Database CPU including bootstrap was 65.38s, peak RSS 511628KiB; these are context measurements, not a performance or leak oracle.
+- Worker-release cases hold every response, admit more concurrent queries than the original request-thread count, run a control SELECT, reject additional request threads, and then require exact rows and model-call counts. Queries enter the held state one at a time so ordinary burst-driven pool growth cannot masquerade as AI waiting. The disabled suspension path failed this same gate; the enabled path passed.
+- Existing multi-batch refill, out-of-order/LOB output, later fatal error, deadline, cancellation, same-connection recovery and 36 failure/36 recovery socket checks pass unchanged. Disconnect checks observe zero model FDs before releasing held responses.
+- The separate shutdown case holds both AI function types and requires normal process exit within 9 seconds after SIGUSR1, before the 20-second SQL deadline. SIGUSR1 includes a fixed 5-second preparation period and up to a 3-second main-loop wait. SIGTERM deliberately forces SIGKILL in this server and is not a graceful-cleanup oracle. The test observes exit without reaping the launcher's child process.
+- Final Debug build, native resource/protocol tests and five fixture self-tests passed. Native protocol checks cover nested authorization, readiness, cancellation/reset and an exception on processor resume. The exception test first failed because the error was reported as success; the fixed path preserves the error and releases exactly once. Client fault tests and all three omitted-action negative controls still pass.
+- Remaining gaps: a full per-worker request-slot exhaustion test, every retained-request/operator allocation failure, active-request physical rescan, whole-heap ASan/LSan/TSan, and real-provider performance. The shutdown check proves bounded normal server exit, not exhaustive cleanup instrumentation at every shutdown phase. No real model, existing debug database or Notebook was used.
+
+## Configurable Multi-Slot Pipelines: 2026-09-29
+
+Eligible AI_COMPLETE and AI_EMBED plans can retain more than two SQL batches without changing batch boundaries, model options, prompt contents, provider validation or per-request retry rules. The controls are independent of `rowsets_max_rows` and of the number of HTTP requests in a batch.
+
+### Pipeline Configuration
+
+| Control | Scope | Default | Range |
+| --- | --- | --- | --- |
+| `ai_pipeline_slots` | Session; global default for new sessions | 2 | 1-1024 |
+| `ai_pipeline_memory_limit` | Session; global default for new sessions | 67108864 bytes (64MiB) | 1MiB-1TiB, specified in bytes |
+| `ai_pipeline_total_memory_limit` | Dynamic server parameter, shared across pipelines | 1GiB | 1MiB-1TiB, capacity suffixes accepted |
+
+```sql
+SET SESSION ai_pipeline_slots = 8;
+SET SESSION ai_pipeline_memory_limit = 268435456;
+
+SELECT @@ai_pipeline_slots, @@ai_pipeline_memory_limit;
+
+EXPLAIN SELECT id, AI_COMPLETE('my_completion_model', prompt)
+FROM inputs ORDER BY id;
+```
+
+An administrator can adjust the instance-wide pipeline budget separately:
+
+```sql
+ALTER SYSTEM SET ai_pipeline_total_memory_limit = '2G';
+SHOW PARAMETERS LIKE 'ai_pipeline_total_memory_limit';
+```
+
+The operator reads its session settings at open, including when reusing a cached plan. Changing the session does not resize an already executing operator. `SET GLOBAL` changes defaults for new sessions; it does not alter the separate server parameter. Increasing a pipeline's budget does not raise its clients' existing per-batch or individual HTTP limits. The configured slot count is a maximum, not a promise that every slot will be filled.
+
+### Backpressure And Ownership
+
+- Slots use a dynamic FIFO ring; arbitrary valid counts, including non-powers of two, are supported. Ready head results are returned before further prefetch; later errors remain visible. No whole-query retry or previously submitted batch replay is introduced.
+- Additional prefetch stops once local charged bytes reach half the operator budget, leaving headroom for responses. Before copying a new batch, the operator measures retained row bytes. If those bytes cannot be admitted while this operator has active batches, it preserves the child position and waits for its existing work to progress. A first batch that cannot fit fails instead of waiting indefinitely for other queries.
+- Local and global reservations are atomic. A global admission failure rolls back only the attempted local charge. Requests, responses and retained row/result bytes release their own charges on failure, retry cleanup, cancellation and reuse. Dynamic lowering of the server limit does not evict existing buffers; subsequent reservations must fit the new limit.
+- At most 64 batches have a background network owner. A pipeline that reaches this limit retains one prepared, unadmitted batch and stops further prefetch. It checks capacity on the existing readiness interval, preserving the original deadline and cancellation state. Eligible SQL requests can suspend while waiting; synchronous/nonpipeline callers retain their old behavior.
+- The worker's 64 suspended-request slots, the network's 64 active-batch slots, and each operator's configured batch slots are different limits. Full worker capacity or retained-context allocation failure still falls back to synchronous execution. No new SQL workers, thread per batch or cross-worker request migration is introduced.
+
+This remains a bounded logical-buffer policy, not exact heap accounting, fair scheduling or a guaranteed-success memory estimator. Prepared requests and unpredictable responses can still exceed hard limits and return 4019. There is no spill-to-disk path. More slots can submit more work before a failure or cancellation is observed; closing local HTTP requests does not prove remote inference or billing stopped.
+
+### Multi-Slot Verification
+
+- Final Debug build and **94/94 SQL contracts** passed, along with **five fixture self-tests**, the native resource/protocol suite and the separate normal-shutdown test. All use private temporary databases and loopback mocks, not real providers or the existing debug database/Notebook.
+- Configuration tests cover defaults, invalid ranges, session isolation and 1/3/5-slot windows for both AI functions. Held responses verify exact in-flight batch counts; complete outputs, tails, ring reuse and logical input counts must match.
+- The byte-pressure test uses inline VARBINARY side columns, not the external payload size of LOB locators. With five configured slots, 1MiB allows one held batch while 4MiB allows all four input batches; both paths preserve rows and request counts after release.
+- A two-connection SQL test sets the server limit to 1MiB: the second query fails before sending a model request, the first query remains intact, and released quota supports a subsequent successful execution. Native tests check cross-query accounting, exact rollback and 1MiB/64MiB/128MiB local budgets.
+- A 65-slot embedding query fills all 64 network positions. More queries than the original request-worker count then wait for admission while a control SELECT completes and the worker thread set remains unchanged. Native checks cover immediate nonblocking admission, duplicate submission rejection, deadline, cancellation and capacity reuse.
+- Five-slot completion/embedding disconnects and a disconnect while the 65th batch is awaiting admission release model sockets before mock responses are allowed. Existing ordering, LOB, retry, error, cancellation/recovery and shutdown contracts remain in the complete suite.
+- Remaining gaps include exhaustive operator allocation injection, active-request physical rescan, all 1024 configured slots under pressure, complete per-worker request-slot exhaustion, ASan/LSan/TSan and real-provider performance. The fixed 50% prefetch watermark is conservative, not a learned model-memory estimate.
 
 ## Constrained Output
 

@@ -132,16 +132,7 @@ int ObSrvMySQLXlator::translate(rpc::ObRequest &req, ObReqProcessor *&processor)
     } else {
       const ObMySQLRawPacket &pkt = reinterpret_cast<const ObMySQLRawPacket &>(req.get_packet());
       if (pkt.get_cmd() == obmysql::COM_QUERY) {
-        char *buf = (&co_ep_callp_buf)->obmp_query_buffer_;
-        ObMPQuery *p = new (buf) ObMPQuery(gctx_);
-        if (OB_ISNULL(p)) {
-          ret = OB_ALLOCATE_MEMORY_FAILED;
-        } else if (OB_FAIL(p->init())) {
-          SERVER_LOG(ERROR, "Init ObMPQuery fail", K(ret));
-          p->~ObMPQuery();
-        } else {
-          processor = p;
-        }
+        NEW_MYSQL_PROCESSOR(ObMPQuery, gctx_);
       } else if (pkt.get_cmd() == obmysql::COM_PROCESS_INFO) {
         ObSMConnection *conn = SQL_REQ_OP.get_sql_session(&req);
         if (OB_ISNULL(conn)) {

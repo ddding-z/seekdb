@@ -62,13 +62,13 @@ OB_NOINLINE int ObWorkerProcessor::process_err_test()
   return ret;
 }
 
-inline int ObWorkerProcessor::process_one(rpc::ObRequest &req)
+inline int ObWorkerProcessor::process_one(rpc::ObRequest &req, ObReqProcessor *&processor)
 {
   int ret = OB_SUCCESS;
-  ObReqProcessor *processor = NULL;
+  const bool resuming = nullptr != processor;
 
-  if (OB_FAIL(process_err_test())) {
-  } else if (OB_FAIL(translator_.translate(req, processor))) {
+  if (!resuming && OB_FAIL(process_err_test())) {
+  } else if (!resuming && OB_FAIL(translator_.translate(req, processor))) {
     LOG_WARN("translate request fail", K(ret));
     on_translate_fail(&req, ret);
   } else if (OB_ISNULL(processor)) {
@@ -76,17 +76,29 @@ inline int ObWorkerProcessor::process_one(rpc::ObRequest &req)
     LOG_ERROR("unexpected condition", K(ret));
   } else {
     NG_TRACE(before_processor_run);
-    req.on_process_begin();
+    if (!resuming) {
+      req.on_process_begin();
+    }
     req.set_trace_point(ObRequest::OB_REQUEST_WORKER_PROCESSOR_RUN);
     if (OB_FAIL(processor->run())) {
     }
-    translator_.release(processor);
+    if (OB_EAGAIN != ret || nullptr == lib::RequestAwait::current() ||
+        !lib::RequestAwait::current()->is_pending()) {
+      translator_.release(processor);
+      processor = nullptr;
+    }
   }
 
   return ret;
 }
 
 int ObWorkerProcessor::process(rpc::ObRequest &req)
+{
+  ObReqProcessor *processor = nullptr;
+  return process(req, processor);
+}
+
+int ObWorkerProcessor::process(rpc::ObRequest &req, ObReqProcessor *&processor)
 {
   int ret = OB_SUCCESS;
 
@@ -111,10 +123,20 @@ int ObWorkerProcessor::process(rpc::ObRequest &req)
   ob_setup_default_tsi_warning_buffer();
   ob_reset_tsi_warning_buffer();
   try {
-    if (OB_FAIL(process_one(req))) {
+    if (OB_FAIL(process_one(req, processor))) {
     }
   } catch (OB_BASE_EXCEPTION &except) {
+    ret = OB_SUCCESS == except.get_errno() ? OB_ERR_UNEXPECTED : except.get_errno();
     _LOG_ERROR("Exception caught!!! errno = %d, exception info = %s", except.get_errno(), except.what());
+    THIS_WORKER.unset_need_retry();
+    if (nullptr != lib::RequestAwait::current()) {
+      lib::RequestAwait::current()->cancel(ret);
+      lib::RequestAwait::current()->reset_pending();
+    }
+    if (nullptr != processor) {
+      translator_.release(processor);
+      processor = nullptr;
+    }
   }
 
   // cleanup

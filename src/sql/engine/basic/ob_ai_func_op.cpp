@@ -33,19 +33,31 @@ struct AIFuncOp::Slot
 int AIFuncOp::inner_open()
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(child_) || OB_ISNULL(ai_spec().ai_expr_)) {
+  if (OB_ISNULL(child_) || OB_ISNULL(ai_spec().ai_expr_) || OB_ISNULL(ctx_.get_my_session())) {
     ret = OB_ERR_UNEXPECTED;
   } else if (ai_spec().ai_expr_->type_ != T_FUN_SYS_AI_EMBED &&
              ai_spec().ai_expr_->type_ != T_FUN_SYS_AI_COMPLETE) {
     ret = OB_NOT_SUPPORTED;
-  } else if (spec_.is_vectorized() &&
-             OB_FAIL(child_frame_.init(child_->get_spec().output_, eval_ctx_, &ctx_.get_allocator()))) {
+  } else if (spec_.is_vectorized()) {
+    if (OB_FAIL(ctx_.get_my_session()->get_sys_variable(share::SYS_VAR_AI_PIPELINE_SLOTS, slot_count_))) {
+    } else if (OB_FAIL(ctx_.get_my_session()->get_sys_variable(
+                         share::SYS_VAR_AI_PIPELINE_MEMORY_LIMIT, buffer_limit_))) {
+    } else if (slot_count_ < 1 || slot_count_ > 1024 || buffer_limit_ <= 0) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_FAIL(child_frame_.init(child_->get_spec().output_, eval_ctx_, &ctx_.get_allocator()))) {
+    } else if (OB_ISNULL(slots_ = static_cast<Slot **>(
+                            ctx_.get_allocator().alloc(sizeof(Slot *) * slot_count_)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMSET(slots_, 0, sizeof(Slot *) * slot_count_);
+    }
   }
-  for (int64_t index = 0; OB_SUCC(ret) && spec_.is_vectorized() && index < 2; ++index) {
+  for (int64_t index = 0; OB_SUCC(ret) && nullptr != slots_ && index < slot_count_; ++index) {
     if (OB_ISNULL(slots_[index] = OB_NEWx(Slot, &ctx_.get_allocator()))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
-      slots_[index]->batch_.set_shared_buffer_usage(buffered_bytes_);
+      slots_[index]->batch_.set_shared_buffer_usage(buffered_bytes_, buffer_limit_);
+      slots_[index]->batch_.set_nonblocking_admission();
     }
   }
   return ret;
@@ -53,17 +65,9 @@ int AIFuncOp::inner_open()
 
 int AIFuncOp::reserve(Slot &slot, int64_t bytes)
 {
-  int ret = OB_SUCCESS;
-  int64_t used = ATOMIC_LOAD(&buffered_bytes_);
-  while (OB_SUCC(ret)) {
-    if (bytes < 0 || bytes > ObAIFuncClient::MAX_BATCH_BYTES - used) {
-      ret = OB_SIZE_OVERFLOW;
-    } else if (ATOMIC_BCAS(&buffered_bytes_, used, used + bytes)) {
-      slot.retained_bytes_ += bytes;
-      break;
-    } else {
-      used = ATOMIC_LOAD(&buffered_bytes_);
-    }
+  const int ret = ObAIFuncClient::reserve_pipeline_buffer(buffered_bytes_, buffer_limit_, bytes);
+  if (OB_SUCCESS == ret) {
+    slot.retained_bytes_ += bytes;
   }
   return ret;
 }
@@ -74,7 +78,7 @@ void AIFuncOp::reset_slot(Slot &slot)
   slot.request_allocator_.reset();
   slot.results_.reset();
   slot.data_allocator_.reset();
-  ATOMIC_FAA(&buffered_bytes_, -slot.retained_bytes_);
+  ObAIFuncClient::release_pipeline_buffer(buffered_bytes_, slot.retained_bytes_);
   slot.datums_ = nullptr;
   slot.size_ = slot.offset_ = slot.retained_bytes_ = 0;
   slot.ready_ = false;
@@ -82,13 +86,14 @@ void AIFuncOp::reset_slot(Slot &slot)
 
 void AIFuncOp::reset_pipeline()
 {
-  for (int64_t index = 0; index < 2; ++index) {
+  for (int64_t index = 0; nullptr != slots_ && index < slot_count_; ++index) {
     if (nullptr != slots_[index]) {
       reset_slot(*slots_[index]);
     }
   }
   head_ = count_ = 0;
   input_end_ = false;
+  pending_input_ = nullptr;
 }
 
 int AIFuncOp::inner_close()
@@ -113,10 +118,13 @@ int AIFuncOp::inner_rescan()
 void AIFuncOp::destroy()
 {
   reset_pipeline();
-  for (int64_t index = 0; index < 2; ++index) {
+  for (int64_t index = 0; nullptr != slots_ && index < slot_count_; ++index) {
     OB_DELETEx(Slot, &ctx_.get_allocator(), slots_[index]);
     slots_[index] = nullptr;
   }
+  ctx_.get_allocator().free(slots_);
+  slots_ = nullptr;
+  slot_count_ = 0;
   child_frame_.destroy();
   child_frame_.~ObBatchResultHolder();
   ObOperator::destroy();
@@ -131,23 +139,46 @@ int AIFuncOp::inner_get_next_row()
 int AIFuncOp::submit(Slot &slot)
 {
   int ret = OB_SUCCESS;
-  const ObBatchRows *rows = nullptr;
   clear_evaluated_flag();
-  if (OB_FAIL(child_->get_next_batch(ai_spec().max_batch_size_, rows))) {
-  } else {
-    input_end_ = rows->end_;
+  if (nullptr == pending_input_ &&
+      OB_FAIL(child_->get_next_batch(ai_spec().max_batch_size_, pending_input_))) {
+  }
+  const ObBatchRows *rows = pending_input_;
+  if (OB_SUCC(ret)) {
     slot.size_ = rows->size_ - rows->skip_->accumulate_bit_cnt(rows->size_);
   }
   const auto &columns = child_->get_spec().output_;
-  if (OB_FAIL(ret) || slot.size_ == 0) {
-  } else if (columns.count() > ObAIFuncClient::MAX_BATCH_BYTES / sizeof(ObDatum) / slot.size_) {
+  int64_t retained_bytes = 0;
+  if (OB_FAIL(ret)) {
+  } else if (slot.size_ == 0) {
+    input_end_ = rows->end_;
+    pending_input_ = nullptr;
+  } else if (slot.size_ > buffer_limit_ / (columns.count() * sizeof(ObDatum) + sizeof(ObString))) {
     ret = OB_SIZE_OVERFLOW;
-  } else if (OB_FAIL(reserve(slot, slot.size_ *
-                             (columns.count() * sizeof(ObDatum) + sizeof(ObString))))) {
-  } else if (OB_ISNULL(slot.datums_ = static_cast<ObDatum *>(slot.data_allocator_.alloc(
-                                      slot.size_ * columns.count() * sizeof(ObDatum))))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(child_frame_.save(rows->size_))) {
   } else {
+    retained_bytes = slot.size_ * (columns.count() * sizeof(ObDatum) + sizeof(ObString));
+    for (int64_t row = 0; OB_SUCC(ret) && row < rows->size_; ++row) {
+      if (!rows->skip_->at(row)) {
+        for (int64_t column = 0; OB_SUCC(ret) && column < columns.count(); ++column) {
+          const int64_t bytes = columns.at(column)->locate_expr_datumvector(eval_ctx_).at(row)->get_deep_copy_size();
+          if (bytes > buffer_limit_ - retained_bytes) {
+            ret = OB_SIZE_OVERFLOW;
+          } else {
+            retained_bytes += bytes;
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(reserve(slot, retained_bytes)) && count_ > 0 && ret == OB_SIZE_OVERFLOW) {
+      ret = OB_EAGAIN;
+    }
+  }
+  if (OB_SUCC(ret) && slot.size_ > 0) {
+    if (OB_ISNULL(slot.datums_ = static_cast<ObDatum *>(slot.data_allocator_.alloc(
+                                       slot.size_ * columns.count() * sizeof(ObDatum))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    }
     ObEvalCtx::BatchInfoScopeGuard guard(eval_ctx_);
     guard.set_batch_size(rows->size_);
     const ObExpr &expression = *ai_spec().ai_expr_;
@@ -178,8 +209,7 @@ int AIFuncOp::submit(Slot &slot)
       }
       for (int64_t column = 0; OB_SUCC(ret) && column < columns.count(); ++column) {
         const ObDatum &source = *columns.at(column)->locate_expr_datumvector(eval_ctx_).at(row);
-        if (OB_FAIL(reserve(slot, source.get_deep_copy_size()))) {
-        } else if (OB_FAIL(slot.datums_[target_row * columns.count() + column].deep_copy(
+        if (OB_FAIL(slot.datums_[target_row * columns.count() + column].deep_copy(
                              source, slot.data_allocator_))) {
         }
       }
@@ -200,10 +230,9 @@ int AIFuncOp::submit(Slot &slot)
       }
     }
     if (OB_SUCC(ret)) {
-      if (OB_FAIL(child_frame_.save(rows->size_))) {
-      } else {
-        ++count_;
-      }
+      input_end_ = rows->end_;
+      pending_input_ = nullptr;
+      ++count_;
     }
   }
   return ret;
@@ -213,7 +242,7 @@ int AIFuncOp::poll()
 {
   int ret = OB_SUCCESS;
   for (int64_t index = 0; OB_SUCC(ret) && index < count_; ++index) {
-    Slot &slot = *slots_[(head_ + index) % 2];
+    Slot &slot = *slots_[(head_ + index) % slot_count_];
     bool finished = false;
     if (slot.ready_) {
     } else if (OB_FAIL(slot.batch_.poll(finished))) {
@@ -274,10 +303,25 @@ int AIFuncOp::output(Slot &slot, int64_t max_row_cnt)
   return ret;
 }
 
+bool AIFuncOp::can_resume(const void *state)
+{
+  const auto &operation = *static_cast<const AIFuncOp *>(state);
+  bool ready = false;
+  for (int64_t index = 0; !ready && index < operation.count_; ++index) {
+    const Slot &slot = *operation.slots_[(operation.head_ + index) % operation.slot_count_];
+    ready = !slot.ready_ && slot.batch_.is_ready();
+  }
+  return ready;
+}
+
 int AIFuncOp::inner_get_next_batch(int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(child_frame_.restore())) {
+  bool suspended = false;
+  bool memory_backpressure = false;
+  if (nullptr != lib::RequestAwait::current() &&
+      OB_FAIL(lib::RequestAwait::current()->cancel_ret())) {
+  } else if (OB_FAIL(child_frame_.restore())) {
   } else if (ctx_.get_my_session()->is_diagnosis_enabled()) {
     const ObBatchRows *rows = nullptr;
     clear_evaluated_flag();
@@ -288,7 +332,7 @@ int AIFuncOp::inner_get_next_batch(int64_t max_row_cnt)
   } else {
     if (count_ > 0 && slots_[head_]->offset_ == slots_[head_]->size_) {
       reset_slot(*slots_[head_]);
-      head_ = (head_ + 1) % 2;
+      head_ = (head_ + 1) % slot_count_;
       --count_;
     }
     while (OB_SUCC(ret)) {
@@ -297,10 +341,20 @@ int AIFuncOp::inner_get_next_batch(int64_t max_row_cnt)
       } else if (count_ > 0 && slots_[head_]->ready_) {
         ret = output(*slots_[head_], max_row_cnt);
         break;
-      } else if (!input_end_ && count_ < 2) {
-        ret = submit(*slots_[(head_ + count_) % 2]);
+      } else if (!input_end_ && count_ < slot_count_ && !memory_backpressure &&
+                 (count_ == 0 || (ATOMIC_LOAD(&buffered_bytes_) < buffer_limit_ / 2 &&
+                                 !slots_[(head_ + count_ - 1) % slot_count_]->batch_.is_waiting_for_admission()))) {
+        ret = submit(*slots_[(head_ + count_) % slot_count_]);
+        if (OB_EAGAIN == ret) {
+          ret = OB_SUCCESS;
+          memory_backpressure = true;
+        }
       } else if (count_ == 0) {
         brs_.end_ = true;
+        break;
+      } else if (lib::RequestAwait::suspend(&ctx_, this, &AIFuncOp::can_resume)) {
+        suspended = true;
+        ret = OB_EAGAIN;
         break;
       } else {
         bool finished = false;
@@ -308,7 +362,7 @@ int AIFuncOp::inner_get_next_batch(int64_t max_row_cnt)
       }
     }
   }
-  if (OB_FAIL(ret)) {
+  if (OB_FAIL(ret) && !suspended) {
     reset_pipeline();
   }
   return ret;

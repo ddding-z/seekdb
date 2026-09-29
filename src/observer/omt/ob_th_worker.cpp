@@ -26,6 +26,8 @@
 #include "lib/statistic_event/ob_stat_event.h"
 #include "lib/thread/threads.h"
 #include "share/interrupt/ob_global_interrupt_call.h"
+#include "rpc/obmysql/ob_mysql_packet.h"
+#include <array>
 
 using namespace oceanbase;
 using namespace oceanbase::lib;
@@ -145,10 +147,10 @@ ObThWorker::Status ObThWorker::check_wait()
   return st;
 }
 
-inline void ObThWorker::process_request(rpc::ObRequest &req)
+inline void ObThWorker::process_request(rpc::ObRequest &req, ObReqProcessor *&processor)
 {
   // reset retry flags
-  can_retry_ = true;
+  can_retry_ = nullptr == processor;
   need_retry_ = false;
 
   bool need_wait_lock = false;
@@ -157,7 +159,7 @@ inline void ObThWorker::process_request(rpc::ObRequest &req)
 
   ::oceanbase::share::server_service<::oceanbase::memtable::ObLockWaitMgr>()->setup(req.get_lock_wait_node(), req.get_receive_timestamp());
   memtable::advance_tlocal_request_lock_wait_stat(rpc::RequestLockWaitStat::RequestStat::EXECUTE);
-  if (OB_FAIL(procor_.process(req))) {
+  if (OB_FAIL(procor_.process(req, processor))) {
   }
   bool wait_succ = ::oceanbase::share::server_service<::oceanbase::memtable::ObLockWaitMgr>()->post_process(need_retry_, need_wait_lock);
   if (OB_LIKELY(wait_succ)) {
@@ -190,7 +192,7 @@ inline void ObThWorker::process_request(rpc::ObRequest &req)
     if (OB_FAIL(ret)) {
       can_retry_ = false;
       need_retry_ = false;
-      if (OB_FAIL(procor_.process(req))) {
+      if (OB_FAIL(procor_.process(req, processor))) {
       }
     }
   }
@@ -215,12 +217,22 @@ void ObThWorker::worker(int64_t &tid, int64_t &req_recv_timestamp, int32_t &work
   procor_.th_created();
   is_doing_ddl_ = &Thread::is_doing_ddl_;
   static constexpr int64_t POLL_INTERVAL = 100 * 1000L;
+  struct PendingRequest {
+    lib::MemoryContext memory_;
+    rpc::ObRequest *request_ = nullptr;
+    ObReqProcessor *processor_ = nullptr;
+    lib::RequestAwait await_;
+    int64_t query_start_time_ = 0;
+  };
+  std::array<PendingRequest, 64> pending_requests;
+  int64_t pending_count = 0;
+  size_t next_pending = 0;
   // Avoid adding and deleting entities from the root node for every request, the parameters are meaningless
   CREATE_WITH_TEMP_ENTITY(RESOURCE_OWNER, OB_SERVER_RUNTIME_ID) {
     auto *pm = common::ObPageManager::thread_local_instance();
     snprintf(module_name_, MAX_MODULE_NAME_LEN, "ReqWorker");
     int64_t idle_since = 0;
-    while (!has_set_stop()) {
+    while (!has_set_stop() || pending_count > 0) {
       worker_level = get_worker_level();
       if (OB_NOT_NULL(runtime_)) {
         tid = runtime_->id();
@@ -248,42 +260,101 @@ void ObThWorker::worker(int64_t &tid, int64_t &req_recv_timestamp, int32_t &work
           class AllocatorGuard {
           public:
             AllocatorGuard(ObIAllocator **allocator)
-              : allocator_(allocator)
+              : allocator_(allocator), previous_(*allocator)
             {
               *allocator_ = &CURRENT_CONTEXT->get_arena_allocator();
             }
             ~AllocatorGuard()
             {
-              *allocator_ = nullptr;
+              *allocator_ = previous_;
             }
           private:
             ObIAllocator **allocator_;
+            ObIAllocator *previous_;
           } allocator_guard(&allocator_);
           rpc::ObRequest *req = NULL;
+          PendingRequest *pending = nullptr;
           bool expand = false;
           {
             // get request from queue and process it
             wait_start_time = ObTimeUtility::current_time();
             ret = runtime_->pop_with_idle([&]() {
-              return runtime_->get_new_request(POLL_INTERVAL, req);
+              for (size_t offset = 0; offset < pending_requests.size(); ++offset) {
+                const size_t index = (next_pending + offset) % pending_requests.size();
+                PendingRequest &candidate = pending_requests[index];
+                if (nullptr != candidate.processor_ &&
+                    (has_set_stop() || candidate.await_.is_ready())) {
+                  pending = &candidate;
+                  req = candidate.request_;
+                  next_pending = (index + 1) % pending_requests.size();
+                  return OB_SUCCESS;
+                }
+              }
+              return runtime_->get_new_request(pending_count > 0 ? 5 * 1000L : POLL_INTERVAL, req);
             }, expand);
             wait_end_time = ObTimeUtility::current_time();
           }
           if (OB_SUCC(ret)) {
             if (OB_NOT_NULL(req)) {
+              const bool resuming = nullptr != pending;
               idle_since = 0;
-              if (expand) {
+              if (expand && !resuming) {
                 runtime_->try_expand_one(runtime_->min_worker_cnt());
               }
-              EVENT_INC(REQUEST_DEQUEUE_COUNT);
               req_recv_timestamp = req->get_receive_timestamp();
-              EVENT_ADD(REQUEST_QUEUE_TIME, wait_end_time - req->get_enqueue_timestamp());
-              req->set_push_pop_diff(wait_end_time);
-              query_start_time_ = wait_end_time;
+              if (!resuming) {
+                EVENT_INC(REQUEST_DEQUEUE_COUNT);
+                EVENT_ADD(REQUEST_QUEUE_TIME, wait_end_time - req->get_enqueue_timestamp());
+                req->set_push_pop_diff(wait_end_time);
+              }
+              query_start_time_ = resuming ? pending->query_start_time_ : wait_end_time;
               query_enqueue_time_ = req->get_enqueue_timestamp();
               last_check_time_ = wait_end_time;
-              process_request(*req);
-              runtime_->completion_cnt_.fetch_add(1, std::memory_order_relaxed);
+              if (!resuming && ObRequest::OB_MYSQL == req->get_type() &&
+                  !req->is_in_connected_phase() &&
+                  obmysql::COM_QUERY == static_cast<const obmysql::ObMySQLRawPacket &>(req->get_packet()).get_cmd()) {
+                for (PendingRequest &candidate : pending_requests) {
+                  if (nullptr == candidate.memory_) {
+                    lib::ContextParam request_param;
+                    request_param.set_mem_attr(ObModIds::OB_SQL_EXECUTOR, ObCtxIds::DEFAULT_CTX_ID)
+                        .set_page_size(OB_MALLOC_REQ_NORMAL_BLOCK_SIZE)
+                        .set_ablock_size(lib::INTACT_MIDDLE_AOBJECT_SIZE);
+                    if (OB_SUCCESS == ROOT_CONTEXT->CREATE_CONTEXT(candidate.memory_, request_param)) {
+                      pending = &candidate;
+                      pending->request_ = req;
+                      pending->query_start_time_ = query_start_time_;
+                    }
+                    break;
+                  }
+                }
+              }
+              if (nullptr == pending) {
+                ObReqProcessor *processor = nullptr;
+                process_request(*req, processor);
+                runtime_->completion_cnt_.fetch_add(1, std::memory_order_relaxed);
+              } else {
+                WITH_CONTEXT(pending->memory_) {
+                  lib::ContextTLOptGuard request_guard(false);
+                  MEM_TRACKER_GUARD(CURRENT_CONTEXT);
+                  AllocatorGuard request_allocator_guard(&allocator_);
+                  lib::RequestAwaitGuard await_guard(pending->await_);
+                  pending->await_.reset_pending();
+                  if (has_set_stop()) {
+                    pending->await_.cancel(OB_CANCELED);
+                  }
+                  process_request(*req, pending->processor_);
+                }
+                if (nullptr == pending->processor_) {
+                  pending->await_.reset();
+                  DESTROY_CONTEXT(pending->memory_);
+                  pending->memory_ = nullptr;
+                  pending->request_ = nullptr;
+                  pending_count -= resuming ? 1 : 0;
+                  runtime_->completion_cnt_.fetch_add(1, std::memory_order_relaxed);
+                } else if (!resuming) {
+                  ++pending_count;
+                }
+              }
               query_enqueue_time_ = INT64_MAX;
               query_start_time_ = INT64_MAX;
             } else {
@@ -293,7 +364,9 @@ void ObThWorker::worker(int64_t &tid, int64_t &req_recv_timestamp, int32_t &work
                     K(runtime_), K(ret), K(req));
               }
             } else if (OB_ENTRY_NOT_EXIST == ret) {
-              if (idle_since == 0) {
+              if (pending_count > 0) {
+                idle_since = 0;
+              } else if (idle_since == 0) {
                 idle_since = wait_end_time;
               } else if (wait_end_time - idle_since >= ObServerRuntime::KEEP_ALIVE_TIMEOUT) {
                 if (runtime_->try_shrink_one(0)) {

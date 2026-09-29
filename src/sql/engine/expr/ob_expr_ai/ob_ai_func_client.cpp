@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_ai_func_client.h"
 #include "sql/session/ob_sql_session_info.h"
+#include "share/config/ob_server_config.h"
 #include <algorithm>
 #include <limits>
 #include <cstdlib>
@@ -33,6 +34,58 @@ namespace common
 {
 
 const int64_t ObAIFuncClient::CURL_MAX_TIMEOUT_SEC = INT_MAX / 1000;
+
+namespace
+{
+int64_t pipeline_buffered_bytes = 0;
+}
+
+int64_t ObAIFuncClient::pipeline_buffer_usage()
+{
+  return ATOMIC_LOAD(&pipeline_buffered_bytes);
+}
+
+int64_t ObAIFuncClient::pipeline_buffer_limit()
+{
+  return GCONF.ai_pipeline_total_memory_limit;
+}
+
+int ObAIFuncClient::reserve_pipeline_buffer(int64_t &used, int64_t limit, int64_t bytes)
+{
+  int ret = OB_SUCCESS;
+  int64_t current = ATOMIC_LOAD(&used);
+  while (OB_SUCC(ret)) {
+    if (bytes < 0 || bytes > limit - current) {
+      ret = OB_SIZE_OVERFLOW;
+    } else if (ATOMIC_BCAS(&used, current, current + bytes)) {
+      break;
+    } else {
+      current = ATOMIC_LOAD(&used);
+    }
+  }
+  if (OB_SUCC(ret)) {
+    current = pipeline_buffer_usage();
+    while (OB_SUCC(ret)) {
+      if (bytes > pipeline_buffer_limit() - current) {
+        ret = OB_SIZE_OVERFLOW;
+      } else if (ATOMIC_BCAS(&pipeline_buffered_bytes, current, current + bytes)) {
+        break;
+      } else {
+        current = pipeline_buffer_usage();
+      }
+    }
+    if (OB_FAIL(ret)) {
+      ATOMIC_FAA(&used, -bytes);
+    }
+  }
+  return ret;
+}
+
+void ObAIFuncClient::release_pipeline_buffer(int64_t &used, int64_t bytes)
+{
+  ATOMIC_FAA(&used, -bytes);
+  ATOMIC_FAA(&pipeline_buffered_bytes, -bytes);
+}
 
 class AIFuncScheduler final : public lib::Threads
 {
@@ -58,7 +111,7 @@ public:
     return scheduler;
   }
 
-  int submit(ObAIFuncClient &client)
+  int submit(ObAIFuncClient &client, bool wait_for_slot = true)
   {
     int ret = OB_SUCCESS;
     std::unique_lock<std::mutex> guard(mutex_);
@@ -81,10 +134,28 @@ public:
           changed_.notify_all();
           break;
         }
-        changed_.wait_for(guard, std::chrono::milliseconds(20));
+        if (!wait_for_slot) {
+          ret = OB_EAGAIN;
+        } else {
+          changed_.wait_for(guard, std::chrono::milliseconds(20));
+        }
       }
     }
     return ret;
+  }
+
+  bool can_submit()
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return stopping_.load() || std::find(clients_.begin(), clients_.end(), nullptr) != clients_.end();
+  }
+
+  void wait_for_capacity(int64_t wait_ms)
+  {
+    std::unique_lock<std::mutex> guard(mutex_);
+    changed_.wait_for(guard, std::chrono::milliseconds(wait_ms), [&] {
+      return stopping_.load() || std::find(clients_.begin(), clients_.end(), nullptr) != clients_.end();
+    });
   }
 
   void wait_for(ObAIFuncClient &client, int64_t wait_ms)
@@ -174,13 +245,15 @@ struct ObAIFuncClient::Request
 
 ObAIFuncClient::ObAIFuncClient()
   : allocator_(nullptr), url_(nullptr), header_list_(nullptr), curlm_(nullptr),
-    requests_(), is_finished_(false), async_mode_(false), async_done_(true),
+    requests_(), is_finished_(false), async_mode_(false), admission_pending_(false),
+    next_admission_check_(0), async_done_(true),
     cancel_ret_(OB_SUCCESS), request_session_(nullptr), max_retry_times_(3), abs_timeout_ts_(0),
     timeout_sec_(60), max_parallel_(0), active_count_(0), completed_count_(0),
     batch_ret_(OB_SUCCESS), status_checker_(nullptr), status_context_(nullptr),
     response_validator_(nullptr),
     batch_start_ts_(0), attempts_(0), retries_(0), peak_active_(0),
-    buffered_bytes_(0), shared_buffered_bytes_(nullptr), received_bytes_(0), submitted_bytes_(0)
+    buffered_bytes_(0), shared_buffered_bytes_(nullptr), shared_buffer_limit_(MAX_BATCH_BYTES),
+    received_bytes_(0), submitted_bytes_(0)
 {}
 
 ObAIFuncClient::~ObAIFuncClient()
@@ -219,16 +292,7 @@ int ObAIFuncClient::reserve_buffer(int64_t bytes)
     ret = OB_SIZE_OVERFLOW;
   } else {
     if (nullptr != shared_buffered_bytes_) {
-      int64_t used = ATOMIC_LOAD(shared_buffered_bytes_);
-      while (OB_SUCC(ret)) {
-        if (bytes > MAX_BATCH_BYTES - used) {
-          ret = OB_SIZE_OVERFLOW;
-        } else if (ATOMIC_BCAS(shared_buffered_bytes_, used, used + bytes)) {
-          break;
-        } else {
-          used = ATOMIC_LOAD(shared_buffered_bytes_);
-        }
-      }
+      ret = reserve_pipeline_buffer(*shared_buffered_bytes_, shared_buffer_limit_, bytes);
     }
     if (OB_SUCC(ret)) {
       buffered_bytes_ += bytes;
@@ -241,7 +305,7 @@ void ObAIFuncClient::release_buffer(int64_t bytes)
 {
   buffered_bytes_ -= bytes;
   if (nullptr != shared_buffered_bytes_) {
-    ATOMIC_FAA(shared_buffered_bytes_, -bytes);
+    release_pipeline_buffer(*shared_buffered_bytes_, bytes);
   }
 }
 
@@ -265,7 +329,8 @@ int ObAIFuncClient::init(ObIAllocator &allocator, const ObString &url, ObArray<O
 {
   int ret = OB_SUCCESS;
   reset();
-  if (url.empty() || headers.empty() || max_parallel_ < 0 || timeout_sec_ <= 0) {
+  if (url.empty() || headers.empty() || max_parallel_ < 0 || timeout_sec_ <= 0 ||
+      (nullptr != shared_buffered_bytes_ && shared_buffer_limit_ <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     allocator_ = &allocator;
@@ -570,21 +635,27 @@ void ObAIFuncClient::stop_async_scheduler()
   AIFuncScheduler::instance().shutdown();
 }
 
-int ObAIFuncClient::start_async()
+int ObAIFuncClient::start_async(bool wait_for_slot)
 {
   int ret = OB_SUCCESS;
-  if (async_mode_) {
+  if (async_mode_ || admission_pending_) {
     ret = OB_INIT_TWICE;
   } else if (nullptr == curlm_ || requests_.empty()) {
     ret = OB_NOT_INIT;
   } else {
-    ret = AIFuncScheduler::instance().submit(*this);
+    ret = AIFuncScheduler::instance().submit(*this, wait_for_slot);
+    if (OB_EAGAIN == ret) {
+      admission_pending_ = true;
+      next_admission_check_ = ObTimeUtility::current_time() + 5000;
+      ret = OB_SUCCESS;
+    }
   }
   return ret;
 }
 
 void ObAIFuncClient::cancel_async()
 {
+  admission_pending_ = false;
   if (async_mode_) {
     cancel_ret_.store(OB_CANCELED);
     AIFuncScheduler::instance().wait_for(*this, -1);
@@ -594,7 +665,25 @@ void ObAIFuncClient::cancel_async()
 
 bool ObAIFuncClient::check_batch_finished()
 {
+  if (admission_pending_) {
+    const int ret = AIFuncScheduler::instance().submit(*this, false);
+    if (OB_EAGAIN == ret) {
+      next_admission_check_ = ObTimeUtility::current_time() + 5000;
+      return false;
+    }
+    admission_pending_ = false;
+    if (OB_SUCCESS != ret) {
+      batch_ret_ = ret;
+    }
+  }
   return async_mode_ ? async_done_.load() : drive_batch();
+}
+
+bool ObAIFuncClient::is_async_ready() const
+{
+  return admission_pending_ ? ObTimeUtility::current_time() >= next_admission_check_ ||
+                                 AIFuncScheduler::instance().can_submit()
+                            : is_async_finished();
 }
 
 bool ObAIFuncClient::drive_batch()
@@ -625,7 +714,7 @@ bool ObAIFuncClient::drive_batch()
 int ObAIFuncClient::get_batch_result(ObArray<ObJsonObject *> &responses)
 {
   responses.reset();
-  if (async_mode_ && !async_done_.load()) {
+  if (admission_pending_ || (async_mode_ && !async_done_.load())) {
     return OB_EAGAIN;
   }
   int ret = batch_ret_;
@@ -642,6 +731,16 @@ int ObAIFuncClient::get_batch_result(ObArray<ObJsonObject *> &responses)
 
 int ObAIFuncClient::poll_batch(bool &finished, int64_t wait_ms)
 {
+  if (admission_pending_) {
+    finished = check_batch_finished();
+    if (admission_pending_ && wait_ms > 0) {
+      AIFuncScheduler::instance().wait_for_capacity(std::min<int64_t>(wait_ms, 20));
+      finished = check_batch_finished();
+    }
+    if (admission_pending_) {
+      return OB_SUCCESS;
+    }
+  }
   if (async_mode_) {
     if (wait_ms > 0 && !async_done_.load()) {
       AIFuncScheduler::instance().wait_for(*this, std::min<int64_t>(wait_ms, 20));

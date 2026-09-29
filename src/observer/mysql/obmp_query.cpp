@@ -20,6 +20,7 @@
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "observer/mysql/obmp_query.h"
 #include "sql/engine/ob_physical_plan.h"
+#include "query/engine/ob_operator.h"
 
 #include "observer/mysql/ob_sync_plan_driver.h"
 #include "observer/mysql/ob_sync_cmd_driver.h"
@@ -37,8 +38,27 @@ using namespace oceanbase::share;
 using namespace oceanbase::share::schema;
 using namespace oceanbase::trace;
 using namespace oceanbase::sql;
+
+struct ObMPQuery::ResponseState
+{
+  ResponseState(ObMPQuery &query, ObSQLSessionInfo &session, ObIAllocator &allocator)
+  : result_(session, allocator,
+    get_observer_sql_engine()->get_plan_cache_access_service()),
+    driver_(query.gctx_, query.ctx_, session, query.retry_ctrl_, query.packet_sender_),
+    deadline_(THIS_WORKER.get_timeout_ts()), memory_used_(0), suspended_(false)
+  {}
+
+  ObMySQLResultSet result_;
+  ObSyncPlanDriver driver_;
+  ObExecutingSqlStatRecord sqlstat_record_;
+  int64_t deadline_;
+  int64_t memory_used_;
+  bool suspended_;
+};
+
 ObMPQuery::ObMPQuery(const oceanbase::share::ObGlobalContext &gctx)
     : ObMPBase(gctx),
+  response_state_(nullptr),
       single_process_timestamp_(0),
       exec_start_timestamp_(0),
       exec_end_timestamp_(0),
@@ -52,11 +72,39 @@ ObMPQuery::ObMPQuery(const oceanbase::share::ObGlobalContext &gctx)
 
 ObMPQuery::~ObMPQuery()
 {
+  if (nullptr != response_state_) {
+    if (response_state_->suspended_) {
+      ObSQLSessionInfo &session = response_state_->result_.get_session();
+      {
+        ObSQLSessionInfo::LockGuard lock_guard(session.get_query_lock());
+        THIS_WORKER.set_session(&session);
+        ob_setup_tsi_warning_buffer(&session.get_warnings_buffer());
+        force_disconnect();
+        int close_ret = OB_CANCELED;
+        (void)response_state_->result_.close(close_ret);
+        response_state_->~ResponseState();
+        response_state_ = nullptr;
+        ctx_.clear();
+        session.set_session_in_retry(false, OB_CANCELED);
+        (void)do_after_process(session, false, OB_CANCELED);
+        ctx_.plan_key_.reset();
+        ctx_.reset();
+        session.check_and_reset_retry_info(*ObCurTraceId::get_trace_id(), false);
+      }
+      THIS_WORKER.set_session(nullptr);
+      revert_session(&session);
+    } else {
+      response_state_->~ResponseState();
+    }
+  }
 }
 
 
 int ObMPQuery::process()
 {
+  if (nullptr != response_state_) {
+    return resume_response();
+  }
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
   ObSQLSessionInfo *sess = NULL;
@@ -249,6 +297,12 @@ int ObMPQuery::process()
         }
       }
     }
+    if (OB_EAGAIN == ret && nullptr != lib::RequestAwait::current() &&
+        lib::RequestAwait::current()->is_pending()) {
+      THIS_WORKER.set_session(nullptr);
+      ob_setup_tsi_warning_buffer(nullptr);
+      return ret;
+    }
     // THIS_WORKER.need_retry() means whether to put the request back in the queue for scheduler retry.
     session.check_and_reset_retry_info(*cur_trace_id, THIS_WORKER.need_retry());
     session.set_last_trace_id(ObCurTraceId::get_trace_id());
@@ -295,6 +349,55 @@ int ObMPQuery::process()
   }
 
   return (OB_SUCCESS != ret) ? ret : tmp_ret;
+}
+
+int ObMPQuery::resume_response()
+{
+  int ret = OB_SUCCESS;
+  bool async_resp_used = false;
+  bool need_disconnect = true;
+  bool suspended = false;
+  ObSQLSessionInfo &session = response_state_->result_.get_session();
+  sql::ObProcessMallocCallback pmcb(response_state_->memory_used_,
+                                  session.get_raw_audit_record().request_memory_used_);
+  lib::ObMallocCallbackGuard malloc_guard(pmcb);
+  THIS_WORKER.set_session(&session);
+  THIS_WORKER.set_timeout_ts(response_state_->deadline_);
+  {
+    ObSQLSessionInfo::LockGuard lock_guard(session.get_query_lock());
+    session.set_current_trace_id(ObCurTraceId::get_trace_id());
+    session.set_thread_id(GETTID());
+    ob_setup_tsi_warning_buffer(&session.get_warnings_buffer());
+    ObThreadLogLevelUtils::init(session.get_log_id_level_map());
+    ret = do_process(session, false, false, async_resp_used, need_disconnect);
+    suspended = OB_EAGAIN == ret && nullptr != lib::RequestAwait::current() &&
+                lib::RequestAwait::current()->is_pending();
+    if (suspended) {
+      response_state_->memory_used_ = pmcb.get_cur_used();
+    } else {
+      ctx_.clear();
+      session.set_session_in_retry(false, ret);
+      do_after_process(session, false, ret);
+      ctx_.plan_key_.reset();
+      ctx_.reset();
+      session.check_and_reset_retry_info(*ObCurTraceId::get_trace_id(), false);
+      session.set_last_trace_id(ObCurTraceId::get_trace_id());
+      if (OB_FAIL(ret) && need_disconnect && is_conn_valid()) {
+        force_disconnect();
+      }
+      if (is_conn_valid()) {
+        const int flush_ret = flush_buffer(true);
+        ret = OB_SUCCESS == ret ? flush_ret : ret;
+      }
+    }
+    ob_setup_tsi_warning_buffer(nullptr);
+    ObThreadLogLevelUtils::clear();
+  }
+  THIS_WORKER.set_session(nullptr);
+  if (!suspended) {
+    revert_session(&session);
+  }
+  return ret;
 }
 
 /*
@@ -423,6 +526,12 @@ int ObMPQuery::process_single_stmt(const ObMultiStmtItem &multi_stmt_item,
                            force_sync_resp,
                            async_resp_used,
                            need_disconnect);
+          if (OB_EAGAIN == ret && nullptr != lib::RequestAwait::current() &&
+              lib::RequestAwait::current()->is_pending()) {
+            response_state_->memory_used_ = pmcb.get_cur_used();
+            ObThreadLogLevelUtils::clear();
+            return ret;
+          }
           ctx_.clear();
         } else {
           ret = process_with_tmp_context(session,
@@ -798,13 +907,15 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
 {
   int ret = OB_SUCCESS;
   ObAuditRecordData &audit_record = session.get_raw_audit_record();
-  ObExecutingSqlStatRecord sqlstat_record;
-  audit_record.try_cnt_++;
+  const bool resuming = nullptr != response_state_;
+  if (!resuming) {
+    audit_record.try_cnt_++;
+    single_process_timestamp_ = ObTimeUtility::current_time();
+  }
   bool is_diagnostics_stmt = false;
   bool need_response_error = true;
   const ObString &sql = ctx_.multi_stmt_item_.get_sql();
   const bool enable_sqlstat = session.is_sqlstat_enabled();
-  single_process_timestamp_ = ObTimeUtility::current_time();
   /* !!!
    * Note that req_timeinfo_guard must be placed before result
    * !!!
@@ -816,93 +927,107 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
   int64_t database_schema_version = 0;
   SQL_INFO_GUARD(sql, session.get_cur_sql_id());
   ObIAllocator &allocator = CURRENT_CONTEXT->get_arena_allocator();
-  SMART_VAR(ObMySQLResultSet, result, session, allocator,
-            ::oceanbase::observer::get_observer_sql_engine()->get_plan_cache_access_service()) {
-    if (OB_FAIL(get_schema_info_(&cached_schema_info,
-                                 schema_guard,
-                                 database_schema_version))) {
-    } else if (OB_FAIL(session.update_query_sensitive_system_variable(*schema_guard))) {
-    } else if (OB_ISNULL(::oceanbase::observer::get_observer_sql_engine())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_ERROR("invalid sql engine", K(ret), K(gctx_));
-    } else {
-      session.set_current_execution_id(::oceanbase::observer::get_observer_sql_engine()->get_execution_id());
-      session.reset_plsql_exec_time();
-      session.reset_plsql_compile_time();
-      session.set_stmt_type(stmt::T_NONE);
-      result.get_exec_context().set_need_disconnect(true);
-      ctx_.schema_guard_ = schema_guard;
-      retry_ctrl_.set_current_local_schema_version(database_schema_version);
+  if (!resuming) {
+    response_state_ = OB_NEWx(ResponseState, &allocator, *this, session, allocator);
+  }
+  if (OB_ISNULL(response_state_)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    if (is_conn_valid()) {
+      send_error_packet(ret, NULL);
+    }
+  } else {
+    ObMySQLResultSet &result = response_state_->result_;
+    ObExecutingSqlStatRecord &sqlstat_record = response_state_->sqlstat_record_;
+    plan = result.get_physical_plan();
+    is_diagnostics_stmt = ObStmt::is_diagnostic_stmt(result.get_literal_stmt_type());
+    if (!resuming) {
+      if (OB_FAIL(get_schema_info_(&cached_schema_info,
+                                   schema_guard,
+                                   database_schema_version))) {
+      } else if (OB_FAIL(session.update_query_sensitive_system_variable(*schema_guard))) {
+      } else if (OB_ISNULL(::oceanbase::observer::get_observer_sql_engine())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("invalid sql engine", K(ret), K(gctx_));
+      } else {
+        session.set_current_execution_id(::oceanbase::observer::get_observer_sql_engine()->get_execution_id());
+        session.reset_plsql_exec_time();
+        session.reset_plsql_compile_time();
+        session.set_stmt_type(stmt::T_NONE);
+        result.get_exec_context().set_need_disconnect(true);
+        ctx_.schema_guard_ = schema_guard;
+        retry_ctrl_.set_current_local_schema_version(database_schema_version);
+      }
     }
 
     if (OB_SUCC(ret)) {
-      {
-        audit_record.exec_record_.record_start();
-      }
-      if (enable_sqlstat) {
-        sqlstat_record.record_sqlstat_start_value(
-            ::oceanbase::observer::get_observer_sql_engine()->get_query_runtime_environment());
-        sqlstat_record.set_is_in_retry(session.get_is_in_retry());
-        session.sql_sess_record_sql_stat_start_value(sqlstat_record);
-      }
-      result.set_has_more_result(has_more_result);
-      ObSqlExecutorCtx &task_ctx = result.get_exec_context().get_sql_exec_ctx();
-      task_ctx.schema_service_ = gctx_.schema_service_;
-      task_ctx.set_query_begin_schema_version(retry_ctrl_.get_current_local_schema_version());
-      ctx_.retry_times_ = retry_ctrl_.get_retry_times();
-      //storage::ObPartitionService* ps = static_cast<storage::ObPartitionService *> (GCTX.par_ser_);
-      //bool is_read_only = false;
-      if (OB_FAIL(ret)) {
-        // do nothing
-      } else if (OB_ISNULL(ctx_.schema_guard_)) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("newest schema is NULL", K(ret));
-      } else if (OB_FAIL(set_session_active(sql, session, single_process_timestamp_))) {
-      } else if (OB_FAIL(::oceanbase::observer::get_observer_sql_engine()->stmt_query(sql, ctx_, result))) {
-        exec_start_timestamp_ = ObTimeUtility::current_time();
-        if (!THIS_WORKER.need_retry()) {
-          int cli_ret = OB_SUCCESS;
-          retry_ctrl_.test_and_save_retry_state(gctx_, ctx_, result, ret, cli_ret);
-          LOG_WARN("run stmt_query failed, check if need retry",
-                   K(ret), K(cli_ret), K(retry_ctrl_.need_retry()),
-                   "sql", ctx_.is_sensitive_ ? ObString(OB_MASKED_STR) : sql);
-          ret = cli_ret;
-          if (ctx_.multi_stmt_item_.is_batched_multi_stmt()) {
-            // batch execute with error,should not response error packet
-            need_response_error = false;
-          } else if (OB_BATCHED_MULTI_STMT_ROLLBACK == ret) {
-            need_response_error = false;
+      if (!resuming) {
+        {
+          audit_record.exec_record_.record_start();
+        }
+        if (enable_sqlstat) {
+          sqlstat_record.record_sqlstat_start_value(
+              ::oceanbase::observer::get_observer_sql_engine()->get_query_runtime_environment());
+          sqlstat_record.set_is_in_retry(session.get_is_in_retry());
+          session.sql_sess_record_sql_stat_start_value(sqlstat_record);
+        }
+        result.set_has_more_result(has_more_result);
+        ObSqlExecutorCtx &task_ctx = result.get_exec_context().get_sql_exec_ctx();
+        task_ctx.schema_service_ = gctx_.schema_service_;
+        task_ctx.set_query_begin_schema_version(retry_ctrl_.get_current_local_schema_version());
+        ctx_.retry_times_ = retry_ctrl_.get_retry_times();
+        //storage::ObPartitionService* ps = static_cast<storage::ObPartitionService *> (GCTX.par_ser_);
+        //bool is_read_only = false;
+        if (OB_FAIL(ret)) {
+          // do nothing
+        } else if (OB_ISNULL(ctx_.schema_guard_)) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("newest schema is NULL", K(ret));
+        } else if (OB_FAIL(set_session_active(sql, session, single_process_timestamp_))) {
+        } else if (OB_FAIL(::oceanbase::observer::get_observer_sql_engine()->stmt_query(sql, ctx_, result))) {
+          exec_start_timestamp_ = ObTimeUtility::current_time();
+          if (!THIS_WORKER.need_retry()) {
+            int cli_ret = OB_SUCCESS;
+            retry_ctrl_.test_and_save_retry_state(gctx_, ctx_, result, ret, cli_ret);
+            LOG_WARN("run stmt_query failed, check if need retry",
+                     K(ret), K(cli_ret), K(retry_ctrl_.need_retry()),
+                     "sql", ctx_.is_sensitive_ ? ObString(OB_MASKED_STR) : sql);
+            ret = cli_ret;
+            if (ctx_.multi_stmt_item_.is_batched_multi_stmt()) {
+              // batch execute with error,should not response error packet
+              need_response_error = false;
+            } else if (OB_BATCHED_MULTI_STMT_ROLLBACK == ret) {
+              need_response_error = false;
+            }
+          } else {
+            retry_ctrl_.set_packet_retry();
+            session.get_retry_info_for_update().set_last_query_retry_err(ret);
+            session.get_retry_info_for_update().inc_retry_cnt();
           }
         } else {
-          retry_ctrl_.set_packet_retry();
-          session.get_retry_info_for_update().set_last_query_retry_err(ret);
-          session.get_retry_info_for_update().inc_retry_cnt();
+          //Monitoring item statistics start
+          exec_start_timestamp_ = ObTimeUtility::current_time();
+          result.get_exec_context().set_plan_start_time(exec_start_timestamp_);
+          // All errors within this branch will be handled properly inside response_result
+          // No need to handle the error response packet additionally
+          need_response_error = false;
+          is_diagnostics_stmt = ObStmt::is_diagnostic_stmt(result.get_literal_stmt_type());
+          ctx_.is_show_trace_stmt_ = ObStmt::is_show_trace_stmt(result.get_literal_stmt_type());
+          plan = result.get_physical_plan();
+
+          if (get_is_com_filed_list()) {
+            result.set_is_com_filed_list();
+            result.set_wildcard_string(wild_str_);
+          }
         }
-      } else {
-        //Monitoring item statistics start
-        exec_start_timestamp_ = ObTimeUtility::current_time();
-        result.get_exec_context().set_plan_start_time(exec_start_timestamp_);
-        // All errors within this branch will be handled properly inside response_result
-        // No need to handle the error response packet additionally
+      }
+      if (OB_SUCC(ret)) {
         need_response_error = false;
-        is_diagnostics_stmt = ObStmt::is_diagnostic_stmt(result.get_literal_stmt_type());
-        ctx_.is_show_trace_stmt_ = ObStmt::is_show_trace_stmt(result.get_literal_stmt_type());
-        plan = result.get_physical_plan();
-
-        if (get_is_com_filed_list()) {
-          result.set_is_com_filed_list();
-          result.set_wildcard_string(wild_str_);
-        }
-
-        //response_result
-        if (OB_FAIL(ret)) {
-        //TODO shengle, confirm whether 4.0 is required
-        //} else if (OB_FAIL(fill_feedback_session_info(*result, session))) {
-          //need_response_error = true;
-          //LOG_WARN("failed to fill session info", K(ret));
-        } else if (OB_FAIL(response_result(result,
-                                           force_sync_resp,
-                                           async_resp_used))) {
+        ret = response_result(result, force_sync_resp, async_resp_used);
+        if (OB_EAGAIN == ret && nullptr != lib::RequestAwait::current() &&
+            lib::RequestAwait::current()->is_pending()) {
+          response_state_->suspended_ = true;
+          return ret;
+        } else if (OB_FAIL(ret)) {
           ObPhysicalPlanCtx *plan_ctx = result.get_exec_context().get_physical_plan_ctx();
           if (OB_ISNULL(plan_ctx)) {
             // ignore ret
@@ -1037,6 +1162,9 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
     }
     bool is_need_retry = THIS_THWORKER.need_retry() ||
         RETRY_TYPE_NONE != retry_ctrl_.get_retry_type();
+    response_state_->~ResponseState();
+    allocator.free(response_state_);
+    response_state_ = nullptr;
   }
   return ret;
 }
@@ -1230,8 +1358,17 @@ OB_INLINE int ObMPQuery::response_result(ObMySQLResultSet &result,
       async_resp_used = result.is_async_end_trans_submitted();
     } else {
       // Pilot ObQuerySyncDriver
-      ObSyncPlanDriver drv(gctx_, ctx_, session, retry_ctrl_, packet_sender_);
-      ret = drv.response_result(result);
+      const ObOpSpec *root = result.get_physical_plan()->get_root_op_spec();
+      if (nullptr != lib::RequestAwait::current() && nullptr != root &&
+          PHY_AI_FUNC == root->type_ && root->is_vectorized() &&
+          stmt::T_SELECT == result.get_stmt_type() && !is_com_filed_list_ &&
+          !session.is_diagnosis_enabled() && static_cast<int64_t>(GCONF.debug_sync_timeout) <= 0 &&
+          !force_sync_resp && !result.has_more_result() &&
+          !ctx_.multi_stmt_item_.is_part_of_multi_stmt() &&
+          !ctx_.multi_stmt_item_.is_batched_multi_stmt() && !session.get_is_in_retry()) {
+        lib::RequestAwait::current()->enable(&result.get_exec_context());
+      }
+      ret = response_state_->driver_.response_result(result);
     }
   } else {
 

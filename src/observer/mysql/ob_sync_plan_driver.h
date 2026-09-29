@@ -58,6 +58,7 @@ protected:
 
   /* disallow copy & assign */
   int32_t iteration_count_;
+  bool result_opened_;
   DISALLOW_COPY_AND_ASSIGN(ObSyncPlanDriver);
 };
 }

@@ -45,6 +45,7 @@ int OB_WEAK_SYMBOL common_yield()
 }  // namespace lib
 }  // namespace oceanbase
 __thread Worker *Worker::self_;
+thread_local RequestAwait *RequestAwait::current_ = nullptr;
 
 Worker::Worker()
     : group_(nullptr),

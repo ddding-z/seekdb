@@ -135,11 +135,11 @@ int ObQueryDriver::response_query_result(ObResultSet &result,
 {
   int ret = OB_SUCCESS;
   ObTraceSpanGuard response_span(&session_, TRACE_RESPONSE_RESULT);
-  can_retry = true;
-  bool is_first_row = true;
+  can_retry = response_first_row_ && !response_suspended_;
+  bool &is_first_row = response_first_row_;
   const ObNewRow *result_row = NULL;
   bool is_cac_found_rows =  result.is_calc_found_rows();
-  int64_t row_num = 0;
+  int64_t &row_num = response_row_count_;
   ObSqlCtx *sql_ctx = result.get_exec_context().get_sql_ctx();
   bool is_packed = result.get_physical_plan() ? result.get_physical_plan()->is_packed() : false;
   MYSQL_PROTOCOL_TYPE protocol_type = is_ps_protocol ? MYSQL_PROTOCOL_TYPE::BINARY : MYSQL_PROTOCOL_TYPE::TEXT;
@@ -243,6 +243,12 @@ int ObQueryDriver::response_query_result(ObResultSet &result,
       // nothing
     }
   }
+  if (OB_EAGAIN == ret && nullptr != lib::RequestAwait::current() &&
+      lib::RequestAwait::current()->is_pending()) {
+    response_suspended_ = true;
+    can_retry = false;
+    return ret;
+  }
   if (OB_ITER_END == ret) {
     ret = OB_SUCCESS;
   } else {
@@ -258,6 +264,9 @@ int ObQueryDriver::response_query_result(ObResultSet &result,
     FLOG_INFO("The query has already returned partial results to the client and cannot be retried", KR(ret));
   }
 
+  response_row_count_ = 0;
+  response_first_row_ = true;
+  response_suspended_ = false;
   return ret;
 }
 

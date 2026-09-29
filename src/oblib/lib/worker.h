@@ -32,6 +32,53 @@ using common::ObIAllocator;
 
 enum class LogReductionMode {NONE = 0, REFINED, COMPRESSED};
 
+class RequestAwait
+{
+public:
+  using ReadyCheck = bool (*)(const void *);
+  RequestAwait() : owner_(nullptr), data_(nullptr), ready_(nullptr), cancel_ret_(common::OB_SUCCESS) {}
+  void enable(const void *owner) { owner_ = owner; }
+  void reset_pending() { data_ = nullptr; ready_ = nullptr; }
+  void reset() { owner_ = nullptr; reset_pending(); cancel_ret_ = common::OB_SUCCESS; }
+  void cancel(int ret) { cancel_ret_ = ret; }
+  int cancel_ret() const { return cancel_ret_; }
+  bool is_pending() const { return nullptr != ready_; }
+  bool is_ready() const { return is_pending() && ready_(data_); }
+  static RequestAwait *current() { return current_; }
+  static bool suspend(const void *owner, const void *data, ReadyCheck ready)
+  {
+    const bool accepted = nullptr != current_ && nullptr != owner && nullptr != ready &&
+                          current_->owner_ == owner && !current_->is_pending() &&
+                          common::OB_SUCCESS == current_->cancel_ret_;
+    if (accepted) {
+      current_->data_ = data;
+      current_->ready_ = ready;
+    }
+    return accepted;
+  }
+private:
+  friend class RequestAwaitGuard;
+  static thread_local RequestAwait *current_;
+  const void *owner_;
+  const void *data_;
+  ReadyCheck ready_;
+  int cancel_ret_;
+  DISALLOW_COPY_AND_ASSIGN(RequestAwait);
+};
+
+class RequestAwaitGuard
+{
+public:
+  explicit RequestAwaitGuard(RequestAwait &context) : previous_(RequestAwait::current_)
+  {
+    RequestAwait::current_ = &context;
+  }
+  ~RequestAwaitGuard() { RequestAwait::current_ = previous_; }
+private:
+  RequestAwait *previous_;
+  DISALLOW_COPY_AND_ASSIGN(RequestAwaitGuard);
+};
+
 class Worker
 {
 public:

@@ -24,7 +24,7 @@ namespace oceanbase
 {
 
 namespace rpc { class ObRequest; } // end of namespace rpc
-namespace rpc { namespace frame { class ObReqTranslator; } }
+namespace rpc { namespace frame { class ObReqTranslator; class ObReqProcessor; } }
 
 namespace omt
 {
@@ -38,11 +38,12 @@ public:
   virtual void th_destroy();
 
   virtual int process(rpc::ObRequest &req);
+  int process(rpc::ObRequest &req, rpc::frame::ObReqProcessor *&processor);
 
 public:
   int process_err_test(); 
 private:
-  int process_one(rpc::ObRequest &req);
+  int process_one(rpc::ObRequest &req, rpc::frame::ObReqProcessor *&processor);
 
 private:
   rpc::frame::ObReqTranslator &translator_;

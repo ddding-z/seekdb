@@ -30,7 +30,7 @@ namespace frame
 class ObSqlProcessor: public ObReqProcessor
 {
 public:
-  ObSqlProcessor() {}
+  ObSqlProcessor() : processing_(false) {}
   virtual ~ObSqlProcessor() {}
 
   int run();
@@ -48,6 +48,7 @@ protected:
   virtual int response(const int retcode) = 0;
 
 private:
+  bool processing_;
   DISALLOW_COPY_AND_ASSIGN(ObSqlProcessor);
 };
 } // end of namespace frame

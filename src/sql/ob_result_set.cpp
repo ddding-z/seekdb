@@ -365,7 +365,10 @@ OB_INLINE int ObResultSet::inner_get_next_row(const common::ObNewRow *&row)
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("exec result is null", K(ret));
     } else if (OB_FAIL(exec_result_->get_next_row(get_exec_context(), row))) {
-      if (OB_ITER_END != ret) {
+      if (OB_EAGAIN == ret && nullptr != lib::RequestAwait::current() &&
+          lib::RequestAwait::current()->is_pending()) {
+        return ret;
+      } else if (OB_ITER_END != ret) {
         LOG_WARN("get next row from exec result failed", K(ret));
         // marked last execute status
         physical_plan_->set_is_last_exec_succ(false);

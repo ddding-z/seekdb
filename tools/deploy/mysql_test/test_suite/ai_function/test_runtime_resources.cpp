@@ -1,4 +1,8 @@
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
+#include "lib/worker.h"
+#include "observer/omt/ob_th_worker.h"
+#include "rpc/frame/ob_req_processor.h"
+#include "rpc/frame/ob_req_translator.h"
 #include "sql/engine/basic/ob_ai_func_op.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/ob_physical_plan.h"
@@ -337,6 +341,104 @@ void test_pending_lifecycle(const char *url)
   resources().check_empty();
 }
 
+void test_request_await_protocol()
+{
+  using oceanbase::lib::RequestAwait;
+  using oceanbase::lib::RequestAwaitGuard;
+  RequestAwait context;
+  bool ready = false;
+  const auto check = [](const void *state) { return *static_cast<const bool *>(state); };
+  require(nullptr == RequestAwait::current(), "request await context must default to disabled");
+  require(!RequestAwait::suspend(&context, &ready, check), "unmanaged callers must not suspend");
+  {
+    RequestAwaitGuard guard(context);
+    require(!RequestAwait::suspend(&context, &ready, check), "request must authorize its execution context");
+    context.enable(&context);
+    require(!RequestAwait::suspend(&ready, &ready, check), "nested execution must not suspend the outer request");
+    require(RequestAwait::suspend(&context, &ready, check), "authorized execution must register its wait");
+    require(context.is_pending() && !context.is_ready(), "pending is distinct from ready");
+    require(!RequestAwait::suspend(&context, &ready, check), "pending wait must not be overwritten");
+    {
+      RequestAwait nested;
+      RequestAwaitGuard nested_guard(nested);
+      require(!RequestAwait::suspend(&context, &ready, check), "nested scope must isolate authorization");
+    }
+    require(RequestAwait::current() == &context, "nested scope must restore the original wait context");
+    ready = true;
+    require(context.is_ready(), "completion must make the request resumable");
+    context.reset_pending();
+    require(!context.is_pending() && !context.is_ready(), "resume must clear the previous wait");
+    context.cancel(OB_CANCELED);
+    require(OB_CANCELED == context.cancel_ret(), "shutdown cancellation must be preserved");
+    require(!RequestAwait::suspend(&context, &ready, check), "cancelled requests must not suspend again");
+    context.reset();
+    require(OB_SUCCESS == context.cancel_ret(), "new request must not inherit cancellation");
+    require(!RequestAwait::suspend(&context, &ready, check), "new request must not inherit authorization");
+  }
+  require(nullptr == RequestAwait::current(), "request scope must restore the previous thread context");
+}
+
+void test_resumed_processor_exception()
+{
+  using oceanbase::lib::RequestAwait;
+  using oceanbase::lib::RequestAwaitGuard;
+  using oceanbase::rpc::ObRequest;
+  using oceanbase::rpc::frame::ObReqProcessor;
+  class ProbeProcessor final : public ObReqProcessor {
+  public:
+    int run() override
+    {
+      if (runs_++ == 0) {
+        require(RequestAwait::suspend(this, this, [](const void *) { return true; }),
+                "probe request must suspend before throwing on resume");
+        return OB_EAGAIN;
+      }
+      throw OB_EXCEPTION<OB_ALLOCATE_MEMORY_FAILED>();
+    }
+    int runs_ = 0;
+  } probe;
+  class ProbeTranslator final : public oceanbase::rpc::frame::ObReqTranslator {
+  public:
+    explicit ProbeTranslator(ObReqProcessor &processor) : processor_(processor) {}
+    int release(ObReqProcessor *processor) override
+    {
+      released_ = processor;
+      ++releases_;
+      return OB_SUCCESS;
+    }
+    ObReqProcessor *get_processor(ObRequest &) override
+    {
+      ++translations_;
+      return &processor_;
+    }
+    ObReqProcessor &processor_;
+    ObReqProcessor *released_ = nullptr;
+    int translations_ = 0;
+    int releases_ = 0;
+  } translator(probe);
+  RequestAwait await;
+  RequestAwaitGuard await_guard(await);
+  await.enable(&probe);
+  ObAddr address;
+  oceanbase::omt::ObWorkerProcessor processor(translator, address);
+  oceanbase::omt::ObThWorker worker;
+  oceanbase::lib::Worker *previous = &THIS_WORKER;
+  oceanbase::lib::Worker::set_worker_to_thread_local(&worker);
+  ObRequest request(ObRequest::OB_TASK);
+  ObReqProcessor *retained = nullptr;
+  const int first_ret = processor.process(request, retained);
+  const bool suspended = await.is_pending() && retained == &probe && translator.releases_ == 0;
+  await.reset_pending();
+  const int resume_ret = processor.process(request, retained);
+  oceanbase::lib::Worker::set_worker_to_thread_local(previous);
+  require(OB_EAGAIN == first_ret && suspended, "pending processor must be retained without release");
+  require(OB_ALLOCATE_MEMORY_FAILED == resume_ret, "resumed exception must retain its error code");
+  require(nullptr == retained && 1 == translator.releases_ && &probe == translator.released_,
+          "exception must release the retained processor exactly once");
+  require(1 == translator.translations_ && 2 == probe.runs_, "resume must not translate a new processor");
+  std::puts("PASS resumed processor exceptions preserve errors and release ownership exactly once");
+}
+
 void test_background_progress(const char *url, bool schedule = true)
 {
   Inputs inputs;
@@ -469,6 +571,73 @@ void test_background_admission(const char *url)
   resources().check_empty();
 }
 
+void test_nonblocking_admission(const char *url)
+{
+  Inputs held(1, "{\"messages\":[{\"content\":\"native-admission\"}]}");
+  Inputs ready(1);
+  TrackingAllocator allocator;
+  TrackingAllocator ready_allocator;
+  {
+    ObAIFuncClient clients[65];
+    for (int64_t index = 0; index < 64; ++index) {
+      initialize(clients[index], allocator, held, url);
+      require(clients[index].send_post_batch_no_wait(held.data) == OB_SUCCESS, "prepare full admission gate");
+      require(clients[index].start_async() == OB_SUCCESS, "fill admission gate");
+    }
+    initialize(clients[64], ready_allocator, ready, url);
+    require(clients[64].send_post_batch_no_wait(ready.data) == OB_SUCCESS, "prepare nonblocking admission");
+    const auto started = std::chrono::steady_clock::now();
+    require(clients[64].start_async(false) == OB_SUCCESS, "register nonblocking admission");
+    require(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(250),
+            "full admission must return without waiting for a network slot");
+    require(clients[64].is_waiting_for_admission(), "full scheduler must retain pending admission");
+    require(clients[64].start_async(false) == OB_INIT_TWICE, "pending admission must reject duplicate submission");
+    bool finished = true;
+    require(clients[64].poll_batch(finished) == OB_SUCCESS && !finished, "full scheduler must remain pending");
+    clients[0].reset();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!finished) {
+      require(std::chrono::steady_clock::now() < deadline, "pending admission did not recover its slot");
+      require(clients[64].poll_batch(finished, 20) == OB_SUCCESS, "pending admission failed after slot release");
+    }
+    ObArray<ObJsonObject *> responses;
+    require(clients[64].get_batch_result(responses) == OB_SUCCESS && responses.count() == 1,
+            "pending admission lost its prepared request");
+    clients[64].reset();
+    const auto retained_results = ready_allocator.outstanding();
+    initialize(clients[0], allocator, held, url);
+    require(clients[0].send_post_batch_no_wait(held.data) == OB_SUCCESS, "refill admission gate");
+    require(clients[0].start_async() == OB_SUCCESS, "restore full scheduler");
+    initialize(clients[64], ready_allocator, ready, url);
+    require(clients[64].send_post_batch_no_wait(ready.data) == OB_SUCCESS, "prepare pending cancellation");
+    require(clients[64].start_async(false) == OB_SUCCESS && clients[64].is_waiting_for_admission(),
+            "register pending cancellation");
+    clients[64].reset();
+        require(ready_allocator.outstanding() == retained_results, "pending cancellation retained request memory");
+        clients[64].set_timeout_sec(1);
+        require(clients[64].init(ready_allocator, ObString::make_string(url), ready.headers) == OB_SUCCESS,
+          "initialize pending admission deadline");
+        require(clients[64].send_post_batch_no_wait(ready.data) == OB_SUCCESS, "prepare pending admission deadline");
+        require(clients[64].start_async(false) == OB_SUCCESS && clients[64].is_waiting_for_admission(),
+          "deadline test must wait for network capacity");
+        finished = false;
+        int result = OB_SUCCESS;
+        const auto timeout_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!finished && OB_SUCCESS == result) {
+          require(std::chrono::steady_clock::now() < timeout_deadline, "pending admission exceeded its deadline");
+          result = clients[64].poll_batch(finished, 20);
+        }
+        require(finished && result == OB_TIMEOUT, "pending admission must retain the original timeout");
+        clients[64].reset();
+        require(ready_allocator.outstanding() == retained_results, "pending deadline retained request memory");
+    for (ObAIFuncClient &client : clients) {
+      client.reset();
+    }
+    require(allocator.outstanding() == 0, "pending admission or cancellation retained memory");
+  }
+  resources().check_empty();
+}
+
 void test_background_shutdown(const char *url)
 {
   Inputs held(1, "{\"messages\":[{\"content\":\"native-hold\"}]}");
@@ -495,7 +664,30 @@ void test_background_shutdown(const char *url)
   resources().check_empty();
 }
 
-void test_shared_pipeline_budget(const char *url, bool background = false)
+void test_global_pipeline_budget()
+{
+  const int64_t limit = ObAIFuncClient::pipeline_buffer_limit();
+  int64_t first = 0;
+  int64_t second = 0;
+  require(limit > 1 && ObAIFuncClient::pipeline_buffer_usage() == 0, "initial global pipeline budget");
+  require(ObAIFuncClient::reserve_pipeline_buffer(first, limit, limit - 1) == OB_SUCCESS,
+    "first pipeline reserves global quota");
+  require(ObAIFuncClient::reserve_pipeline_buffer(second, limit, 2) == OB_SIZE_OVERFLOW,
+    "independent pipelines must share the global limit");
+  require(second == 0 && first == limit - 1 && ObAIFuncClient::pipeline_buffer_usage() == limit - 1,
+    "global admission failure must roll back only its own local charge");
+  require(ObAIFuncClient::reserve_pipeline_buffer(second, 1, 2) == OB_SIZE_OVERFLOW,
+    "local admission failure must not acquire global quota");
+  ObAIFuncClient::release_pipeline_buffer(first, first);
+  require(ObAIFuncClient::reserve_pipeline_buffer(second, limit, limit) == OB_SUCCESS,
+    "released global quota must be reusable");
+  ObAIFuncClient::release_pipeline_buffer(second, second);
+  require(first == 0 && second == 0 && ObAIFuncClient::pipeline_buffer_usage() == 0,
+    "global quota must return to zero after both pipelines finish");
+}
+
+void test_shared_pipeline_budget(const char *url, bool background = false,
+                                int64_t buffer_limit = ObAIFuncClient::MAX_BATCH_BYTES)
 {
   Inputs inputs(1);
   TrackingAllocator first_allocator;
@@ -504,14 +696,14 @@ void test_shared_pipeline_budget(const char *url, bool background = false)
   {
     ObAIFuncClient first;
     ObAIFuncClient second;
-    first.set_shared_buffer_usage(shared_bytes);
-    second.set_shared_buffer_usage(shared_bytes);
+    first.set_shared_buffer_usage(shared_bytes, buffer_limit);
+    second.set_shared_buffer_usage(shared_bytes, buffer_limit);
     initialize(first, first_allocator, inputs, url);
     initialize(second, second_allocator, inputs, url);
     require(first.send_post_batch_no_wait(inputs.data) == OB_SUCCESS, "submit first shared-budget batch");
     const int64_t first_bytes = shared_bytes;
     require(first_bytes > 0, "requests must charge shared quota");
-    int64_t retained_bytes = ObAIFuncClient::MAX_BATCH_BYTES - first_bytes - 1;
+    int64_t retained_bytes = buffer_limit - first_bytes - 1;
     shared_bytes += retained_bytes;
     require(second.send_post_batch_no_wait(inputs.data) == OB_SIZE_OVERFLOW,
             "request preparation must honor quota already retained by another batch");
@@ -521,7 +713,14 @@ void test_shared_pipeline_budget(const char *url, bool background = false)
     shared_bytes -= retained_bytes;
     require(second.send_post_batch_no_wait(inputs.data) == OB_SUCCESS, "released quota must allow resubmission");
     require(resources().attached.size() == 2, "two batches must own independent active requests");
-    retained_bytes = ObAIFuncClient::MAX_BATCH_BYTES - shared_bytes;
+    if (buffer_limit > ObAIFuncClient::MAX_BATCH_BYTES) {
+      shared_bytes += ObAIFuncClient::MAX_BATCH_BYTES;
+      second.clean_up();
+      require(second.send_post_batch_no_wait(inputs.data) == OB_SUCCESS,
+              "larger shared budget must admit batches beyond the original 64MiB total");
+      shared_bytes -= ObAIFuncClient::MAX_BATCH_BYTES;
+    }
+    retained_bytes = buffer_limit - shared_bytes;
     shared_bytes += retained_bytes;
     if (background) {
       require(first.start_async() == OB_SUCCESS, "schedule first shared-budget batch");
@@ -609,6 +808,13 @@ void test_pipeline_diagnosis_and_empty_rescan()
   for (ObItemType type : {T_FUN_SYS_AI_EMBED, T_FUN_SYS_AI_COMPLETE}) {
     ObArenaAllocator allocator;
     ObSQLSessionInfo session;
+    require(session.load_sys_variable(allocator, ObString::make_string("ai_pipeline_slots"), ObIntType,
+          ObString::make_string("2"), ObString::make_string("1"), ObString::make_string("1024"),
+                oceanbase::share::ObSysVarFlag::SESSION_SCOPE, false) == OB_SUCCESS, "load lifecycle slot count");
+    require(session.load_sys_variable(allocator, ObString::make_string("ai_pipeline_memory_limit"), ObIntType,
+          ObString::make_string("67108864"), ObString::make_string("1048576"),
+                ObString::make_string("1099511627776"), oceanbase::share::ObSysVarFlag::SESSION_SCOPE, false) == OB_SUCCESS,
+        "load lifecycle memory budget");
     ObExecContext context(allocator);
     context.set_my_session(&session);
     require(context.create_physical_plan_ctx() == OB_SUCCESS, "create lifecycle plan context");
@@ -810,6 +1016,9 @@ int main(int argc, char **argv)
     std::puts("PASS response allocation failure and peer cleanup");
     test_pending_lifecycle(url);
     std::puts("PASS 32 no_wait cancellations, queued work, reinitialization and pending destruction");
+    test_request_await_protocol();
+    test_resumed_processor_exception();
+    std::puts("PASS opt-in request wait ownership, readiness and nested-scope isolation");
     test_background_progress(url);
     std::puts("PASS network completion without SQL-thread polling");
     test_background_cancellation(url);
@@ -817,10 +1026,16 @@ int main(int argc, char **argv)
     test_background_deadline_and_peer_progress(url);
     std::puts("PASS independent background peer progress and autonomous deadline");
     test_background_admission(url);
+    test_nonblocking_admission(url);
+    std::puts("PASS nonblocking network admission, duplicate rejection, cancellation and slot recovery");
     std::puts("PASS bounded background admission, deadline and slot recovery");
     test_shared_pipeline_budget(url);
+    test_global_pipeline_budget();
+    std::puts("PASS cross-query pipeline memory limit, rollback and exact recovery");
     std::puts("PASS shared pipeline admission/response quota and exact rollback");
     test_shared_pipeline_budget(url, true);
+    test_shared_pipeline_budget(url, false, 1024 * 1024);
+    test_shared_pipeline_budget(url, true, 128 * 1024 * 1024);
     std::puts("PASS background batches share admission/response quota and exact rollback");
     test_recovery_and_result_lifetime(url);
     std::puts("PASS 16 failure/recovery cycles and caller-owned result lifetime");

@@ -55,7 +55,10 @@ public:
       ctx_(ctx),
       session_(session),
       retry_ctrl_(retry_ctrl),
-      sender_(sender)
+      sender_(sender),
+      response_row_count_(0),
+      response_first_row_(true),
+      response_suspended_(false)
   {
   }
   virtual ~ObQueryDriver()
@@ -115,6 +118,9 @@ protected:
   sql::ObSQLSessionInfo &session_;
   sql::ObQueryRetryCtrl &retry_ctrl_;
   ObMPPacketSender &sender_;
+  int64_t response_row_count_;
+  bool response_first_row_;
+  bool response_suspended_;
   /* const */
   /* disallow copy & assign */
   DISALLOW_COPY_AND_ASSIGN(ObQueryDriver);

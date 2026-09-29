@@ -37,7 +37,7 @@ ObSyncPlanDriver::ObSyncPlanDriver(const share::ObGlobalContext &gctx,
                                    ObMPPacketSender &sender,
                                    int32_t iteration_count)
     : ObQueryDriver(gctx, ctx, session, retry_ctrl, sender),
-    iteration_count_(iteration_count)
+    iteration_count_(iteration_count), result_opened_(false)
 {
 }
 
@@ -56,7 +56,7 @@ int ObSyncPlanDriver::response_result(ObMySQLResultSet &result)
     ret = OB_NOT_INIT;
     LOG_WARN("should have set plan to result set", K(ret));
   } else if (OB_FAIL(session_.get_autocommit(ac))) {
-  } else if (OB_FAIL(result.open())) {
+  } else if (!result_opened_ && OB_FAIL(result.open())) {
     int cret = OB_SUCCESS;
     int cli_ret = OB_SUCCESS;
     // move result.close() below, after test_and_save_retry_state().
@@ -85,6 +85,7 @@ int ObSyncPlanDriver::response_result(ObMySQLResultSet &result)
     }
     ret = cli_ret;
   } else if (result.is_with_rows()) {
+    result_opened_ = true;
     // is the result set, no retries after starting to send data
     bool can_retry = false;
     if (OB_FAIL(response_query_result(result,
@@ -92,6 +93,10 @@ int ObSyncPlanDriver::response_result(ObMySQLResultSet &result)
                                       result.has_more_result(),
                                       can_retry,
                                       OB_INVALID_COUNT))) {
+      if (OB_EAGAIN == ret && nullptr != lib::RequestAwait::current() &&
+          lib::RequestAwait::current()->is_pending()) {
+        return ret;
+      }
       LOG_WARN("response query result fail", K(ret));
       // move result.close() below, after test_and_save_retry_state().
       if (can_retry) {
@@ -214,6 +219,7 @@ int ObSyncPlanDriver::response_result(ObMySQLResultSet &result)
       }
     }
   }
+  result_opened_ = false;
   return ret;
 }
 }/* ns observer*/

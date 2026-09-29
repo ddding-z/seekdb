@@ -18,6 +18,7 @@
 
 #include "rpc/frame/ob_sql_processor.h"
 #include "rpc/ob_sql_request_operator.h"
+#include "lib/worker.h"
 using namespace oceanbase::common;
 using namespace oceanbase::rpc::frame;
 
@@ -26,20 +27,29 @@ int ObSqlProcessor::run()
   int ret = OB_SUCCESS;
   bool deseri_succ = true;
 
-  run_timestamp_ = ObTimeUtility::current_time();
-  if (OB_FAIL(setup_packet_sender())) {
-    deseri_succ = false;
-    LOG_WARN("setup packet sender fail", K(ret));
-  } else if (OB_FAIL(deserialize())) {
-    deseri_succ = false;
-    LOG_WARN("deserialize argument fail", K(ret));
-  } else if (OB_FAIL(before_process())) {
-  } else {
+  if (!processing_) {
+    run_timestamp_ = ObTimeUtility::current_time();
+    if (OB_FAIL(setup_packet_sender())) {
+      deseri_succ = false;
+      LOG_WARN("setup packet sender fail", K(ret));
+    } else if (OB_FAIL(deserialize())) {
+      deseri_succ = false;
+      LOG_WARN("deserialize argument fail", K(ret));
+    } else if (OB_FAIL(before_process())) {
+    }
+  }
+  if (OB_SUCC(ret)) {
+    processing_ = true;
     req_->set_trace_point(ObRequest::OB_REQUEST_SQL_PROCESSOR_RUN);
     if (OB_FAIL(process())) {
     } else {
     }
   }
+  if (OB_EAGAIN == ret && nullptr != oceanbase::lib::RequestAwait::current() &&
+      oceanbase::lib::RequestAwait::current()->is_pending()) {
+    return ret;
+  }
+  processing_ = false;
   int tmp_ret = OB_SUCCESS;
   int tmp_ret_2 = OB_SUCCESS;
   if (OB_TMP_FAIL(response(ret))) {

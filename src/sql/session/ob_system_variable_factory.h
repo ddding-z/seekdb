@@ -5208,6 +5208,20 @@ public:
   inline virtual share::ObSysVarClassType get_type() const { return share::SYS_VAR_OB_SPARSE_DROP_RATIO_SEARCH; }
   inline virtual const common::ObObj &get_global_default_value() const { return share::ObSysVariables::get_default_value(718); }
 };
+class ObSysVarAiPipelineSlots : public ObIntSysVar
+{
+public:
+  ObSysVarAiPipelineSlots() : ObIntSysVar(NULL, NULL, NULL, NULL, NULL) {}
+  inline virtual share::ObSysVarClassType get_type() const { return share::SYS_VAR_AI_PIPELINE_SLOTS; }
+  inline virtual const common::ObObj &get_global_default_value() const { return share::ObSysVariables::get_default_value(719); }
+};
+class ObSysVarAiPipelineMemoryLimit : public ObIntSysVar
+{
+public:
+  ObSysVarAiPipelineMemoryLimit() : ObIntSysVar(NULL, NULL, NULL, NULL, NULL) {}
+  inline virtual share::ObSysVarClassType get_type() const { return share::SYS_VAR_AI_PIPELINE_MEMORY_LIMIT; }
+  inline virtual const common::ObObj &get_global_default_value() const { return share::ObSysVariables::get_default_value(720); }
+};
 
 
 class ObSysVarFactory

@@ -22,8 +22,9 @@ class AIFuncOp : public ObOperator
 {
 public:
   AIFuncOp(ObExecContext &ctx, const ObOpSpec &spec, ObOpInput *input)
-      : ObOperator(ctx, spec, input), buffered_bytes_(0), slots_{nullptr, nullptr},
-        head_(0), count_(0), input_end_(false) {}
+      : ObOperator(ctx, spec, input), buffered_bytes_(0), buffer_limit_(0),
+        slots_(nullptr), slot_count_(0),
+        head_(0), count_(0), input_end_(false), pending_input_(nullptr) {}
   int inner_open() override;
   int inner_rescan() override;
   int inner_get_next_row() override;
@@ -37,14 +38,18 @@ private:
   int submit(Slot &slot);
   int poll();
   int output(Slot &slot, int64_t max_row_cnt);
+  static bool can_resume(const void *state);
   void reset_slot(Slot &slot);
   void reset_pipeline();
   ObBatchResultHolder child_frame_;
   int64_t buffered_bytes_;
-  Slot *slots_[2];
+  int64_t buffer_limit_;
+  Slot **slots_;
+  int64_t slot_count_;
   int64_t head_;
   int64_t count_;
   bool input_end_;
+  const ObBatchRows *pending_input_;
   DISALLOW_COPY_AND_ASSIGN(AIFuncOp);
 };
 

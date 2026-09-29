@@ -35,6 +35,7 @@ public:
     max_used_ = cur_used_ > max_used_ ? cur_used_ : max_used_;
   }
   virtual ~ObProcessMallocCallback() {}
+  int64_t get_cur_used() const { return cur_used_; }
 
   virtual void operator()(const ObMemAttr &attr, int64_t add_size) override
   {

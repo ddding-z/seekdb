@@ -296,6 +296,9 @@ DEF_PARAM(_rowsets_max_rows, INT, OB_CLUSTER_PARAMETER, "256", "[0, 65535]",
 DEF_PARAM(_ctx_memory_limit, STR_WITH_CHECKER, OB_CLUSTER_PARAMETER, "", common::ObCtxMemoryLimitChecker,
         "specifies server runtime context memory limits.",
         ObParameterAttr(Section::RUNTIME, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_PARAM(ai_pipeline_total_memory_limit, CAP, OB_CLUSTER_PARAMETER, "1G", "[1M,1T]",
+        "shared logical buffer limit for all AI function pipelines in this server",
+        ObParameterAttr(Section::RUNTIME, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_PARAM(_enable_convert_real_to_decimal, BOOL, OB_CLUSTER_PARAMETER, "False",
          "specifies whether convert column type float(M,D), double(M,D) to decimal(M,D) in DDL",
          ObParameterAttr(Section::RUNTIME, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));

@@ -88,7 +88,7 @@ public:
   static thread_local bool thread_name_set_;
 private:
   void set_th_worker_thread_name();
-  void process_request(rpc::ObRequest &req);
+  void process_request(rpc::ObRequest &req, rpc::frame::ObReqProcessor *&processor);
 
 private:
   ObWorkerProcessor procor_;

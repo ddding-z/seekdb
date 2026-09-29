@@ -62,6 +62,7 @@ protected:
   int is_readonly_stmt(ObMySQLResultSet &result, bool &is_readonly);
   void assign_sql(const char * sql, int64_t sql_length) { sql_.assign_ptr(sql, sql_length); }
 private:
+  int resume_response();
   int response_result(ObMySQLResultSet &result, bool force_sync_resp, bool &async_resp_used);
   int get_schema_info_(ObCachedSchemaGuardInfo *cache_info,
                       share::schema::ObSchemaGetterGuard *&schema_guard,
@@ -118,6 +119,8 @@ public:
 private:
   DISALLOW_COPY_AND_ASSIGN(ObMPQuery);
 private:
+  struct ResponseState;
+  ResponseState *response_state_;
   //Lifecycle in process_single_stmt()
   sql::ObSqlCtx ctx_;
   sql::ObQueryRetryCtrl retry_ctrl_;
