@@ -46,7 +46,8 @@ public:
 private:
   friend class AIFuncOp;
   static int prepare_input(const ObExpr &expr, ObEvalCtx &ctx, MultimodeAlloctor &allocator,
-                           ObString &model_id, ObString &prompt, ObJsonObject *&config);
+                           ObString &model_id, ObString &prompt, ObJsonObject *&config,
+                           ObJsonObject **fields = nullptr);
   static constexpr int MODEL_IDX = 0;
   static constexpr int PROMPT_IDX = 1;
   static constexpr int CONFIG_IDX = 2;

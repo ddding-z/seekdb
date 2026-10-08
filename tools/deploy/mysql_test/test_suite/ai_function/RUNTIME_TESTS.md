@@ -1,6 +1,131 @@
 # AI Function Runtime Regression
 
-Latest validation (2026-09-28): all **86 SQL contracts**, **five fixture self-tests**, the expanded [resource reliability tests](#resource-reliability-tests), and a separate server-shutdown contract passed with [SQL worker suspension](#sql-worker-suspension-2026-09-28). Eligible single-statement AI pipeline SELECTs now return their worker while waiting and resume from the retained result cursor. Earlier results are retained below as historical evidence.
+Latest validation (2026-09-29): the Debug build, all **105 SQL contracts** (including ten [global SOLO contracts](#global-solo-prompt-reordering-2026-09-29)), **five fixture self-tests**, the [native resource tests](#resource-reliability-tests), and the separate server-shutdown contract passed. The earlier [suspended-statement cache lifetime fix](#suspended-statement-cache-lifetime-2026-09-29) remains covered. Eligible single-statement AI pipeline SELECTs return their worker while waiting and resume from the retained result cursor.
+
+## Global SOLO Prompt Reordering (2026-09-29)
+
+A two-argument `AI_PROMPT` whose second argument is a JSON object selects global
+SOLO when used directly as the prompt of a supported top-level `AI_COMPLETE`.
+No separate field-reordering switch is required. The model and its endpoint must
+already be registered:
+
+```sql
+SELECT id,
+       AI_COMPLETE(
+         'my_completion_model',
+         AI_PROMPT('Classify the text using the named fields.',
+                   JSON_OBJECT('id', id, 'text', prompt))) AS answer
+FROM inputs
+ORDER BY id;
+```
+
+Prefix this query with `EXPLAIN` to check for `AI SOLO GLOBAL`. Existing string
+prompts and positional `AI_PROMPT(template, string_args...)` keep their existing
+meaning and do not opt into field reordering. Passing a previously stored
+structured prompt object as a plain column does not select the new mode.
+
+### Input And Execution Contract
+
+- The instruction, model and optional completion configuration must be static
+  constants. The JSON object must be nonempty and have the same field names in
+  every row. Field values may include JSON nulls, numbers, strings and nested
+  values; a NULL, array or scalar in place of the field object is invalid.
+- The operator first drains its entire child, retaining input rows and their
+  original row numbers. It then plans one global column order and one global row
+  order. Neither collection nor planning sends model requests. Empty input sends
+  nothing. An invalid final input row fails without sending earlier rows.
+- SOLO uses exact serialized JSON value bytes for dictionary encoding, then
+  repeatedly selects the column with the fewest distinct current-prefix/value
+  pairs. A final lexicographic sort uses the selected columns and original row
+  numbers to break ties. There is no SQL-collation equality, sampling or
+  per-network-batch replanning. The greedy column order is not a claim of a
+  globally optimal layout across all possible field permutations.
+- After planning, requests use a fixed GGR-style task prefix followed by a valid
+  JSON object in the selected field order. Names stay attached to their values,
+  and JSON escaping is preserved. Each input row remains a separate prompt;
+  duplicate rows are not deduplicated. Field reordering preserves the supplied
+  data, not a guarantee of identical model answers.
+- The existing asynchronous slots consume consecutive portions of the global
+  row order. Responses are mapped back to original rows, and output follows the
+  child input order. Explicit SQL ordering remains intact; without `ORDER BY`,
+  SQL does not promise a particular result order. Network submission order does
+  not guarantee the inference service's prefill order or cache hits.
+- Retry, deadline, cancellation and worker suspension reuse the existing
+  pipeline mechanisms. A retry replays the failed request, not the entire query.
+  Collection and planning also check query status. Local failure cannot retract
+  requests already accepted by a model service during the execution phase.
+
+### Scope And Memory
+
+This version supports one top-level completion over a single-worker upstream
+plan, including ordinary filters, expressions, joins and aggregation. The target
+AI expression cannot be evaluated in that upstream plan. Additional AI calls in
+retained upstream expressions, including HAVING, GROUP BY and JOIN conditions,
+are rejected. Scalar execution, dynamic instruction/model/options, multiple AI
+calls, AI-dependent ordering, LIMIT, DISTINCT, window functions, set operations,
+subqueries and parallel/exchange plans are not supported. Unsupported paths
+reject structured input instead of silently executing it one row at a time.
+AI_EMBED and AI_RERANK do not use SOLO.
+
+The full input store, serialized field data and SOLO working allocations share
+the existing `ai_pipeline_memory_limit` and instance-wide
+`ai_pipeline_total_memory_limit` accounting with network state. Collection and
+planning are limited to half the local budget, leaving headroom for execution;
+after planning, retained input and results may use the full local budget together
+with active requests. The default local limit remains 64MiB, and
+`ai_pipeline_slots` still controls in-flight batch slots, not planning windows.
+Temporary expression/JSON buffers and other existing exclusions mean this is
+not a process RSS cap or a guarantee that every response will fit.
+
+There is no disk spill. A collection/planning budget failure returns size error
+4019 before HTTP submission; it does not switch to a windowed layout. Later
+request/response/result overflows can still fail an executing query. Existing
+4MiB serialized-request, 8MiB response and 64MiB per-client batch bounds remain.
+
+### SOLO Verification
+
+All ten new SQL contracts passed within the complete **105/105** run. They cover
+cross-batch global ordering and original-row mapping, invalid-final-row zero
+submission, conditional-prefix column selection against an independent
+reference, JSON types/escaping/case/duplicates, retry with out-of-order slots,
+join/aggregation inputs, unsupported forms and changing fields, local/global
+memory failure and quota reuse, cancellation/deadline/provider-error cleanup,
+and request-worker release. Native diagnosis and repeated empty-input rescan
+checks now also exercise SOLO mode.
+
+The Debug build, native resource suite, five fixture self-tests and independent
+normal-shutdown check passed. Tests used private temporary databases and local
+HTTP mocks, not a real model or the existing debug database. This does not verify
+rescan with retained rows/in-flight requests, every operator allocation failure,
+whole-heap sanitizers, or real-model output quality, prefix-cache hits and speedup.
+
+## Suspended Statement Cache Lifetime (2026-09-29)
+
+Larger real-model queries exposed error 4014 after partial results. The session
+checker could acquire `query_lock` while an AI statement was suspended and expire
+the session's cached schema guard after ten seconds. The retained statement still
+borrowed that guard. Short or single-batch tests did not necessarily cross both
+the expiry interval and another schema-dependent batch.
+
+The checker now reverts the schema cache and refreshes cached runtime configuration
+only for `SESSION_SLEEP`, preserving the pre-suspension assumption that an active
+statement owns those caches. Query/session deadlines, cancellation, transaction
+timeout checks, and idle-session cache reclamation remain enabled.
+
+The new `test_pipeline_many_batches_preserve_rows_after_repeated_suspension`
+uses 2,049 distinct 6KB prompts, the default 256-row vector size, and one/two
+pipeline slots. Response gates keep the query suspended across the ten-second
+expiry interval and then verify every row, exact response text, call count, tail,
+and connection reuse. It reproduced 4014 before the fix in both slot modes and
+passed after it. The full 95-contract run and shutdown check also passed.
+
+Run just this regression, or repeat `--case` to select other contracts:
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_runtime_contracts.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb" \
+  --case test_pipeline_many_batches_preserve_rows_after_repeated_suspension
+```
 
 Run from the repository root after a Debug build:
 

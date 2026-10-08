@@ -545,11 +545,11 @@ bool ObSQLSessionMgr::CheckSessionFunctor::operator()(sql::ObSQLSessionMgr::Key 
           LOG_INFO("session is timeout, kill this session", K(key.sessid_));
           ret = sess_mgr_->kill_session(*sess_info);
         } else {
-          //with the help ofsession traversaloffunctionality，tryrevert sessioncacheofschema guard，
-          // Avoid holding guard for a long time, causing schema mgr slots to be unable to release
-          sess_info->get_cached_schema_guard_info().try_revert_schema_guard();
-          // Refresh cached runtime configuration periodically.
-          sess_info->refresh_runtime_config();
+          // Suspended statements release query_lock but still borrow these session caches.
+          if (ObSQLSessionState::SESSION_SLEEP == sess_info->get_session_state()) {
+            sess_info->get_cached_schema_guard_info().try_revert_schema_guard();
+            sess_info->refresh_runtime_config();
+          }
           // send client commit result if txn commit timeout
           if (OB_FAIL(sess_info->is_trx_commit_timeout(commit_cb, callback_retcode))) {
           } else if (commit_cb) {

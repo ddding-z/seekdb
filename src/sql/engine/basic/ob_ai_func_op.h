@@ -14,8 +14,9 @@ class AIFuncSpec : public ObOpSpec
   OB_UNIS_VERSION_V(1);
 public:
   AIFuncSpec(common::ObIAllocator &allocator, ObPhyOperatorType type)
-      : ObOpSpec(allocator, type), ai_expr_(nullptr) {}
+      : ObOpSpec(allocator, type), ai_expr_(nullptr), solo_(false) {}
   ObExpr *ai_expr_;
+  bool solo_;
 };
 
 class AIFuncOp : public ObOperator
@@ -24,7 +25,7 @@ public:
   AIFuncOp(ObExecContext &ctx, const ObOpSpec &spec, ObOpInput *input)
       : ObOperator(ctx, spec, input), buffered_bytes_(0), buffer_limit_(0),
         slots_(nullptr), slot_count_(0),
-        head_(0), count_(0), input_end_(false), pending_input_(nullptr) {}
+        head_(0), count_(0), input_end_(false), pending_input_(nullptr), solo_(nullptr) {}
   int inner_open() override;
   int inner_rescan() override;
   int inner_get_next_row() override;
@@ -33,11 +34,16 @@ public:
   void destroy() override;
 private:
   struct Slot;
+  struct SoloState;
   const AIFuncSpec &ai_spec() const { return static_cast<const AIFuncSpec &>(spec_); }
   int reserve(Slot &slot, int64_t bytes);
   int submit(Slot &slot);
   int poll();
   int output(Slot &slot, int64_t max_row_cnt);
+  int collect_solo();
+  int submit_solo(Slot &slot);
+  int poll_solo();
+  int next_solo(int64_t max_row_cnt, bool &suspended);
   static bool can_resume(const void *state);
   void reset_slot(Slot &slot);
   void reset_pipeline();
@@ -50,6 +56,7 @@ private:
   int64_t count_;
   bool input_end_;
   const ObBatchRows *pending_input_;
+  SoloState *solo_;
   DISALLOW_COPY_AND_ASSIGN(AIFuncOp);
 };
 

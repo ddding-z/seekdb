@@ -805,7 +805,7 @@ public:
 
 void test_pipeline_diagnosis_and_empty_rescan()
 {
-  for (ObItemType type : {T_FUN_SYS_AI_EMBED, T_FUN_SYS_AI_COMPLETE}) {
+  for (int64_t mode = 0; mode < 3; ++mode) {
     ObArenaAllocator allocator;
     ObSQLSessionInfo session;
     require(session.load_sys_variable(allocator, ObString::make_string("ai_pipeline_slots"), ObIntType,
@@ -825,11 +825,12 @@ void test_pipeline_diagnosis_and_empty_rescan()
     PipelineInput input(context, input_spec);
     require(input.open() == OB_SUCCESS, "open lifecycle input");
     ObExpr expression;
-    expression.type_ = type;
+    expression.type_ = mode == 0 ? T_FUN_SYS_AI_EMBED : T_FUN_SYS_AI_COMPLETE;
     AIFuncSpec spec(allocator, PHY_AI_FUNC);
     spec.plan_ = &plan;
     spec.max_batch_size_ = 16;
     spec.ai_expr_ = &expression;
+    spec.solo_ = mode == 2;
     auto *pipeline = OB_NEWx(AIFuncOp, &allocator, context, spec, nullptr);
     require(pipeline != nullptr, "allocate lifecycle operator");
     ObOperator *children[] = {&input};
@@ -1040,7 +1041,7 @@ int main(int argc, char **argv)
     test_recovery_and_result_lifetime(url);
     std::puts("PASS 16 failure/recovery cycles and caller-owned result lifetime");
     test_pipeline_diagnosis_and_empty_rescan();
-    std::puts("PASS both AI functions: diagnosis passthrough and empty-input physical rescan");
+    std::puts("PASS both AI functions and global SOLO: diagnosis passthrough and empty-input physical rescan");
     test_background_shutdown(url);
     std::puts("PASS scheduler shutdown cancels in-flight work and rejects new submissions");
     resources().check_empty();

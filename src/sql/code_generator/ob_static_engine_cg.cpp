@@ -1036,6 +1036,7 @@ int ObStaticEngineCG::generate_spec(LogAIFunc &op, AIFuncSpec &spec, const bool 
 {
   int ret = OB_SUCCESS;
   UNUSED(in_root_job);
+  spec.solo_ = op.is_solo();
   if (OB_ISNULL(op.get_ai_expr())) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(generate_rt_expr(*op.get_ai_expr(), spec.ai_expr_))) {

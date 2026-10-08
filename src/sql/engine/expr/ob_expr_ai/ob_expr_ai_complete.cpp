@@ -85,9 +85,12 @@ int ObExprAIComplete::calc_result_typeN(ObExprResType &type,
 
 int ObExprAIComplete::prepare_input(const ObExpr &expr, ObEvalCtx &ctx,
                                     MultimodeAlloctor &temp_allocator, ObString &model_id,
-                                    ObString &prompt, ObJsonObject *&config)
+                                    ObString &prompt, ObJsonObject *&config, ObJsonObject **fields)
 {
   INIT_SUCC(ret);
+  if (nullptr != fields) {
+    *fields = nullptr;
+  }
   ObDatum *arg_model_id = nullptr;
   ObDatum *arg_prompt = nullptr;
   ObDatum *arg_config = nullptr;
@@ -117,9 +120,18 @@ int ObExprAIComplete::prepare_input(const ObExpr &expr, ObEvalCtx &ctx,
         LOG_WARN("prompt is not valid", K(ret));
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "prompt is not valid");
       } else if (!ObAIFuncJsonUtils::ob_is_json_array_all_str(static_cast<ObJsonArray *>(prompt_object->get_value(ObAIFuncPromptObjectUtils::prompt_args_key)))) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_WARN("prompt object is not support", K(ret));
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "prompt object is not support");
+        auto *args = static_cast<ObJsonArray *>(prompt_object->get_value(ObAIFuncPromptObjectUtils::prompt_args_key));
+        if (nullptr == fields) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "structured AI_PROMPT requires a vectorized global SOLO AI operator");
+        } else if (args->element_count() != 1 || args->get_value(0)->json_type() != ObJsonNodeType::J_OBJECT ||
+                   args->get_value(0)->element_count() == 0) {
+          ret = OB_INVALID_ARGUMENT;
+        } else {
+          *fields = static_cast<ObJsonObject *>(args->get_value(0));
+          prompt = static_cast<ObJsonString *>(prompt_object->get_value(
+                       ObAIFuncPromptObjectUtils::prompt_template_key))->get_str();
+        }
       } else if (OB_FAIL(ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(temp_allocator, prompt_object, prompt))) {
       }
     } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_prompt, expr.args_[1]->datum_meta_, expr.args_[1]->obj_meta_.has_lob_header(), prompt))) {

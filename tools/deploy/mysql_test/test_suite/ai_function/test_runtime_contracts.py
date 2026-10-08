@@ -28,6 +28,25 @@ def answer(prompt):
     return 'result:"' + prompt + '"\n'
 
 
+def solo_prompt(fields, instruction="classify record"):
+    return (f"Answer the below query:\n{instruction}\nGiven the following data:\n" +
+            json.dumps(fields, ensure_ascii=False, separators=(",", ":")))
+
+
+def solo_layout(records):
+    encoded = [{name: json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                for name, value in record.items()} for record in records]
+    remaining = list(records[0])
+    columns = []
+    while remaining:
+        column = min(remaining, key=lambda name: len({
+            tuple(record[key] for key in [*columns, name]) for record in encoded}))
+        columns.append(column)
+        remaining.remove(column)
+    order = sorted(range(len(records)), key=lambda index: tuple(encoded[index][name] for name in columns))
+    return columns, order
+
+
 def completion(content, *, finish_reason=None, refusal=None):
     choice = {"message": {"content": content}}
     if finish_reason is not None:
@@ -337,6 +356,263 @@ class RuntimeContracts(unittest.TestCase):
         self.gates.append(gate)
         return gate
 
+    def test_solo_global_layout_and_original_row_mapping(self):
+        row_count = 65
+        self.load([f"solo-{index}" for index in range(row_count)])
+        self.cursor.execute("SET ai_pipeline_slots = 1")
+        expression = ("AI_COMPLETE('contract_model', AI_PROMPT('classify record', "
+                      "JSON_OBJECT('row', id, 'bucket', MOD(id, 3), 'fixed', 'all')))")
+        self.cursor.execute("EXPLAIN SELECT /*+ OPT_PARAM('rowsets_max_rows', 16) */ "
+                            f"id, {expression} FROM inputs ORDER BY id")
+        plan = "\n".join(str(row[0]) for row in self.cursor.fetchall())
+        self.assertIn("AI SOLO GLOBAL", plan)
+        prompts = [solo_prompt({"fixed": "all", "bucket": index % 3, "row": index})
+               for index in range(row_count)]
+        order = sorted(range(row_count), key=lambda index: (str(index % 3), str(index)))
+        gate = self.gate()
+        self.server.default_reply = Reply(gate=gate)
+        worker, outcome = self.start_embedding_query(lambda: self.query_pipeline(expression))
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(
+                    lambda: len(self.server.audit) >= 16 or not worker.is_alive(), timeout=5))
+                self.assertEqual(len(self.server.audit), 16, outcome)
+                self.assertEqual(self.server.counts, Counter(prompts[index] for index in order[:16]))
+                self.assertTrue(all(record["response"] is None for record in self.server.audit))
+        finally:
+            gate.set()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome, [tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))])
+        self.assertEqual(self.server.counts, Counter(prompts))
+
+    def test_solo_invalid_final_row_submits_nothing(self):
+        expression = "AI_COMPLETE('contract_model', AI_PROMPT('classify', CAST(prompt AS JSON)))"
+        self.assertEqual(self.query_pipeline(expression), ())
+        self.assertFalse(self.server.audit)
+        self.load([json.dumps({"value": f"valid-{index}"}) for index in range(64)] + ["[]"])
+        for batch_size in (1, 16):
+            with self.subTest(batch_size=batch_size):
+                sql_error(self, 1210, lambda: self.cursor.execute(
+                    f"SELECT /*+ OPT_PARAM('rowsets_max_rows', {batch_size}) */ "
+                    f"id, {expression} FROM inputs ORDER BY id"))
+                self.assertEqual(len(self.server.audit), 0)
+        self.cursor.execute("SELECT 42")
+        self.assertEqual(self.cursor.fetchone(), (42,))
+
+    def test_solo_conditional_prefix_selection(self):
+        records = [{"a": (index // 6) % 2, "b": index % 3,
+                    "c": 2 * ((index // 6) % 2) + index % 2, "row": index} for index in range(48)]
+        columns, order = solo_layout(records)
+        self.assertEqual(columns, ["a", "c", "b", "row"])
+        self.load([json.dumps(record) for record in records])
+        self.cursor.execute("SET ai_pipeline_slots = 1")
+        expression = "AI_COMPLETE('contract_model', AI_PROMPT('classify record', CAST(prompt AS JSON)))"
+        prompts = [solo_prompt({name: record[name] for name in columns}) for record in records]
+        gates = [self.gate() for _ in range(3)]
+        for position, index in enumerate(order):
+            self.server.scenarios[prompts[index]] = [Reply(gate=gates[position // 16])]
+        worker, outcome = self.start_embedding_query(lambda: self.query_pipeline(expression))
+        try:
+            for batch, gate in enumerate(gates):
+                target = (batch + 1) * 16
+                with self.server.condition:
+                    self.assertTrue(self.server.condition.wait_for(
+                        lambda: len(self.server.audit) >= target or not worker.is_alive(), timeout=5))
+                    self.assertEqual(self.server.counts, Counter(prompts[index] for index in order[:target]),
+                                     outcome)
+                gate.set()
+        finally:
+            for gate in gates:
+                gate.set()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome, [tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))])
+
+    def test_solo_json_types_bytes_and_duplicates(self):
+        constant = {"null": None, "array": [1, True, "\u4e2d\u6587\U0001f600"],
+                    "nested": {"text": 'quote" slash\\ newline\n nul\0'}}
+        records = [{"a": value, "b": constant} for value in ("A", "a", "A", "a")]
+        self.load([json.dumps(record, ensure_ascii=False) for record in records])
+        rows = self.query_pipeline(
+            "AI_COMPLETE('contract_model', AI_PROMPT('classify record', CAST(prompt AS JSON)))")
+        prefix = 'result:"Answer the below query:\nclassify record\nGiven the following data:\n'
+        self.assertEqual([row[0] for row in rows], list(range(len(records))))
+        for index, result in rows:
+            self.assertTrue(result.startswith(prefix))
+            self.assertTrue(result.endswith('"\n'))
+            fields = json.loads(result[len(prefix):-2])
+            self.assertEqual(list(fields), ["b", "a"])
+            self.assertEqual(fields, records[index])
+            self.assertIs(fields["b"]["array"][1], True)
+        self.assertEqual(len(self.server.audit), 4)
+        self.assertEqual(sorted(self.server.counts.values()), [2, 2])
+
+    def test_solo_retry_and_out_of_order_slots(self):
+        records = [{"value": f"{64 - index:03d}"} for index in range(65)]
+        prompts = [solo_prompt(record) for record in records]
+        self.load([json.dumps(record) for record in records])
+        self.cursor.execute("SET ai_pipeline_slots = 3")
+        gates = [self.gate(), self.gate()]
+        for position, prompt in enumerate(reversed(prompts)):
+            if position < 32:
+                self.server.scenarios[prompt] = [Reply(gate=gates[position // 16])]
+        self.server.scenarios[prompts[20]] = [Reply(429, b"{}", {"Retry-After": "0"}), Reply()]
+        expression = ("AI_COMPLETE('contract_model', AI_PROMPT('classify record', CAST(prompt AS JSON)), "
+                      "'{\"temperature\":0.25,\"max_tokens\":64}')")
+        worker, outcome = self.start_embedding_query(lambda: self.query_pipeline(expression))
+        try:
+            with self.server.condition:
+                self.assertTrue(self.server.condition.wait_for(
+                    lambda: len(self.server.counts) == len(prompts) or not worker.is_alive(), timeout=5),
+                    "completed later slots must refill while earlier slots remain held")
+                self.assertEqual(set(self.server.counts), set(prompts), outcome)
+                self.assertTrue(all(record["response"] is None for record in self.server.audit
+                                    if record["prompt"] in prompts[33:]))
+        finally:
+            for gate in reversed(gates):
+                gate.set()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome, [tuple((index, answer(prompt)) for index, prompt in enumerate(prompts))])
+        self.assertEqual(self.server.counts, Counter(prompts) + Counter({prompts[20]: 1}))
+        self.assertTrue(all(body["temperature"] == 0.25 and body["max_tokens"] == 64
+                            for body in self.server.requests))
+
+    def test_solo_upstream_join_and_aggregation(self):
+        self.load([f"row-{index}" for index in range(12)])
+        queries = [
+            ("SELECT /*+ OPT_PARAM('rowsets_max_rows', 16) */ source.id, "
+             "AI_COMPLETE('contract_model', AI_PROMPT('classify record', "
+             "JSON_OBJECT('value', CONCAT(source.prompt, '/', peer.prompt)))) "
+             "FROM inputs source JOIN inputs peer ON peer.id = source.id + 1 "
+             "WHERE MOD(source.id, 2) = 0 ORDER BY source.id DESC",
+             tuple((index, {"value": f"row-{index}/row-{index + 1}"}) for index in range(10, -1, -2))),
+            ("SELECT /*+ OPT_PARAM('rowsets_max_rows', 16) */ MOD(id, 3) AS bucket, "
+             "AI_COMPLETE('contract_model', AI_PROMPT('classify record', "
+             "JSON_OBJECT('value', SUM(id)))) FROM inputs GROUP BY MOD(id, 3) "
+             "HAVING SUM(id) > 20 ORDER BY bucket DESC",
+             ((2, {"value": 26}), (1, {"value": 22}))),
+        ]
+        for query, expected in queries:
+            with self.subTest(query=query):
+                self.cursor.execute("EXPLAIN " + query)
+                self.assertIn("AI SOLO GLOBAL", "\n".join(str(row[0]) for row in self.cursor.fetchall()))
+                before = len(self.server.audit)
+                self.cursor.execute(query)
+                self.assertEqual(self.cursor.fetchall(), tuple((index, answer(solo_prompt(fields)))
+                                                               for index, fields in expected))
+                self.assertEqual(Counter(record["prompt"] for record in self.server.audit[before:]),
+                                 Counter(solo_prompt(fields) for _, fields in expected))
+
+    def test_solo_unsupported_shapes_and_field_changes_submit_nothing(self):
+        self.load([f"value-{index}" for index in range(33)])
+        prompt = "AI_PROMPT('classify record', JSON_OBJECT('value', prompt))"
+        expression = f"AI_COMPLETE('contract_model', {prompt})"
+        queries = [
+            f"SELECT {expression} FROM inputs LIMIT 1",
+            f"SELECT /*+ OPT_PARAM('rowsets_max_rows', 0) */ {expression} FROM inputs",
+            f"SELECT AI_COMPLETE(model, {prompt}) FROM inputs",
+            "SELECT AI_COMPLETE('contract_model', AI_PROMPT(CAST(prompt AS CHAR), JSON_OBJECT('value', id))) FROM inputs",
+            f"SELECT {expression}, AI_COMPLETE('contract_model', prompt) FROM inputs",
+            f"SELECT {expression} FROM inputs ORDER BY {expression}",
+            "SELECT AI_COMPLETE('contract_model', AI_PROMPT('classify record', JSON_OBJECT('value', SUM(id)))) "
+            "FROM inputs GROUP BY MOD(id, 3) "
+            "HAVING LENGTH(AI_COMPLETE('contract_model', CAST(SUM(id) AS CHAR))) > 0",
+            "SELECT AI_COMPLETE('contract_model', AI_PROMPT('classify record', JSON_OBJECT('value', COUNT(*)))) "
+            "FROM inputs GROUP BY AI_COMPLETE('contract_model', prompt)",
+            "SELECT AI_COMPLETE('contract_model', AI_PROMPT('classify record', "
+            "JSON_OBJECT('value', source.id, 'peer', peer.id))) "
+            "FROM inputs source LEFT JOIN inputs peer ON source.id = peer.id "
+            "AND LENGTH(AI_COMPLETE('contract_model', peer.prompt)) > 0",
+        ]
+        for query in queries:
+            with self.subTest(query=query):
+                sql_error(self, 1235, lambda: self.cursor.execute(query))
+                self.assertEqual(len(self.server.audit), 0)
+        for fields in ("JSON_ARRAY(id)", "JSON_OBJECT()", "JSON_OBJECT(IF(id < 32, 'value', 'changed'), id)"):
+            with self.subTest(fields=fields):
+                sql_error(self, 1210, lambda: self.query_pipeline(
+                    f"AI_COMPLETE('contract_model', AI_PROMPT('classify record', {fields}))"))
+                self.assertEqual(len(self.server.audit), 0)
+        query = f"SELECT /*+ OPT_PARAM('rowsets_max_rows', 1) */ id, {expression} FROM inputs ORDER BY id"
+        self.cursor.execute("EXPLAIN " + query)
+        self.assertIn("AI SOLO GLOBAL", str(self.cursor.fetchall()))
+        self.cursor.execute(query)
+        self.assertEqual(self.cursor.fetchall(), tuple((index, answer(solo_prompt({"value": f"value-{index}"})))
+                                                       for index in range(33)))
+        self.assertEqual(len(self.server.audit), 33)
+
+    def test_solo_memory_limits_submit_nothing_and_release_quota(self):
+        self.load(["x" * 4096 for _ in range(1000)])
+        expression = "AI_COMPLETE('contract_model', AI_PROMPT('classify record', JSON_OBJECT('value', prompt)))"
+        self.cursor.execute("SHOW PARAMETERS LIKE 'ai_pipeline_total_memory_limit'")
+        columns = [description[0].lower() for description in self.cursor.description]
+        old_limit = self.cursor.fetchone()[columns.index("value")]
+        self.addCleanup(lambda: self.cursor.execute(
+            "ALTER SYSTEM SET ai_pipeline_total_memory_limit = %s", (old_limit,)))
+        for shared in (False, True):
+            with self.subTest(shared=shared):
+                self.cursor.execute("SET ai_pipeline_memory_limit = %s", (67108864 if shared else 4194304,))
+                self.cursor.execute("ALTER SYSTEM SET ai_pipeline_total_memory_limit = %s",
+                                    ("4M" if shared else old_limit,))
+                before = len(self.server.audit)
+                for _ in range(2):
+                    sql_error(self, 4019, lambda: self.query_pipeline(expression))
+                    self.assertEqual(len(self.server.audit), before)
+                self.assertEqual(self.query_pipeline(expression, "WHERE id = 0 ORDER BY id"),
+                                 ((0, answer(solo_prompt({"value": "x" * 4096}))),))
+                self.assertEqual(len(self.server.audit), before + 1)
+
+    def test_solo_cancel_deadline_and_provider_error_release_resources(self):
+        values = [f"termination-{index:03d}" for index in range(33)]
+        self.load(values)
+        prompts = [solo_prompt({"value": value}) for value in values]
+        expression = "AI_COMPLETE('contract_model', AI_PROMPT('classify record', JSON_OBJECT('value', prompt)))"
+        process_id = struct.unpack("3i", self.connection._sock.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
+        for kind, code in (("cancel", 1317), ("deadline", 4012), ("provider", 4070)):
+            with self.subTest(kind=kind):
+                gate = self.gate()
+                error_gate = self.gate()
+                self.server.default_reply = Reply(gate=gate)
+                if kind == "provider":
+                    self.server.scenarios[prompts[0]] = [Reply(body=b"{}", gate=error_gate)]
+                self.cursor.execute("SET ob_query_timeout = %s", (3000000 if kind == "deadline" else 20000000,))
+                before = len(self.server.audit)
+                worker, outcome = self.start_embedding_query(lambda: self.query_pipeline(expression))
+                try:
+                    with self.server.condition:
+                        self.assertTrue(self.server.condition.wait_for(
+                            lambda: len(self.server.audit) >= before + 32 or not worker.is_alive(), timeout=3))
+                        self.assertEqual(len(self.server.audit), before + 32, outcome)
+                    self.assertEqual(len(model_socket_fds(process_id, self.server.server_port)), 32)
+                    if kind == "cancel":
+                        with pymysql.connect(unix_socket=self.sql_socket, user="root", autocommit=True) as control:
+                            with control.cursor() as cursor:
+                                cursor.execute(f"KILL QUERY {self.connection.thread_id()}")
+                    elif kind == "provider":
+                        error_gate.set()
+                    worker.join(4)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(len(outcome), 1)
+                    self.assertIsInstance(outcome[0], pymysql.MySQLError)
+                    self.assertEqual(outcome[0].args[0], code)
+                    self.assertEqual(len(self.server.audit), before + 32)
+                    self.assertFalse(model_socket_fds(process_id, self.server.server_port))
+                finally:
+                    gate.set()
+                    error_gate.set()
+                    worker.join(5)
+                self.server.default_reply = Reply()
+                self.server.scenarios.clear()
+                self.cursor.execute("SET ob_query_timeout = 20000000")
+                self.assertEqual(self.query_pipeline(expression),
+                                 tuple((index, answer(prompt)) for index, prompt in enumerate(prompts)))
+
+    def test_solo_releases_request_workers(self):
+        self.assert_pipeline_releases_request_workers(False, solo=True)
+
     def test_completion_pipeline_releases_request_workers(self):
         self.assert_pipeline_releases_request_workers(False)
 
@@ -398,6 +674,57 @@ class RuntimeContracts(unittest.TestCase):
                     submitted = [text for body in self.server.requests[before:]
                                  for text in (body["input"] if embedding else [body["messages"][-1]["content"]])]
                     self.assertEqual(Counter(submitted), Counter(prompts))
+
+    def test_pipeline_many_batches_preserve_rows_after_repeated_suspension(self):
+        batch_size = 256
+        row_count = batch_size * 8 + 1
+        for slots in (1, 2):
+            with self.subTest(slots=slots):
+                self.cursor.execute("TRUNCATE TABLE inputs")
+                self.cursor.execute("SET ob_query_timeout=60000000, ai_pipeline_slots=%s", (slots,))
+                prompts = [f"repeated-suspend-{slots}-{index:05d}:" + "x" * 6000
+                           for index in range(row_count)]
+                self.load(prompts)
+                gates = [self.gate() for _ in range((row_count + batch_size - 1) // batch_size)]
+                for index, prompt in enumerate(prompts):
+                    self.server.scenarios[prompt] = [Reply(gate=gates[index // batch_size])]
+                query_sql = "SELECT id, AI_COMPLETE('contract_model', prompt) FROM inputs ORDER BY id"
+                self.cursor.execute("EXPLAIN " + query_sql)
+                plan = "\n".join(str(row[0]) for row in self.cursor.fetchall())
+                self.assertIn("AI FUNCTION PIPELINE", plan)
+                self.assertIn("rowset=256", plan)
+                before = len(self.server.audit)
+                worker, outcome = self.start_embedding_query(lambda: self.query())
+                try:
+                    for index, gate in enumerate(gates):
+                        target = before + min(row_count, (index + slots) * batch_size)
+                        with self.server.condition:
+                            self.assertTrue(self.server.condition.wait_for(
+                                lambda: len(self.server.audit) >= target or not worker.is_alive(),
+                                timeout=5),
+                                f"batch {index} did not reach its submission window")
+                            self.assertGreaterEqual(
+                                len(self.server.audit), target,
+                                f"query stopped at batch {index}: {outcome!r}")
+                        if index < 5:
+                            # Cross the session schema-cache expiry while the statement is suspended.
+                            time.sleep(3)
+                        gate.set()
+                finally:
+                    for gate in gates:
+                        gate.set()
+                    worker.join(15)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(len(outcome), 1)
+                self.assertNotIsInstance(outcome[0], Exception, str(outcome[0]))
+                self.assertEqual(len(outcome[0]), row_count)
+                for index, (row_id, value) in enumerate(outcome[0]):
+                    self.assertEqual(row_id, index)
+                    self.assertEqual(value, answer(prompts[index]))
+                self.assertEqual(Counter(record["prompt"] for record in self.server.audit[before:]),
+                                 Counter(prompts))
+                self.cursor.execute("SELECT 1")
+                self.assertEqual(self.cursor.fetchone(), (1,))
 
     def test_pipeline_memory_backpressure(self):
         prompts = [f"memory-window-{index}" for index in range(51)]
@@ -503,7 +830,7 @@ class RuntimeContracts(unittest.TestCase):
     def test_embedding_pipeline_releases_request_workers(self):
         self.assert_pipeline_releases_request_workers(True)
 
-    def assert_pipeline_releases_request_workers(self, embedding, *, saturate_network=False):
+    def assert_pipeline_releases_request_workers(self, embedding, *, saturate_network=False, solo=False):
         filler_expected = None
         if saturate_network:
             prompts = ["worker-release"] + [f"network-full-{index}" for index in range(16 * 66)]
@@ -514,14 +841,17 @@ class RuntimeContracts(unittest.TestCase):
             expected = self.load_embeddings(["worker-release"])
         else:
             self.load(["worker-release"])
-            expected = ((0, answer("worker-release")),)
+            expected = ((0, answer(solo_prompt({"value": "worker-release"}) if solo else "worker-release")),)
         expression = ("AI_EMBED('contract_embed', prompt, 3)" if embedding else
                       "AI_COMPLETE('contract_model', prompt)")
+        if solo:
+            expression = ("AI_COMPLETE('contract_model', AI_PROMPT('classify record', "
+                          "JSON_OBJECT('value', prompt)))")
         predicate = "WHERE id = 0 " if saturate_network else ""
         query = ("SELECT /*+ OPT_PARAM('rowsets_max_rows', 16) */ "
              f"id, {expression} FROM inputs {predicate}ORDER BY id")
         self.cursor.execute("EXPLAIN " + query)
-        self.assertIn("AI FUNCTION PIPELINE", str(self.cursor.fetchall()))
+        self.assertIn("AI SOLO GLOBAL" if solo else "AI FUNCTION PIPELINE", str(self.cursor.fetchall()))
         process_id = struct.unpack("3i", self.connection._sock.getsockopt(
             socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
 
@@ -622,7 +952,8 @@ class RuntimeContracts(unittest.TestCase):
             submitted = [text for body in self.server.requests for text in body["input"]]
             self.assertEqual(Counter(submitted), Counter(prompts) + Counter({"worker-release": len(connections)}))
         else:
-            self.assertEqual(self.server.counts, Counter({"worker-release": len(connections)}))
+            prompt = solo_prompt({"value": "worker-release"}) if solo else "worker-release"
+            self.assertEqual(self.server.counts, Counter({prompt: len(connections)}))
 
     def test_completion_pipeline_disconnect_releases_waiting_requests(self):
         self.assert_pipeline_disconnect(False)
@@ -2074,12 +2405,16 @@ class RuntimeContracts(unittest.TestCase):
                                 ("contract_endpoint", '{"access_key":"contract-test-only"}'))
 
 
-def run_contracts(connection, server, sql_socket, *, shutdown_only=False):
+def run_contracts(connection, server, sql_socket, *, shutdown_only=False, test_names=None):
     RuntimeContracts.connection = connection
     RuntimeContracts.server = server
     RuntimeContracts.sql_socket = sql_socket
-    suite = (unittest.TestSuite([RuntimeContracts("check_shutdown_with_suspended_queries")])
-             if shutdown_only else unittest.defaultTestLoader.loadTestsFromTestCase(RuntimeContracts))
+    if shutdown_only:
+        suite = unittest.TestSuite([RuntimeContracts("check_shutdown_with_suspended_queries")])
+    elif test_names:
+        suite = unittest.TestSuite(RuntimeContracts(name) for name in test_names)
+    else:
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(RuntimeContracts)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if not result.wasSuccessful():
         raise SystemExit(1)
@@ -2092,4 +2427,14 @@ if __name__ == "__main__":
         sys.argv.remove("--shutdown-test")
         runtime.main(lambda *args: run_contracts(*args, shutdown_only=True), sql_timeout=75)
     else:
-        runtime.main(run_contracts, sql_timeout=75)
+        selected = []
+        while "--case" in sys.argv:
+            index = sys.argv.index("--case")
+            sys.argv.pop(index)
+            if index >= len(sys.argv):
+                raise SystemExit("--case requires a RuntimeContracts test method name")
+            name = sys.argv.pop(index)
+            if not name.startswith("test_") or not callable(getattr(RuntimeContracts, name, None)):
+                raise SystemExit(f"Unknown RuntimeContracts test: {name}")
+            selected.append(name)
+        runtime.main(lambda *args: run_contracts(*args, test_names=selected), sql_timeout=75)

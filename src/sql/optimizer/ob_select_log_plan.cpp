@@ -4914,17 +4914,50 @@ static int check_ai_pipeline_input(const ObRawExpr *expr, bool &supported)
   return ret;
 }
 
+static int check_solo_input(const ObRawExpr *expr, bool &supported)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (expr->get_expr_type() == T_FUN_SYS_AI_COMPLETE ||
+             expr->get_expr_type() == T_FUN_SYS_AI_EMBED ||
+             expr->get_expr_type() == T_FUN_SYS_AI_RERANK || expr->is_query_ref_expr()) {
+    supported = false;
+  } else {
+    for (int64_t index = 0; OB_SUCC(ret) && supported && index < expr->get_param_count(); ++index) {
+      ret = SMART_CALL(check_solo_input(expr->get_param_expr(index), supported));
+    }
+  }
+  return ret;
+}
+
+static int check_solo_plan(const ObLogicalOperator *node, bool &supported)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (node->get_parallel() != 1 || node->get_type() == log_op_def::LOG_EXCHANGE ||
+             node->get_type() == log_op_def::LOG_AI_FUNC) {
+    supported = false;
+  } else {
+    for (int64_t index = 0; OB_SUCC(ret) && supported && index < node->get_num_of_child(); ++index) {
+      ret = SMART_CALL(check_solo_plan(node->get_child(index), supported));
+    }
+  }
+  return ret;
+}
+
 int ObSelectLogPlan::candi_allocate_ai_func()
 {
   int ret = OB_SUCCESS;
   const ObSelectStmt &stmt = *get_stmt();
   ObRawExpr *ai_expr = nullptr;
-  bool supported = is_final_root_plan() && stmt.is_single_table_stmt() &&
-                   stmt.get_table_item(0)->is_basic_table() && !stmt.is_set_stmt() &&
-                   !stmt.has_limit() && !stmt.has_group_by() && !stmt.has_having() &&
+  bool solo = false;
+  bool plain_projection = true;
+  bool supported = is_final_root_plan() && !stmt.is_set_stmt() && !stmt.has_limit() &&
                    !stmt.has_window_function() && !stmt.has_distinct() &&
                    !stmt.has_for_update() && !stmt.has_select_into() && stmt.get_subquery_expr_size() == 0;
-  for (int64_t index = 0; supported && index < stmt.get_select_item_size(); ++index) {
+  for (int64_t index = 0; OB_SUCC(ret) && supported && index < stmt.get_select_item_size(); ++index) {
     ObRawExpr *expr = stmt.get_select_item(index).expr_;
     const bool is_ai_function = expr->get_expr_type() == T_FUN_SYS_AI_EMBED ||
                                expr->get_expr_type() == T_FUN_SYS_AI_COMPLETE;
@@ -4934,25 +4967,63 @@ int ObSelectLogPlan::candi_allocate_ai_func()
     }
     if (is_ai_function && ai_expr == nullptr &&
         expr->get_param_expr(0)->is_static_scalar_const_expr() &&
-        nullptr != content && content->is_column_ref_expr() &&
+        nullptr != content &&
         (expr->get_param_count() == 2 || expr->get_param_expr(2)->is_static_scalar_const_expr())) {
       ai_expr = expr;
+      solo = expr->get_expr_type() == T_FUN_SYS_AI_COMPLETE &&
+             content->get_expr_type() == T_FUN_SYS_AI_PROMPT && content->get_param_count() == 2 &&
+             content->get_param_expr(1)->get_result_type().get_type() == ObJsonType;
+      if (solo) {
+        supported = content->get_param_expr(0)->is_static_scalar_const_expr();
+        if (supported) {
+          ret = check_solo_input(content, supported);
+        }
+      } else {
+        supported = content->is_column_ref_expr();
+      }
     } else if (!expr->is_column_ref_expr() && !expr->is_static_scalar_const_expr()) {
-      supported = false;
+      plain_projection = false;
+      ret = check_solo_input(expr, supported);
+    }
+  }
+  if (!solo) {
+    supported = supported && plain_projection && stmt.is_single_table_stmt() &&
+                stmt.get_table_item(0)->is_basic_table() && !stmt.has_group_by() && !stmt.has_having();
+  }
+  if (OB_SUCC(ret) && solo && supported) {
+    ObSEArray<ObRawExpr *, 16> input_exprs;
+    if (OB_FAIL(stmt.get_relation_exprs(input_exprs))) {
+    } else {
+      for (int64_t index = 0; OB_SUCC(ret) && supported && index < input_exprs.count(); ++index) {
+        if (input_exprs.at(index) != ai_expr) {
+          ret = check_solo_input(input_exprs.at(index), supported);
+        }
+      }
     }
   }
   for (int64_t index = 0; OB_SUCC(ret) && supported && index < stmt.get_condition_size(); ++index) {
-    ret = check_ai_pipeline_input(stmt.get_condition_exprs().at(index), supported);
+    ret = solo ? check_solo_input(stmt.get_condition_exprs().at(index), supported)
+               : check_ai_pipeline_input(stmt.get_condition_exprs().at(index), supported);
   }
-  for (int64_t index = 0; supported && index < stmt.get_order_item_size(); ++index) {
+  for (int64_t index = 0; OB_SUCC(ret) && supported && index < stmt.get_order_item_size(); ++index) {
     const ObRawExpr *expr = stmt.get_order_items().at(index).expr_;
-    supported = expr->is_column_ref_expr() || expr->is_static_scalar_const_expr();
+    if (solo) {
+      ret = check_solo_input(expr, supported);
+    } else {
+      supported = expr->is_column_ref_expr() || expr->is_static_scalar_const_expr();
+    }
+  }
+  if (OB_SUCC(ret) && solo && !supported) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "global SOLO requires one top-level AI_COMPLETE with fixed instruction and ordinary upstream expressions");
   }
   for (int64_t index = 0; OB_SUCC(ret) && supported && nullptr != ai_expr &&
                         index < candidates_.candidate_plans_.count(); ++index) {
     ObLogicalOperator *&top = candidates_.candidate_plans_.at(index).plan_tree_;
     bool simple_plan = top->get_parallel() == 1;
-    for (ObLogicalOperator *node = top; simple_plan && nullptr != node;
+    if (solo && OB_FAIL(check_solo_plan(top, simple_plan))) {
+    }
+    for (ObLogicalOperator *node = top; !solo && simple_plan && nullptr != node;
          node = node->get_child(ObLogicalOperator::first_child)) {
       if (node->get_type() == log_op_def::LOG_TABLE_SCAN) {
         break;
@@ -4960,12 +5031,13 @@ int ObSelectLogPlan::candi_allocate_ai_func()
         simple_plan = false;
       }
     }
-    if (simple_plan) {
+    if (OB_SUCC(ret) && simple_plan) {
       auto *pipeline = static_cast<LogAIFunc *>(get_log_op_factory().allocate(*this, log_op_def::LOG_AI_FUNC));
       if (OB_ISNULL(pipeline)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else {
         pipeline->set_ai_expr(ai_expr);
+        pipeline->set_solo(solo);
         pipeline->set_child(ObLogicalOperator::first_child, top);
         if (OB_FAIL(pipeline->compute_property())) {
         } else {
