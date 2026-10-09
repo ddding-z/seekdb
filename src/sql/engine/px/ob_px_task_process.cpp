@@ -69,7 +69,8 @@ bool ObPxTaskProcess::supports_resumable(const ObPxInitTaskArgs &arg)
   }
   bool has_semantic = false;
   while (supported && nullptr != op &&
-         (PHY_SEMANTIC_MAP == op->type_ || PHY_SEMANTIC_FILTER == op->type_)) {
+         (PHY_SEMANTIC_MAP == op->type_ || PHY_SEMANTIC_FILTER == op->type_ ||
+          PHY_SEMANTIC_JOIN == op->type_)) {
     has_semantic = true;
     supported = op->max_batch_size_ > 0 && 1 == op->get_child_cnt();
     op = supported ? op->get_child() : nullptr;

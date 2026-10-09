@@ -22,6 +22,7 @@
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/rewrite/ob_equal_analysis.h"
 #include "sql/rewrite/ob_transform_utils.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
 namespace oceanbase
 {
 using namespace common;
@@ -39,10 +40,27 @@ int ObTransformJoinElimination::transform_one_stmt(common::ObIArray<ObParentDMLS
   bool trans_happened_outer_join = false;
   bool trans_happened_left_outer_join = false;
   bool trans_happened_self_foreign_semi_join = false;
+  bool preserve_semantic_join = false;
   ObSEArray<ObSEArray<TableItem *, 4>, 4> eliminated_tables;
   if (OB_ISNULL(stmt)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("stmt is null", K(ret));
+  } else if (stmt->get_table_size() >= 2) {
+    ObSEArray<ObRawExpr *, 16> expressions;
+    if (OB_FAIL(stmt->get_relation_exprs(expressions))) {
+      LOG_WARN("failed to collect semantic join rewrite dependencies", K(ret));
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && !preserve_semantic_join &&
+         index < expressions.count(); ++index) {
+      if (OB_FAIL(SemanticExprUtils::contains_semantic_join(
+          expressions.at(index), preserve_semantic_join))) {
+        LOG_WARN("failed to check semantic join rewrite dependencies", K(ret));
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (preserve_semantic_join) {
+    OPT_TRACE("AI_JOIN retains both candidate relations before semantic lowering");
   } else if (stmt->get_table_size() < 2) {
     //do nothing
   } else if (OB_FAIL(eliminate_join_self_foreign_key(stmt, trans_happened_self_foreign_key, eliminated_tables))) {

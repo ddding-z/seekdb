@@ -341,6 +341,8 @@ protected:
   int resolve_sys_vars(common::ObArray<ObVarInfo> &sys_vars);
   int check_expr_param(const ObRawExpr &expr);
   int check_col_param_on_expr(ObRawExpr *expr);
+  int check_semantic_join_condition(const ObRawExpr *expr, const JoinedTable &joined_table);
+  int check_semantic_join_inputs(const ObRawExpr &expr, const JoinedTable &joined_table);
   int resolve_columns_field_list_first(ObRawExpr *&expr, ObArray<ObQualifiedName> &columns, ObSelectStmt* sel_stmt);
   int replace_col_ref_prefix(ObQualifiedName &col_ref, uint64_t idx, ObQualifiedName &q_name, bool &try_success);
   int replace_col_ref_prefix(ObQualifiedName &q_name);

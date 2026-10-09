@@ -40,9 +40,11 @@ class AIFuncSpec;
 class LogSemantic;
 class LogSemanticMap;
 class LogSemanticFilter;
+class LogSemanticJoin;
 class SemanticSpec;
 class SemanticMapSpec;
 class SemanticFilterSpec;
+class SemanticJoinSpec;
 class ObLogSort;
 class ObSortSpec;
 class ObLogSet;
@@ -286,6 +288,7 @@ private:
   int generate_semantic_spec(LogSemantic &op, SemanticSpec &spec);
   int generate_spec(LogSemanticMap &op, SemanticMapSpec &spec, const bool in_root_job);
   int generate_spec(LogSemanticFilter &op, SemanticFilterSpec &spec, const bool in_root_job);
+  int generate_spec(LogSemanticJoin &op, SemanticJoinSpec &spec, const bool in_root_job);
 
   int generate_spec(ObLogSort &op, ObSortSpec &spec, const bool in_root_job);
 

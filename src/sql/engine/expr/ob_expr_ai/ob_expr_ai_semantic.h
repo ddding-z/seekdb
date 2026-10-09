@@ -53,6 +53,7 @@ class SemanticExprUtils
 public:
   static bool is_semantic(ObItemType type);
   static int contains_semantic(const ObRawExpr *expr, bool &contains);
+  static int contains_semantic_join(const ObRawExpr *expr, bool &contains);
   static int prepare_input(const ObExpr &expr, ObEvalCtx &ctx,
                            MultimodeAlloctor &allocator,
                            common::ObString &model_id, common::ObString &prompt,
@@ -60,6 +61,7 @@ public:
   static int set_result(const ObExpr &expr, ObEvalCtx &ctx, common::ObDatum &datum,
                         const common::ObString &result);
 private:
+  static int contains_semantic(const ObRawExpr *expr, ObItemType type, bool &contains);
   SemanticExprUtils() = delete;
 };
 
@@ -95,6 +97,23 @@ public:
                                   const ObBitVector &skip, int64_t size);
 private:
   DISALLOW_COPY_AND_ASSIGN(ExprAIFilter);
+};
+
+class ExprAIJoin : public ObFuncExprOperator
+{
+public:
+  explicit ExprAIJoin(common::ObIAllocator &allocator);
+  virtual ~ExprAIJoin() {}
+  virtual int calc_result_typeN(ObExprResType &type, ObExprResType *types,
+                                int64_t param_num, common::ObExprTypeCtx &type_ctx) const override;
+  virtual int cg_expr(ObExprCGCtx &expr_cg_ctx, const ObRawExpr &raw_expr,
+                      ObExpr &rt_expr) const override;
+  virtual bool need_rt_ctx() const override { return true; }
+  static int eval_ai_join(const ObExpr &expr, ObEvalCtx &ctx, common::ObDatum &result);
+  static int eval_ai_join_batch(const ObExpr &expr, ObEvalCtx &ctx,
+                                const ObBitVector &skip, int64_t size);
+private:
+  DISALLOW_COPY_AND_ASSIGN(ExprAIJoin);
 };
 
 } // namespace sql

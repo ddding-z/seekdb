@@ -30,6 +30,42 @@ OB_SERIALIZE_MEMBER((SemanticSpec, ObOpSpec), expressions_, semantic_exprs_, own
                     local_exprs_, shared_exprs_, carried_exprs_, query_task_count_, filter_expr_count_);
 OB_SERIALIZE_MEMBER((SemanticMapSpec, SemanticSpec));
 OB_SERIALIZE_MEMBER((SemanticFilterSpec, SemanticSpec));
+OB_SERIALIZE_MEMBER((SemanticJoinSpec, SemanticSpec), join_exprs_);
+
+int SemanticJoinSpec::validate_bindings() const
+{
+  int ret = OB_SUCCESS;
+  if (join_exprs_.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("semantic join has no pair predicate binding", K(ret));
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && index < join_exprs_.count(); ++index) {
+    const ObExpr *expr = join_exprs_.at(index);
+    if (OB_ISNULL(expr) || expr->type_ != T_FUN_SYS_AI_JOIN ||
+        (expr->arg_cnt_ != 4 && expr->arg_cnt_ != 5) ||
+        OB_ISNULL(expr->args_) ||
+        !contains_expression(semantic_exprs_, expr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid semantic join pair predicate binding", K(ret), KP(expr));
+    } else {
+      for (uint32_t argument = 0; OB_SUCC(ret) && argument < expr->arg_cnt_; ++argument) {
+        if (OB_ISNULL(expr->args_[argument])) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("semantic join argument binding is null", K(ret), K(argument));
+        }
+      }
+    }
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && index < semantic_exprs_.count(); ++index) {
+    const ObExpr *expr = semantic_exprs_.at(index);
+    if (OB_ISNULL(expr) ||
+        (expr->type_ == T_FUN_SYS_AI_JOIN && !contains_expression(join_exprs_, expr))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("semantic join is missing a pair predicate binding", K(ret), KP(expr));
+    }
+  }
+  return ret;
+}
 
 struct SemanticOp::Task
 {
@@ -119,9 +155,11 @@ int SemanticOp::inner_open()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid semantic filter condition count", K(ret), K(spec.filter_expr_count_));
   } else if (OB_FAIL(validate_shared_expressions())) {
+  } else if (spec_.type_ == PHY_SEMANTIC_JOIN &&
+             OB_FAIL(static_cast<const SemanticJoinSpec &>(spec_).validate_bindings())) {
   } else if (!spec_.is_vectorized()) {
     ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_MAP and AI_FILTER require a vectorized semantic operator");
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_MAP, AI_FILTER and AI_JOIN require a vectorized semantic operator");
   } else if (OB_FAIL(ctx_.get_my_session()->get_sys_variable(
                          share::SYS_VAR_AI_PIPELINE_SLOTS, slot_count_))) {
   } else if (OB_FAIL(ctx_.get_my_session()->get_sys_variable(
@@ -233,15 +271,22 @@ int SemanticOp::inner_close()
   return ret;
 }
 
-int SemanticOp::inner_rescan()
+int SemanticOp::rescan()
 {
   int ret = child_frame_.restore();
   child_frame_.reset();
   reset_pipeline();
-  if (OB_SUCC(ret)) {
-    ret = ObOperator::inner_rescan();
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to restore semantic input frame before child rescan", K(ret));
+  } else if (OB_FAIL(ObOperator::rescan())) {
+    LOG_WARN("failed to rescan semantic operator", K(ret));
   }
   return ret;
+}
+
+int SemanticOp::inner_rescan()
+{
+  return ObOperator::inner_rescan();
 }
 
 void SemanticOp::destroy()
@@ -270,12 +315,75 @@ int SemanticOp::inner_get_next_row()
   return OB_NOT_SUPPORTED;
 }
 
-int SemanticOp::capture(Slot &slot)
+int64_t SemanticOp::slot_metadata_bytes(int64_t size) const
+{
+  const int64_t columns = child_->get_spec().output_.count();
+  const int64_t expressions = semantic_spec().expressions_.count();
+  const int64_t tasks = semantic_spec().semantic_exprs_.count();
+  return size * (columns * sizeof(ObDatum) +
+      expressions * (sizeof(ObDatum) + sizeof(uint8_t)) + sizeof(int64_t) +
+      tasks * (sizeof(uint8_t) + sizeof(ObString))) +
+      tasks * (sizeof(Task) + sizeof(Task *));
+}
+
+int SemanticOp::allocate_slot(Slot &slot, int64_t size)
 {
   int ret = OB_SUCCESS;
+  auto &allocator = slot.allocator_;
+  const int64_t columns = child_->get_spec().output_.count();
+  const int64_t outputs = semantic_spec().expressions_.count();
+  const int64_t tasks = semantic_spec().semantic_exprs_.count();
+  if (columns > 0 && OB_ISNULL(slot.inputs_ = static_cast<ObDatum *>(
+      allocator.alloc(size * columns * sizeof(ObDatum))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_ISNULL(slot.values_ = static_cast<ObDatum *>(
+      allocator.alloc(size * outputs * sizeof(ObDatum)))) ||
+      OB_ISNULL(slot.evaluated_ = static_cast<uint8_t *>(allocator.alloc(size * outputs))) ||
+      OB_ISNULL(slot.kept_rows_ = static_cast<int64_t *>(allocator.alloc(size * sizeof(int64_t)))) ||
+      OB_ISNULL(slot.tasks_ = static_cast<Task **>(allocator.alloc(tasks * sizeof(Task *))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    MEMSET(slot.evaluated_, 0, size * outputs);
+    MEMSET(slot.tasks_, 0, tasks * sizeof(Task *));
+    slot.task_count_ = tasks;
+    for (int64_t index = 0; index < size * outputs; ++index) {
+      new (&slot.values_[index]) ObDatum();
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && index < tasks; ++index) {
+      auto *task = OB_NEWx(Task, &allocator, semantic_spec().semantic_exprs_.at(index));
+      if (OB_ISNULL(task)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        slot.tasks_[index] = task;
+        task->batch_.set_shared_buffer_usage(*execution_->budget().memory_counter(),
+                                              execution_->budget().memory_limit());
+        task->batch_.set_nonblocking_admission();
+        task->states_ = static_cast<uint8_t *>(allocator.alloc(size));
+        task->results_ = static_cast<ObString *>(allocator.alloc(size * sizeof(ObString)));
+        if (OB_ISNULL(task->states_) || OB_ISNULL(task->results_)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else {
+          MEMSET(task->states_, Task::UNREQUESTED, size);
+          for (int64_t row = 0; row < size; ++row) {
+            new (&task->results_[row]) ObString();
+          }
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to allocate semantic batch storage", K(ret), K(size));
+  }
+  return ret;
+}
+
+int SemanticOp::capture(Slot &slot)
+{
+  if (spec_.type_ == PHY_SEMANTIC_JOIN) {
+    return capture_join_candidates(slot);
+  }
+  int ret = OB_SUCCESS;
   const auto &columns = child_->get_spec().output_;
-  const int64_t output_count = semantic_spec().expressions_.count();
-  const int64_t task_count = semantic_spec().semantic_exprs_.count();
   if (OB_FAIL(child_frame_.restore())) {
   } else if (nullptr == pending_input_ &&
       OB_FAIL(child_->get_next_batch(spec_.max_batch_size_, pending_input_))) {
@@ -284,10 +392,7 @@ int SemanticOp::capture(Slot &slot)
     const ObBatchRows &rows = *pending_input_;
     // Prefix sort and joins can retain a live input tail beyond the returned rows.
     const int64_t size = rows.size_ - rows.skip_->accumulate_bit_cnt(rows.size_);
-    int64_t bytes = size * (columns.count() * sizeof(ObDatum) +
-        output_count * (sizeof(ObDatum) + sizeof(uint8_t)) + sizeof(int64_t) +
-        task_count * (sizeof(uint8_t) + sizeof(ObString))) +
-        task_count * (sizeof(Task) + sizeof(Task *));
+    int64_t bytes = slot_metadata_bytes(size);
     if (size == 0) {
       input_end_ = rows.end_;
       pending_input_ = nullptr;
@@ -322,51 +427,14 @@ int SemanticOp::capture(Slot &slot)
       } else {
         waiting_memory_ = 0;
         slot.size_ = size;
-        auto &allocator = slot.allocator_;
-        if (columns.count() > 0 && OB_ISNULL(slot.inputs_ = static_cast<ObDatum *>(
-            allocator.alloc(size * columns.count() * sizeof(ObDatum))))) {
-          ret = OB_ALLOCATE_MEMORY_FAILED;
-        } else if (OB_ISNULL(slot.values_ = static_cast<ObDatum *>(
-            allocator.alloc(size * output_count * sizeof(ObDatum)))) ||
-            OB_ISNULL(slot.evaluated_ = static_cast<uint8_t *>(
-            allocator.alloc(size * output_count))) ||
-            OB_ISNULL(slot.kept_rows_ = static_cast<int64_t *>(allocator.alloc(size * sizeof(int64_t)))) ||
-            OB_ISNULL(slot.tasks_ = static_cast<Task **>(allocator.alloc(task_count * sizeof(Task *))))) {
-          ret = OB_ALLOCATE_MEMORY_FAILED;
+        if (OB_FAIL(allocate_slot(slot, size))) {
         } else {
-          MEMSET(slot.evaluated_, 0, size * output_count);
-          MEMSET(slot.tasks_, 0, task_count * sizeof(Task *));
-          slot.task_count_ = task_count;
-          for (int64_t index = 0; index < size * output_count; ++index) {
-            new (&slot.values_[index]) ObDatum();
-          }
-          for (int64_t index = 0; OB_SUCC(ret) && index < task_count; ++index) {
-            auto *task = OB_NEWx(Task, &allocator, semantic_spec().semantic_exprs_.at(index));
-            if (OB_ISNULL(task)) {
-              ret = OB_ALLOCATE_MEMORY_FAILED;
-            } else {
-              slot.tasks_[index] = task;
-              task->batch_.set_shared_buffer_usage(*execution_->budget().memory_counter(),
-                                                    execution_->budget().memory_limit());
-              task->batch_.set_nonblocking_admission();
-              task->states_ = static_cast<uint8_t *>(allocator.alloc(size));
-              task->results_ = static_cast<ObString *>(allocator.alloc(size * sizeof(ObString)));
-              if (OB_ISNULL(task->states_) || OB_ISNULL(task->results_)) {
-                ret = OB_ALLOCATE_MEMORY_FAILED;
-              } else {
-                MEMSET(task->states_, Task::UNREQUESTED, size);
-                for (int64_t row = 0; row < size; ++row) {
-                  new (&task->results_[row]) ObString();
-                }
-              }
-            }
-          }
           int64_t target = 0;
           for (int64_t row = 0; OB_SUCC(ret) && row < rows.size_; ++row) {
             if (!rows.skip_->at(row)) {
               for (int64_t column = 0; OB_SUCC(ret) && column < columns.count(); ++column) {
                 if (OB_FAIL(slot.inputs_[target * columns.count() + column].deep_copy(
-                    *columns.at(column)->locate_expr_datumvector(eval_ctx_).at(row), allocator))) {
+                    *columns.at(column)->locate_expr_datumvector(eval_ctx_).at(row), slot.allocator_))) {
                 }
               }
               ++target;
@@ -381,6 +449,109 @@ int SemanticOp::capture(Slot &slot)
         }
       }
     }
+  }
+  return ret;
+}
+
+int SemanticOp::capture_join_candidates(Slot &slot)
+{
+  int ret = OB_SUCCESS;
+  const auto &columns = child_->get_spec().output_;
+  const int64_t capacity = MIN(spec_.max_batch_size_, eval_ctx_.max_batch_size_);
+  if (capacity <= 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid semantic join candidate batch capacity", K(ret), K(capacity));
+  }
+  // Native NLJ output can be one row per fragment, independently of its ROWSET.
+  while (OB_SUCC(ret) && !input_end_ && slot.size_ < capacity) {
+    if (OB_FAIL(ctx_.check_status())) {
+    } else if (OB_FAIL(child_frame_.restore())) {
+    } else if (nullptr == pending_input_ &&
+               OB_FAIL(child_->get_next_batch(capacity - slot.size_, pending_input_))) {
+      if (ret == OB_EAGAIN && slot.size_ > 0) {
+        ret = OB_SUCCESS;
+        break;
+      }
+    }
+    if (OB_FAIL(ret)) {
+      break;
+    } else if (OB_ISNULL(pending_input_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("semantic join candidate generator returned no batch", K(ret));
+      break;
+    }
+    const ObBatchRows &rows = *pending_input_;
+    const int64_t size = rows.size_ - rows.skip_->accumulate_bit_cnt(rows.size_);
+    if (size > capacity - slot.size_) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("semantic join candidate fragment exceeds requested capacity",
+               K(ret), K(size), K(capacity), K(slot.size_));
+    } else if (size == 0) {
+      input_end_ = rows.end_;
+      pending_input_ = nullptr;
+    } else if (OB_FAIL(child_frame_.save(eval_ctx_.max_batch_size_))) {
+    } else {
+      int64_t bytes = slot.task_count_ == 0 ? slot_metadata_bytes(capacity) : 0;
+      for (int64_t row = 0; OB_SUCC(ret) && row < rows.size_; ++row) {
+        if (!rows.skip_->at(row)) {
+          for (int64_t column = 0; OB_SUCC(ret) && column < columns.count(); ++column) {
+            const int64_t extra = columns.at(column)->locate_expr_datumvector(eval_ctx_)
+                                      .at(row)->get_deep_copy_size();
+            if (extra > execution_->budget().memory_limit() - bytes) {
+              ret = OB_SIZE_OVERFLOW;
+            } else {
+              bytes += extra;
+            }
+          }
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (bytes > execution_->budget().memory_limit() ||
+                 bytes > ObAIFuncClient::pipeline_buffer_limit()) {
+        ret = OB_SIZE_OVERFLOW;
+      } else if (OB_FAIL(reserve(slot, bytes))) {
+        if (ret == OB_SIZE_OVERFLOW && execution_->budget().failure() == OB_SUCCESS) {
+          if (slot.size_ > 0) {
+            LOG_DEBUG("semantic join emits a partial batch under memory pressure",
+                      K(bytes), K(slot.size_));
+            waiting_memory_ = 0;
+            ret = OB_SUCCESS;
+            break;
+          } else if (count_ > 0) {
+            waiting_memory_ = bytes;
+            ret = OB_EAGAIN;
+          } else {
+            LOG_WARN("semantic join input cannot fit while its upstream batch is pinned",
+                     K(ret), K(bytes), "memory_used", execution_->budget().memory_used());
+          }
+        }
+      } else {
+        waiting_memory_ = 0;
+        if (slot.task_count_ == 0 && OB_FAIL(allocate_slot(slot, capacity))) {
+        } else {
+          int64_t target = slot.size_;
+          for (int64_t row = 0; OB_SUCC(ret) && row < rows.size_; ++row) {
+            if (!rows.skip_->at(row)) {
+              for (int64_t column = 0; OB_SUCC(ret) && column < columns.count(); ++column) {
+                if (OB_FAIL(slot.inputs_[target * columns.count() + column].deep_copy(
+                    *columns.at(column)->locate_expr_datumvector(eval_ctx_).at(row), slot.allocator_))) {
+                }
+              }
+              ++target;
+            }
+          }
+          if (OB_SUCC(ret)) {
+            slot.size_ = target;
+            input_end_ = rows.end_;
+            pending_input_ = nullptr;
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && slot.size_ > 0) {
+    slot.needs_prepare_ = true;
+    ++count_;
   }
   return ret;
 }

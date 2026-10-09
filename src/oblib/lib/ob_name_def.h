@@ -1093,4 +1093,5 @@
 #define N_AI_PROMPT                         "ai_prompt"
 #define N_AI_MAP                            "ai_map"
 #define N_AI_FILTER                         "ai_filter"
+#define N_AI_JOIN                           "ai_join"
 #endif //OCEANBASE_LIB_OB_NAME_DEF_H_

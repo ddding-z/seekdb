@@ -47,6 +47,16 @@ public:
       : SemanticSpec(allocator, type) {}
 };
 
+class SemanticJoinSpec : public SemanticSpec
+{
+  OB_UNIS_VERSION_V(1);
+public:
+  SemanticJoinSpec(common::ObIAllocator &allocator, ObPhyOperatorType type)
+      : SemanticSpec(allocator, type), join_exprs_(allocator) {}
+  int validate_bindings() const;
+  common::ObFixedArray<ObExpr *, common::ObIAllocator> join_exprs_;
+};
+
 class SemanticOp : public ObOperator, public ISemanticExprRuntime
 {
 public:
@@ -54,6 +64,7 @@ public:
   int inner_open() override;
   int inner_get_next_row() override;
   int inner_get_next_batch(int64_t max_row_cnt) override;
+  int rescan() override;
   int inner_rescan() override;
   int inner_close() override;
   void destroy() override;
@@ -63,10 +74,14 @@ private:
   struct Task;
   struct Slot;
   const SemanticSpec &semantic_spec() const { return static_cast<const SemanticSpec &>(spec_); }
-  bool is_filter() const { return spec_.type_ == PHY_SEMANTIC_FILTER; }
+  bool is_filter() const
+  { return spec_.type_ == PHY_SEMANTIC_FILTER || spec_.type_ == PHY_SEMANTIC_JOIN; }
   int validate_shared_expressions() const;
   int reserve(Slot &slot, int64_t bytes);
+  int64_t slot_metadata_bytes(int64_t size) const;
+  int allocate_slot(Slot &slot, int64_t size);
   int capture(Slot &slot);
+  int capture_join_candidates(Slot &slot);
   int prepare(Slot &slot, bool &progress);
   int submit_tasks(Slot &slot, bool &progress);
   int poll_tasks(Slot &slot, bool &progress);
@@ -105,6 +120,13 @@ class SemanticFilterOp : public SemanticOp
 {
 public:
   SemanticFilterOp(ObExecContext &ctx, const ObOpSpec &spec, ObOpInput *input)
+      : SemanticOp(ctx, spec, input) {}
+};
+
+class SemanticJoinOp : public SemanticOp
+{
+public:
+  SemanticJoinOp(ObExecContext &ctx, const ObOpSpec &spec, ObOpInput *input)
       : SemanticOp(ctx, spec, input) {}
 };
 }

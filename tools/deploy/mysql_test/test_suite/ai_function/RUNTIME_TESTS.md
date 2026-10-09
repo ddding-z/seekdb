@@ -4,6 +4,124 @@ Legacy baseline validation (2026-09-29): the Debug build, all **105 SQL contract
 
 For the current architecture, code map, maintenance invariants and handoff checklist, see the [Chinese maintenance handoff](../../../../../docs/developer-guide/zh/ai-function-runtime-handoff.md).
 
+## Semantic Join Baseline (2026-10-09)
+
+`AI_JOIN(model, rule, left_input, right_input[, options])` is a Boolean pair
+predicate for an INNER JOIN ON clause. It is not a general scalar projection,
+WHERE predicate, outer/semi/anti join, or approximate-nearest-neighbor interface.
+Models and options must be static. The rule is a SQL string expression; each
+payload is a SQL string or JSON expression referring only to a nonempty set of
+columns on one syntactic join side, with the other payload on the opposite side.
+Either argument orientation is allowed and remains unchanged when the optimizer
+reorders its candidate join. Constant-only and cross-side payloads are explicitly
+unsupported in this first version. Existing semantic SELECT restrictions still
+apply.
+
+```sql
+SELECT l.id, r.id
+FROM left_inputs l
+JOIN right_inputs r
+  ON AI_JOIN('matcher', 'Do the two inputs describe the same entity?',
+             l.description, r.description)
+ORDER BY l.id, r.id;
+```
+
+The planner creates a dedicated `SEMANTIC JOIN` stage, retaining the two candidate
+input table sets and the original model/rule/left/right expression bindings. The
+join-elimination rewrite is conservatively disabled for statements containing
+AI_JOIN: even a lossless primary-key self-join must retain the candidate-pair
+boundary before lowering. Other relational candidate algorithms remain usable.
+The first physical strategy is an ordinary binary SQL join producing candidate-pair
+batches followed by asynchronous semantic matching. It preserves every
+candidate satisfying ordinary SQL qualifications; there is no retrieval pruning
+or prompt-text deduplication. Duplicate rows and many-to-many matches retain SQL
+bag multiplicity. Without ordinary candidate conditions, the work is worst-case
+`N * M` model judgments, not a lower-complexity join algorithm.
+
+The matcher retains bounded, owned pair batches rather than materializing the
+complete Cartesian product. Native join fragments, including one-row Cartesian
+NLJ output, are coalesced up to the configured semantic batch size before they
+consume a pipeline slot. The window therefore does not collapse to two row
+requests merely because a native join chose a one-row inner side. A tail, an
+upstream wait or query-memory backpressure can finish a partial owned batch.
+It uses the existing semantic dependency runtime,
+cross-batch pipeline, query-wide task/memory admission, response validation,
+deadline, cancellation and rescan cleanup. The native candidate join's own
+storage/workarea accounting is separate from the retained semantic buffers.
+Rescan restores the native input frame before the framework rescans descendants;
+restoring it only in inner_rescan would overwrite freshly reset material/scan
+state with a prior match's row values.
+An asynchronous join does not imply that every containing SQL/PX shape releases
+its physical worker; the existing conservative suspension gates are not widened
+to arbitrary binary join trees.
+
+The provider prompt is one JSON object with `rule`, `left`, and `right` fields.
+SQL strings are JSON strings, not templates or raw JSON snippets; JSON payloads
+retain their JSON type. SQL NULL rule/payloads error when demanded, rather than
+silently failing the match. SQL short-circuiting may avoid an undemanded call.
+The result uses AI_FILTER's strict Boolean `value` JSON schema, with default
+native schema name `ai_join`; a matching caller format/name is preserved.
+`Schema` is reserved, and incompatible output formats fail before HTTP.
+Options configure the model request, not an unimplemented join strategy.
+
+ANN candidates, blocking, cascades, result caches, outer/semi/anti joins and
+semantic cost/quality-based strategy selection are not implemented. Candidate
+pruning can change recall and must not be silently enabled as a speed-only
+optimization. Exhaustive candidates do not guarantee that the model's judgment
+is semantically correct.
+
+The independent [join contracts](test_semantic_join.py) use private databases
+and loopback model fixtures:
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_join.py \
+  --self-test
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_join.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+```
+
+Repeat `--case` for focused SQL contracts. The existing semantic runtime,
+composition and PX suites remain regression gates; native resource checks also
+cover join binding integrity, semantic-stage discovery and suspension scopes.
+
+### Validation: 2026-10-09
+
+The final Debug build and the following gates passed on this implementation:
+
+| Gate | Passed |
+| --- | --- |
+| AI_JOIN SQL contracts | 45/45 |
+| AI_JOIN fixture/oracle self-tests | 14/14 |
+| Existing AI_MAP / AI_FILTER SQL contracts | 39/39 |
+| Existing SQL composition contracts | 26/26 |
+| Actual PX contracts, including one new AI_JOIN case | 9/9 |
+| Legacy AI Function / SOLO SQL contracts | 105/105 |
+| Native semantic resource/binding/discovery checks | 140 (14 cases, 10 repetitions) |
+| Native resumable collection scenarios | 78 |
+| Separate legacy and semantic-PX normal shutdown checks | Both passed, zero exit status |
+
+The single-worker join gates hold every response, require 32 row requests from
+two configured 16-row candidate batches before the first reply, and reject
+unbounded refill. They also verify demand-driven AND services, nested map
+dependencies, exact duplicate/pair multiplicity, rescan/reexecution, provider
+errors, retries, cancel/deadline cleanup and same-connection recovery.
+The rescan oracle checks the ancestor path of the semantic stage, not unrelated
+materialization inside its native candidate generator. EXPLAIN assertions accept
+the engine's type-cast wrappers and Unicode tree connectors while checking the
+original argument order and fixed candidate policy.
+
+The new actual-PX join case uses eight partitions and `PARALLEL(4)`. Four task
+IDs from one execution and multiple real CPU thread IDs prepare inputs while
+all replies are held. It requires the shared 32-row HTTP admission ceiling,
+256 exact candidate requests and 128 known matching output pairs, exercising
+the serialized SemanticJoinSpec and self-join preservation. This does not add
+a join-tree worker-release claim: the existing eight map/filter PX contracts
+separately cover checked driver suspension and actual worker reuse.
+
+All SQL checks used temporary private unix-socket databases and loopback model
+mocks. No real-model quality, SemBench acceleration, GPU utilization, approximate
+recall or actual spill-I/O certification is claimed.
+
 ## Asynchronous Semantic Operators (2026-10-08)
 
 `AI_MAP(model, prompt[, options])` returns per-row LONGTEXT.
@@ -54,7 +172,7 @@ is an exportable stage target.
 
 AI_FILTER uses the existing native `response_format.json_schema` mechanism with
 required Boolean `value`, no additional properties, and `strict=true`. The exact
-case-sensitive `Schema` key is reserved only for AI_FILTER. A matching caller
+case-sensitive `Schema` key is reserved for AI_FILTER within these two interfaces. A matching caller
 native format and its nonempty name are preserved; conflicting formats fail.
 AI_MAP retains completion-style option passthrough rather than interpreting
 `Schema` as a new shorthand.

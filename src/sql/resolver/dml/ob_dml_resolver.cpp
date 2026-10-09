@@ -2972,6 +2972,95 @@ int ObDMLResolver::resolve_joined_table(const ParseNode &parse_node, JoinedTable
       current_scope_ = old_scope;
     }
   }
+  for (int64_t index = 0; OB_SUCC(ret) && index < joined_table->join_conditions_.count(); ++index) {
+    if (OB_FAIL(check_semantic_join_condition(joined_table->join_conditions_.at(index), *joined_table))) {
+      LOG_WARN("invalid semantic join ON condition", K(ret), K(joined_table->joined_type_));
+    }
+  }
+  return ret;
+}
+
+int ObDMLResolver::check_semantic_join_condition(const ObRawExpr *expr, const JoinedTable &joined_table)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("join ON expression is null", K(ret));
+  } else if (expr->get_expr_type() == T_FUN_SYS_AI_JOIN) {
+    if (!joined_table.is_inner_join()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_JOIN is only supported within INNER JOIN ON, not OUTER, SEMI or ANTI JOIN ON");
+    } else if (OB_FAIL(check_semantic_join_inputs(*expr, joined_table))) {
+      LOG_WARN("invalid AI_JOIN input roles", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && expr->has_flag(CNT_STATE_FUNC)) {
+    for (int64_t index = 0; OB_SUCC(ret) && index < expr->get_param_count(); ++index) {
+      ret = SMART_CALL(check_semantic_join_condition(expr->get_param_expr(index), joined_table));
+    }
+  }
+  return ret;
+}
+
+int ObDMLResolver::check_semantic_join_inputs(const ObRawExpr &expr, const JoinedTable &joined_table)
+{
+  int ret = OB_SUCCESS;
+  int operand_sides[2] = {0, 0};
+  if (expr.get_param_count() < 4 || expr.get_param_count() > 5) {
+    const ObString name(N_AI_JOIN);
+    ret = OB_ERR_PARAM_SIZE;
+    LOG_USER_ERROR(OB_ERR_PARAM_SIZE, name.length(), name.ptr());
+  } else if (OB_ISNULL(joined_table.left_table_) || OB_ISNULL(joined_table.right_table_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("syntactic join side is null", K(ret));
+  } else {
+    const auto belongs_to_side = [](const TableItem &side, uint64_t table_id) {
+      return side.is_joined_table()
+          ? has_exist_in_array(static_cast<const JoinedTable &>(side).single_table_ids_, table_id)
+          : side.table_id_ == table_id;
+    };
+    for (int64_t index = 2; OB_SUCC(ret) && index <= 3; ++index) {
+      const ObRawExpr *input = expr.get_param_expr(index);
+      ObSEArray<ObRawExpr *, 4> columns;
+      bool on_left = true;
+      bool on_right = true;
+      if (OB_ISNULL(input)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("AI_JOIN input expression is null", K(ret), K(index));
+      } else if (input->has_flag(CNT_SUB_QUERY)) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_JOIN inputs containing subqueries are not supported in the first version");
+      } else if (OB_FAIL(ObRawExprUtils::extract_column_exprs(input, columns))) {
+        LOG_WARN("failed to extract AI_JOIN input columns", K(ret), K(index));
+      } else if (columns.empty()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_JOIN left_input and right_input must each reference a nonempty set of join-side columns; constant inputs are not supported");
+      }
+      for (int64_t column_index = 0; OB_SUCC(ret) && column_index < columns.count(); ++column_index) {
+        ObRawExpr *column_expr = columns.at(column_index);
+        if (OB_ISNULL(column_expr) || !column_expr->is_column_ref_expr()) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("AI_JOIN input column is invalid", K(ret), K(column_expr));
+        } else {
+          const uint64_t table_id = static_cast<ObColumnRefRawExpr *>(column_expr)->get_table_id();
+          on_left = on_left && belongs_to_side(*joined_table.left_table_, table_id);
+          on_right = on_right && belongs_to_side(*joined_table.right_table_, table_id);
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (on_left == on_right) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_JOIN inputs crossing join sides or referencing columns outside the syntactic join are not supported");
+        } else {
+          operand_sides[index - 2] = on_left ? 1 : 2;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && operand_sides[0] == operand_sides[1]) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_JOIN left_input and right_input must reference opposite sides of the syntactic join");
+    }
+  }
   return ret;
 }
 

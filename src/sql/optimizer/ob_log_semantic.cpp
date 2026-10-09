@@ -169,5 +169,50 @@ int LogSemantic::do_re_est_cost(EstimateCostInfo &param, double &card,
   }
   return ret;
 }
+
+int LogSemanticJoin::set_candidate_inputs(const ObRelIds &left, const ObRelIds &right)
+{
+  int ret = OB_SUCCESS;
+  if (left.is_empty() || right.is_empty() || left.overlap(right)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid semantic join candidate inputs", K(ret), K(left), K(right));
+  } else {
+    candidate_left_tables_.reuse();
+    candidate_right_tables_.reuse();
+    if (OB_FAIL(candidate_left_tables_.add_members(left))) {
+    } else if (OB_FAIL(candidate_right_tables_.add_members(right))) {
+    }
+  }
+  return ret;
+}
+
+int LogSemanticJoin::add_join_expression(ObRawExpr *expr)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr) || expr->get_expr_type() != T_FUN_SYS_AI_JOIN ||
+      (expr->get_param_count() != 4 && expr->get_param_count() != 5)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid semantic join expression binding", K(ret), KP(expr));
+  } else {
+    ret = add_var_to_array_no_dup(join_exprs_, expr);
+  }
+  return ret;
+}
+
+int LogSemanticJoin::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ObLogicalOperator::get_plan_item_info(plan_text, plan_item))) {
+  } else {
+    BEGIN_BUF_PRINT;
+    if (OB_FAIL(BUF_PRINTF("candidate_policy=ALL_SQL_CANDIDATES, "))) {
+    } else {
+      const ObIArray<ObRawExpr *> &pair_predicates = join_exprs_;
+      EXPLAIN_PRINT_EXPRS(pair_predicates, type);
+    }
+    END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
+  }
+  return ret;
+}
 }
 }

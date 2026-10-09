@@ -653,7 +653,8 @@ int ObStaticEngineCG::generate_spec_basic(ObLogicalOperator &op,
                                   && static_cast<ObLogTableScan&>(op).get_is_index_global());
     const ObIArray<ObRawExpr *> *stage_exprs = nullptr;
     if (op.get_type() == log_op_def::LOG_SEMANTIC_MAP ||
-        op.get_type() == log_op_def::LOG_SEMANTIC_FILTER) {
+        op.get_type() == log_op_def::LOG_SEMANTIC_FILTER ||
+        op.get_type() == log_op_def::LOG_SEMANTIC_JOIN) {
       stage_exprs = &static_cast<LogSemantic &>(op).owned_exprs();
     }
     // get calc exprs
@@ -1064,7 +1065,8 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
     }
   }
   spec.query_task_count_ = op.query_task_count();
-  spec.filter_expr_count_ = op.get_type() == log_op_def::LOG_SEMANTIC_FILTER
+  spec.filter_expr_count_ = (op.get_type() == log_op_def::LOG_SEMANTIC_FILTER ||
+                            op.get_type() == log_op_def::LOG_SEMANTIC_JOIN)
       ? op.expressions().count() : 0;
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(generate_rt_exprs(op.expressions(), spec.expressions_))) {
@@ -1090,6 +1092,22 @@ int ObStaticEngineCG::generate_spec(LogSemanticFilter &op, SemanticFilterSpec &s
 {
   UNUSED(in_root_job);
   return generate_semantic_spec(op, spec);
+}
+
+int ObStaticEngineCG::generate_spec(LogSemanticJoin &op, SemanticJoinSpec &spec,
+                                    const bool in_root_job)
+{
+  UNUSED(in_root_job);
+  int ret = OB_SUCCESS;
+  if (op.candidate_left_tables().is_empty() || op.candidate_right_tables().is_empty() ||
+      op.join_exprs().empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("semantic join lost its candidate input bindings", K(ret));
+  } else if (OB_FAIL(generate_semantic_spec(op, spec))) {
+  } else if (OB_FAIL(generate_rt_exprs(op.join_exprs(), spec.join_exprs_))) {
+  } else if (OB_FAIL(spec.validate_bindings())) {
+  }
+  return ret;
 }
 
 int ObStaticEngineCG::generate_spec(ObLogOptimizerStatsGathering &op, ObOptimizerStatsGatheringSpec &spec, const bool in_root_job)
@@ -6421,6 +6439,10 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
     }
     case log_op_def::LOG_SEMANTIC_FILTER: {
       type = PHY_SEMANTIC_FILTER;
+      break;
+    }
+    case log_op_def::LOG_SEMANTIC_JOIN: {
+      type = PHY_SEMANTIC_JOIN;
       break;
     }
     case log_op_def::LOG_WINDOW_FUNCTION: {

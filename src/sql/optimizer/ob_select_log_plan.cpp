@@ -4961,12 +4961,16 @@ int collect_semantic_calls(ObRawExpr *expr, ObIArray<ObRawExpr *> &calls,
   } else if (stop_at_aggregate && expr->is_aggr_expr()) {
   } else {
     if (SemanticExprUtils::is_semantic(expr->get_expr_type())) {
-      if (expr->get_param_count() < 2 || expr->get_param_count() > 3 ||
+      const bool join = expr->get_expr_type() == T_FUN_SYS_AI_JOIN;
+      const int64_t min_params = join ? 4 : 2;
+      const int64_t max_params = min_params + 1;
+      const int64_t options_index = max_params - 1;
+      if (expr->get_param_count() < min_params || expr->get_param_count() > max_params ||
           !expr->get_param_expr(0)->is_static_scalar_const_expr() ||
-          (expr->get_param_count() == 3 &&
-           !expr->get_param_expr(2)->is_static_scalar_const_expr())) {
+          (expr->get_param_count() == max_params &&
+           !expr->get_param_expr(options_index)->is_static_scalar_const_expr())) {
         ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_MAP and AI_FILTER require static model and options");
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_MAP, AI_FILTER and AI_JOIN require static model and options");
       } else {
         ret = add_var_to_array_no_dup(calls, expr);
       }
@@ -4981,7 +4985,8 @@ int collect_semantic_calls(ObRawExpr *expr, ObIArray<ObRawExpr *> &calls,
 
 bool semantic_plan_present(const ObLogicalOperator &node)
 {
-  bool present = node.get_type() == LOG_SEMANTIC_MAP || node.get_type() == LOG_SEMANTIC_FILTER;
+  bool present = node.get_type() == LOG_SEMANTIC_MAP || node.get_type() == LOG_SEMANTIC_FILTER ||
+                 node.get_type() == LOG_SEMANTIC_JOIN;
   for (int64_t index = 0; !present && index < node.get_num_of_child(); ++index) {
     if (nullptr != node.get_child(index)) {
       present = semantic_plan_present(*node.get_child(index));
@@ -5008,7 +5013,8 @@ public:
         }
       }
       if (OB_SUCC(ret) && (node->get_type() == LOG_SEMANTIC_MAP ||
-                           node->get_type() == LOG_SEMANTIC_FILTER)) {
+                           node->get_type() == LOG_SEMANTIC_FILTER ||
+                           node->get_type() == LOG_SEMANTIC_JOIN)) {
         auto *semantic = static_cast<LogSemantic *>(node);
         if (OB_FAIL(stages_.push_back(semantic))) {
         } else {
@@ -5172,16 +5178,55 @@ private:
   int wrap(ObLogicalOperator *&child, const ObIArray<ObRawExpr *> &expressions, bool filter)
   {
     int ret = OB_SUCCESS;
-    auto *stage = static_cast<LogSemantic *>(plan_.get_log_op_factory().allocate(
-        plan_, filter ? LOG_SEMANTIC_FILTER : LOG_SEMANTIC_MAP));
-    if (OB_ISNULL(stage) || OB_ISNULL(child)) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("allocate semantic logical stage failed", K(ret));
+    ObSEArray<ObRawExpr *, 8> calls;
+    ObSEArray<ObRawExpr *, 4> join_calls;
+    LogSemantic *stage = nullptr;
+    if (OB_ISNULL(child)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("semantic stage has no candidate input", K(ret));
     } else {
-      ObSEArray<ObRawExpr *, 8> calls;
       for (int64_t index = 0; OB_SUCC(ret) && index < expressions.count(); ++index) {
         ret = collect_semantic_calls(expressions.at(index), calls, true);
       }
+      for (int64_t index = 0; OB_SUCC(ret) && index < calls.count(); ++index) {
+        if (calls.at(index)->get_expr_type() == T_FUN_SYS_AI_JOIN) {
+          ret = join_calls.push_back(calls.at(index));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && !join_calls.empty() &&
+        (!filter || child->get_type() != LOG_JOIN ||
+         static_cast<ObLogJoin *>(child)->get_join_type() != INNER_JOIN)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_JOIN requires an INNER JOIN candidate-pair input");
+      LOG_WARN("semantic join lost its candidate-pair boundary", K(ret), K(filter),
+               "candidate_operator", child->get_name());
+    }
+    if (OB_SUCC(ret)) {
+      const ObLogOpType type = !join_calls.empty() ? LOG_SEMANTIC_JOIN :
+          (filter ? LOG_SEMANTIC_FILTER : LOG_SEMANTIC_MAP);
+      stage = static_cast<LogSemantic *>(plan_.get_log_op_factory().allocate(plan_, type));
+      if (OB_ISNULL(stage)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("allocate semantic logical stage failed", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && !join_calls.empty()) {
+      auto &join = *static_cast<ObLogJoin *>(child);
+      auto &semantic_join = *static_cast<LogSemanticJoin *>(stage);
+      if (OB_ISNULL(join.get_child(ObLogicalOperator::first_child)) ||
+          OB_ISNULL(join.get_child(ObLogicalOperator::second_child))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("semantic join candidate generator lost an input", K(ret));
+      } else if (OB_FAIL(semantic_join.set_candidate_inputs(
+          join.get_child(ObLogicalOperator::first_child)->get_table_set(),
+          join.get_child(ObLogicalOperator::second_child)->get_table_set()))) {
+      }
+      for (int64_t index = 0; OB_SUCC(ret) && index < join_calls.count(); ++index) {
+        ret = semantic_join.add_join_expression(join_calls.at(index));
+      }
+    }
+    if (OB_SUCC(ret)) {
       for (ObRawExpr *call : calls) {
         if (OB_SUCC(ret) && ObOptimizerUtil::find_item(available_calls_, call)) {
           if (OB_FAIL(stage->add_shared_expression(call))) {

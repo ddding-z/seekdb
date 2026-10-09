@@ -112,6 +112,7 @@ void ObExprExtraInfoFactory::register_expr_extra_infos()
   REG_EXTRA_INFO(T_FUN_SYS_AI_RERANK, ObAIFuncExprInfo);
   REG_EXTRA_INFO(T_FUN_SYS_AI_MAP, ObAIFuncExprInfo);
   REG_EXTRA_INFO(T_FUN_SYS_AI_FILTER, ObAIFuncExprInfo);
+  REG_EXTRA_INFO(T_FUN_SYS_AI_JOIN, ObAIFuncExprInfo);
 }
 
 } // end namespace sql

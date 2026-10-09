@@ -1,6 +1,6 @@
 # AI Function、异步 Semantic Operators 与全局 SOLO 维护交接
 
-更新日期：2026-10-08。适用基线：`0532d6e33`，`feat(sql): add global SOLO prompt reordering`。
+更新日期：2026-10-09。适用基线：`8dcadbc7c`，`feat(sql): add asynchronous semantic map and filter operators`；本轮在该基线上增加 semantic join 首版。
 
 本文面向接手实现、调试和回归测试的开发者，覆盖 AI Function 异步运行时及全阻塞 SOLO。这里的 SOLO 是数据库端的输入排列算法，不是推理服务端的 KV cache 实现。
 
@@ -14,9 +14,10 @@
 | SQL worker 释放 | 符合准入条件的单语句 AI 根算子查询可挂起并从保留状态恢复，不重新执行整条 SQL |
 | 全局 SOLO | 收齐当前 AI 阶段的全部输入，完成一次列重排和行重排后才提交模型请求 |
 | AI_MAP / AI_FILTER | 显式逻辑和物理算子；独立表达式并发、依赖感知的跨批推进、严格布尔过滤 |
+| AI_JOIN | INNER JOIN ON 的显式语义连接；普通 SQL 候选对生成加有界异步判断，不做近似候选裁剪 |
 | 语义 PX | 经校验的 reduce-transmit / semantic / GI / scan 路径保留任务状态并释放物理 worker；同一查询共享预算 |
 
-旧 AI Function 与 SOLO 实现在上述基线提交中。本轮新增了 AI_MAP / AI_FILTER 和可恢复 PX 实现；下文保留旧路径的维护约束，不应把旧 SOLO 的单 worker 限制套到新接口上。
+旧 AI Function 与 SOLO、AI_MAP / AI_FILTER 和可恢复 PX 实现已在基线提交中。本轮新增 AI_JOIN；下文保留旧路径的维护约束，不应把旧 SOLO 的单 worker 限制套到新接口上。
 
 已有的 [RUNTIME_TESTS.md](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md) 是运行契约、测试入口和历史验收记录。本文解释当前架构、维护约束和排障路径；行为或测试变更时，两份文档应一起更新。外层工作区另有历史执行能力补齐计划，但它不是本仓库依赖，也不应被当作最新 SOLO 规范。
 
@@ -24,7 +25,8 @@
 
 | 提交 | 用途 |
 | --- | --- |
-| `0532d6e33` | 全局 SOLO 与相关验收；当前交接基线 |
+| `8dcadbc7c` | 异步 AI_MAP / AI_FILTER 与可恢复 PX；semantic join 的实现基线 |
+| `0532d6e33` | 全局 SOLO 与相关验收 |
 | `5bfa9aaed` | 可恢复的多槽 AI 流水线与共享预算 |
 | `b30697580` | 共享后台网络调度线程 |
 | `183defcac` | AI Function 跨 SQL batch 流水线 |
@@ -70,6 +72,57 @@ completion 退路。AI_FILTER 使用原有原生 `response_format.json_schema`�
 是保留键；AI_FILTER 拒绝该键，匹配的原生格式和调用者非空名称可以原样使用，
 冲突格式报错。AI_MAP 的 Schema 只是原有 provider 配置透传，不是新增简写。
 
+#### AI_JOIN：先跑通全部候选对，再谈缩小范围
+
+```sql
+SELECT l.id, r.id
+FROM left_inputs l
+JOIN right_inputs r
+  ON AI_JOIN('matcher', '判断两侧是否描述同一个实体',
+             l.description, r.description)
+ORDER BY l.id, r.id;
+```
+
+签名是 `AI_JOIN(model, rule, left_input, right_input[, options])`。首版只允许
+INNER JOIN 的 ON 条件，不作为 SELECT/WHERE/HAVING/GROUP/ORDER 的通用函数，
+也不支持 outer/semi/anti join。模型和 options 静态；规则是普通 SQL 字符串
+表达式，左右输入可为字符串或 JSON。每个输入必须只引用连接一侧的非空列集合，
+另一个输入引用另一侧；纯常量输入或单个输入跨两侧引用明确不支持。左右参数
+可反向填写，但参数角色不会随优化器交换 build/probe 侧而交换。
+
+规划层新增 SEMANTIC JOIN，保留候选生成器两侧的表集合和原始
+模型/规则/左右输入表达式。首版对包含 AI_JOIN 的语句保守禁止 join elimination：
+主键 self-join 虽然可以在关系上无损消除，但不能在语义 lowering 之前丢掉候选对
+边界。其他普通候选连接算法仍可使用。物理上采用组合实现：普通二元 SQL JOIN 流式生成
+候选行对，专用语义连接阶段复用现有异步运行时分批判断，不额外收齐整个
+笛卡尔积。普通 SQL 条件可以减少候选；除此以外不做 ANN、blocking、级联或
+文本去重。因此没有普通连接条件时仍可能有 N×M 次判断，重复文本的不同输入行
+不会合并，多对多匹配保留 SQL 重复行语义。
+
+普通 NLJ 可能每次只返回一对行，即使 EXPLAIN 显示 ROWSET=16。语义连接会先把
+这些碎片合并到配置的批大小，再占一个流水线槽，不能让两个槽退化成只有两个
+模型请求。末尾、上游等待或查询内存压力允许输出不足一批的已拥有候选；所有
+已保留数据仍参与预算，不能通过预先发送模型请求绕过额度。
+
+模型 prompt 是包含 rule、left、right 的 JSON 对象：字符串作为 JSON 字符串，
+JSON 输入保留其类型，不把普通字符串当模板展开。实际需要求值时，SQL NULL
+规则/输入报错，不能转换为 false；普通 SQL 短路可以避免未选中的调用。
+输出沿用 AI_FILTER 的严格布尔 value schema，默认名称 ai_join；匹配的调用者
+response_format 和名称可保留，Schema 保留键及格式冲突会明确报错。options
+仅配置模型请求，不宣称支持尚未实现的连接策略。
+
+异步批次、依赖、在途额度、保留内存、取消、deadline 和 rescan 清理复用现有
+语义底座；候选 JOIN 自己的 workarea 与语义保留缓冲分别计账。该版本不扩大
+任意二元 JOIN 的 PX 挂起准入，因此不能把跨批 HTTP 重叠当作整条 SQL 释放
+worker 的证据。测试入口是
+[test_semantic_join.py](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_join.py)，
+契约与验证记录见
+[Semantic Join Baseline](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md#semantic-join-baseline-2026-10-09)。
+
+rescan 要在调用框架的 child rescan 之前恢复原始输入 frame、取消旧任务和清空槽位。
+只在 inner_rescan 中恢复已经太晚：框架先重置子树，再把旧匹配行的 frame 盖回去，
+可能让后续轮次的行 ID 错位，即使 prompt 和模型结果仍正确。
+
 #### 所有权、资源与恢复
 
 - 每个执行上下文拥有自己的 SQL frame 和 readiness 列表；不同 PX 上下文不共享
@@ -105,27 +158,39 @@ completion 退路。AI_FILTER 使用原有原生 `response_format.json_schema`�
 | [ob_expr_ai_semantic.cpp](../../../src/sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.cpp) | 接口类型、严格布尔约束、静态参数和无同步退路 |
 | [ob_log_semantic.cpp](../../../src/sql/optimizer/ob_log_semantic.cpp) | 语义计算归属；[规划入口](../../../src/sql/optimizer/ob_select_log_plan.cpp) 负责阶段放置 |
 | [ob_semantic_op.cpp](../../../src/sql/engine/basic/ob_semantic_op.cpp) | 输入/结果所有权、按需表达式依赖、发送/轮询/跨批输出 |
+| [ob_transform_join_elimination.cpp](../../../src/sql/rewrite/ob_transform_join_elimination.cpp) | 语义 lowering 之前保留 AI_JOIN 的二元候选边界 |
 | [ob_semantic_runtime.cpp](../../../src/sql/engine/basic/ob_semantic_runtime.cpp) | 查询共享预算、失败传播、readiness 与安全挂起范围 |
 | [ob_px_worker.cpp](../../../src/sql/engine/px/ob_px_worker.cpp) | 保留 PX 上下文、逐 slice 恢复 TLS、取消和真实结束 |
 | [ob_px_task_continuation_store.h](../../../src/observer/omt/ob_px_task_continuation_store.h) | 有界记录、ready-only 驱动、lease 与 shutdown |
 
-真实私有 SQL 测试已经验证 8 分区、PARALLEL(4) 下同一 execution ID 的四个 task、
+map/filter 的真实私有 SQL 测试已经验证 8 分区、PARALLEL(4) 下同一 execution ID 的四个 task、
 多个实际 CPU thread、预算不随 DOP 放大、精确结果及调用次数。所有响应被扣住时
 PX active slice 归零，另一条并行查询复用相同物理线程；取消、deadline、provider
 错误后的连接/配额恢复，以及正常零退出码 shutdown 也通过。native 调度器压力测试
 与这份 SQL 证据要分开记录，HTTP 并发和 EXPLAIN DOP 本身不是多 worker 证明。
 
-本轮完整验证通过：39 项新接口 SQL 契约、26 项关系组合回归、8 项真实 PX 回归、
+2026-10-08 的 map/filter 基线验证通过：39 项新接口 SQL 契约、26 项关系组合回归、8 项真实 PX 回归、
 原有 105 项 AI Function SQL 契约，以及两个独立正常 shutdown。另有 11 项语义
 fixture 自测、120 次预算/挂起范围/并发 registry 回收/完成额度回收检查、78 项
 native 收集场景通过；PX 生命周期的 9 项用例重复 20 次及 ASan/UBSan 另有记录。
 此环境无法启动 TSan，不能算作 TSan 通过。测试只使用私有数据库和 loopback
 mock，没有调用真实模型或证明 SemBench 加速。
 
+2026-10-09 的 join 首版在最终 Debug 构建上重新验收通过：45/45 AI_JOIN SQL、
+14/14 join fixture 自测、39/39 map/filter SQL、26/26 关系组合、9/9 真实 PX、
+105/105 旧 AI Function/SOLO SQL、140 次原生资源/绑定/发现/挂起范围检查、
+78 项原生收集场景，以及旧流水线和 semantic PX 两个独立正常零退出码 shutdown。
+9 项 PX 中新增的 join 用例验证同一 execution ID 的四个 task、多个实际 CPU
+thread、全查询 32 个 held HTTP 请求上界、256 次精确候选判断和 128 对输出；
+它没有扩大任意 join 子树的 worker 释放准入。其余 8 项继续验证 map/filter
+的挂起和真实线程复用。
+
 目前做的是正确的阶段规划和执行底座：仍未实现包含模型延迟、费用、选择率和质量
-目标的 semantic CBO，也未实现近似检索/级联或专用集合级语义 join/aggregation。
-已有普通 JOIN 后的语义筛选、GROUP BY/HAVING 等组合不应被称为新的低复杂度语义
-连接算法。测试入口和最新记录见 [运行契约](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md#asynchronous-semantic-operators-2026-10-08)。
+目标的 semantic CBO，也未实现近似检索/级联、低复杂度语义连接或专用集合级
+语义 aggregation。新增 AI_JOIN 是保留完整候选的执行基线，不应被称为新的
+低复杂度连接算法。map/filter 测试记录见
+[运行契约](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md#asynchronous-semantic-operators-2026-10-08)，
+join 的新契约与验证记录见上面的 Semantic Join Baseline。
 
 ## 2. 如何使用和确认执行路径
 
@@ -285,7 +350,7 @@ SQL runner 使用私有临时数据库、Unix socket 和 loopback HTTP mock，�
 
 ### 已有验证证据
 
-基线中记录的最近一轮结果是 Debug 构建、105/105 SQL 契约、5 项夹具自测、原生资源测试和独立正常停机检查通过；105 项中有 10 项 SOLO 契约。记录日期为 2026-09-29，代码于 2026-10-08 提交。**本次撰写交接文档没有重新运行这些重型测试**，不能把历史通过记录当作以后修改后的验证。
+此前基线的历史记录是 Debug 构建、105/105 SQL 契约、5 项夹具自测、原生资源测试和独立正常停机检查通过；105 项中有 10 项 SOLO 契约。记录日期为 2026-09-29，代码于 2026-10-08 提交。2026-10-08 的交接撰写本身没有重跑这些测试；2026-10-09 的重新验收见第 1 节，不能把不同版本的历史记录混作当前证据。
 
 SOLO 覆盖全局跨批排列、末行非法零请求、条件前缀选列、JSON 类型/转义/大小写/重复行、乱序完成与局部重试、连接聚合、非法形态、额度复用、取消/超时/错误清理及 worker 释放。原生 rescan 证据是空输入反复扫描和诊断路径，不等于保留数据或在途请求时的完整 rescan 证明。
 

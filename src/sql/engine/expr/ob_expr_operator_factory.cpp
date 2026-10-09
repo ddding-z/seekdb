@@ -1051,6 +1051,7 @@ void ObExprOperatorFactory::register_expr_operators()
     REG_OP(ObExprAIPrompt);
     REG_OP(ExprAIMap);
     REG_OP(ExprAIFilter);
+    REG_OP(ExprAIJoin);
   }();
 }
 

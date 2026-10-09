@@ -51,6 +51,22 @@ class LogSemanticFilter : public LogSemantic
 public:
   explicit LogSemanticFilter(ObLogPlan &plan) : LogSemantic(plan) {}
 };
+
+class LogSemanticJoin : public LogSemantic
+{
+public:
+  explicit LogSemanticJoin(ObLogPlan &plan) : LogSemantic(plan) {}
+  int set_candidate_inputs(const ObRelIds &left, const ObRelIds &right);
+  int add_join_expression(ObRawExpr *expr);
+  int get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item) override;
+  const ObRelIds &candidate_left_tables() const { return candidate_left_tables_; }
+  const ObRelIds &candidate_right_tables() const { return candidate_right_tables_; }
+  const common::ObIArray<ObRawExpr *> &join_exprs() const { return join_exprs_; }
+private:
+  ObRelIds candidate_left_tables_;
+  ObRelIds candidate_right_tables_;
+  common::ObSEArray<ObRawExpr *, 4> join_exprs_;
+};
 }
 }
 #endif

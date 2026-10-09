@@ -918,6 +918,7 @@ typedef enum ObItemType
   T_FUN_SYS_BUCKET = 2086,
   T_FUN_SYS_AI_MAP = 2087,
   T_FUN_SYS_AI_FILTER = 2088,
+  T_FUN_SYS_AI_JOIN = 2089,
   T_MAX_OP = 3000,
 
   //pseudo column, to mark the group iterator id

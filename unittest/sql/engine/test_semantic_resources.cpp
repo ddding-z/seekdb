@@ -29,6 +29,7 @@
 #include <utility>
 #include <vector>
 #include "sql/engine/basic/ob_semantic_runtime.h"
+#include "sql/engine/basic/ob_semantic_op.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/ob_physical_plan.h"
@@ -638,6 +639,18 @@ void test_suspension_scope_defaults_and_override()
     }
     require(SemanticSuspendScope::allowed(), "ancestor teardown restores eligibility");
   }
+  for (ObPhyOperatorType type : {PHY_SEMANTIC_MAP, PHY_SEMANTIC_FILTER, PHY_SEMANTIC_JOIN}) {
+    {
+      SemanticSuspendScope semantic(type);
+      require(SemanticSuspendScope::allowed(), "semantic stages can suspend at their own boundary");
+      {
+        SemanticSuspendScope opening(type, true);
+        require(!SemanticSuspendScope::allowed(), "semantic open cannot unwind");
+      }
+      require(SemanticSuspendScope::allowed(), "semantic open teardown restores eligibility");
+    }
+    require(SemanticSuspendScope::allowed(), "semantic scope teardown restores eligibility");
+  }
   for (ObPhyOperatorType type : {PHY_SORT, PHY_HASH_GROUP_BY, PHY_PX_REDUCE_TRANSMIT}) {
     {
       SemanticSuspendScope unverified(type);
@@ -684,6 +697,69 @@ void test_suspension_scope_thread_isolation()
   require(SemanticSuspendScope::allowed(), "main eligibility remains unchanged");
 }
 
+void test_semantic_join_bindings()
+{
+  ObArenaAllocator allocator("SemanticTest");
+  SemanticJoinSpec spec(allocator, PHY_SEMANTIC_JOIN);
+  ObExpr arguments[5];
+  ObExpr *argument_pointers[] = {
+    &arguments[0], &arguments[1], &arguments[2], &arguments[3], &arguments[4]
+  };
+  ObExpr first;
+  first.type_ = T_FUN_SYS_AI_JOIN;
+  first.arg_cnt_ = 4;
+  first.args_ = argument_pointers;
+  ObExpr second;
+  second.type_ = T_FUN_SYS_AI_JOIN;
+  second.arg_cnt_ = 5;
+  second.args_ = argument_pointers;
+  require_equal(spec.validate_bindings(), OB_ERR_UNEXPECTED, "empty pair bindings are rejected");
+  require_equal(spec.join_exprs_.init(2), OB_SUCCESS, "allocate join predicate bindings");
+  require_equal(spec.semantic_exprs_.init(2), OB_SUCCESS, "allocate semantic task bindings");
+  require_equal(spec.join_exprs_.push_back(&first), OB_SUCCESS, "bind first pair predicate");
+  require_equal(spec.validate_bindings(), OB_ERR_UNEXPECTED, "bound pair must have a semantic task");
+  require_equal(spec.semantic_exprs_.push_back(&first), OB_SUCCESS, "bind first semantic task");
+  require_equal(spec.validate_bindings(), OB_SUCCESS, "four-argument pair predicate binding");
+  first.arg_cnt_ = 3;
+  require_equal(spec.validate_bindings(), OB_ERR_UNEXPECTED, "invalid pair predicate arity");
+  first.arg_cnt_ = 4;
+  first.type_ = T_FUN_SYS_AI_FILTER;
+  require_equal(spec.validate_bindings(), OB_ERR_UNEXPECTED, "filter cannot masquerade as pair predicate");
+  first.type_ = T_FUN_SYS_AI_JOIN;
+  first.args_ = nullptr;
+  require_equal(spec.validate_bindings(), OB_ERR_UNEXPECTED, "missing argument vector");
+  first.args_ = argument_pointers;
+  argument_pointers[2] = nullptr;
+  require_equal(spec.validate_bindings(), OB_ERR_UNEXPECTED, "missing left input");
+  argument_pointers[2] = &arguments[2];
+  require_equal(spec.semantic_exprs_.push_back(&second), OB_SUCCESS, "bind second semantic task");
+  require_equal(spec.validate_bindings(), OB_ERR_UNEXPECTED, "every pair task needs a binding");
+  require_equal(spec.join_exprs_.push_back(&second), OB_SUCCESS, "bind second pair predicate");
+  require_equal(spec.validate_bindings(), OB_SUCCESS, "five-argument pair predicate binding");
+}
+
+void test_semantic_join_detection()
+{
+  ObArenaAllocator allocator("SemanticTest");
+  ObOpSpec left(allocator, PHY_TABLE_SCAN);
+  ObOpSpec right(allocator, PHY_EXPR_VALUES);
+  ObOpSpec candidates(allocator, PHY_NESTED_LOOP_JOIN);
+  ObOpSpec root(allocator, PHY_SORT);
+  SemanticJoinSpec semantic_join(allocator, PHY_SEMANTIC_JOIN);
+  ObOpSpec *candidate_children[] = {&left, &right};
+  ObOpSpec *semantic_children[] = {&candidates};
+  ObOpSpec *root_children[] = {&candidates};
+  require_equal(candidates.set_children_pointer(candidate_children, 2), OB_SUCCESS, "bind candidate inputs");
+  require_equal(root.set_children_pointer(root_children, 1), OB_SUCCESS, "bind ordinary candidate tree");
+  require(!root.has_semantic_operator(), "ordinary binary join is not a semantic stage");
+  require(semantic_join.has_semantic_operator(), "semantic join is recognized at its own boundary");
+  require_equal(semantic_join.set_children_pointer(semantic_children, 1), OB_SUCCESS, "bind candidate generator");
+  require_equal(root.set_child(0, &semantic_join), OB_SUCCESS, "install semantic stage");
+  require(root.has_semantic_operator(), "semantic join detection traverses ordinary ancestors");
+  require_equal(root.set_child(0, &candidates), OB_SUCCESS, "restore ordinary tree");
+  require(!root.has_semantic_operator(), "restoring ordinary tree clears semantic detection");
+}
+
 struct TestCase
 {
   const char *name_;
@@ -704,6 +780,8 @@ const TestCase TESTS[] = {
    test_completed_producers_release_credits_without_another_pull},
   {"suspension_scope_defaults_and_override", test_suspension_scope_defaults_and_override},
   {"suspension_scope_thread_isolation", test_suspension_scope_thread_isolation},
+  {"semantic_join_bindings", test_semantic_join_bindings},
+  {"semantic_join_detection", test_semantic_join_detection},
 };
 } // namespace
 

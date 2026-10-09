@@ -211,6 +211,13 @@ ObLogicalOperator *ObLogOperatorFactory::allocate(ObLogPlan &plan, ObLogOpType t
     }
     break;
   }
+  case LOG_SEMANTIC_JOIN: {
+    ptr = allocator_.alloc(sizeof(LogSemanticJoin));
+    if (NULL != ptr) {
+      ret_op = new (ptr) LogSemanticJoin(plan);
+    }
+    break;
+  }
   case LOG_MATERIAL: {
     ptr = allocator_.alloc(sizeof(ObLogMaterial));
     if (NULL != ptr) {

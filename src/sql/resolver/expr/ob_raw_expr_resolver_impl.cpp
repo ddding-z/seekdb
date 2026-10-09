@@ -5349,6 +5349,10 @@ int ObRawExprResolverImpl::process_fun_sys_node(const ParseNode *node,
     type = ObExprOperatorFactory::get_type_by_name(func_name);
     if (OB_UNLIKELY(T_INVALID == (type))) {
       ret = OB_ERR_FUNCTION_UNKNOWN;
+    } else if (type == T_FUN_SYS_AI_JOIN && ctx_.current_scope_ != T_ON_SCOPE) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_JOIN is only supported within INNER JOIN ON");
+      LOG_WARN("AI_JOIN is outside a join ON condition", K(ret), K(ctx_.current_scope_));
     }
   }
 

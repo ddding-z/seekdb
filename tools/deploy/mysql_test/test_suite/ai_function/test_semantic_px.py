@@ -1,5 +1,6 @@
 """Private SQL PX contracts with gated replies and actual task/thread evidence."""
 
+import json
 import os
 from pathlib import Path
 import re
@@ -11,7 +12,7 @@ import time
 import pymysql
 
 import test_semantic_runtime as semantic
-from test_runtime_contracts import Reply, answer
+from test_runtime_contracts import Reply, answer, completion
 
 
 PREPARE = re.compile(
@@ -134,6 +135,51 @@ class SemanticPXContracts(semantic.SemanticContracts):
         pending, gate, _records = self.start_held_map()
         gate.set()
         self.assert_map_rows(pending.result(timeout=20), self.mock_a)
+
+    def test_parallel_join_preserves_pairs_and_shares_admission(self):
+        rule = "Keep even matching pairs."
+        statement = (
+            "SELECT /*+ PARALLEL(4) OPT_PARAM('rowsets_max_rows', 16) USE_HASH(b) */ "
+            "a.id, b.id FROM semantic_px_inputs a INNER JOIN semantic_px_inputs b "
+            "ON a.id = b.id AND AI_JOIN('semantic_a', 'Keep even matching pairs.', "
+            "a.prompt, b.prompt) ORDER BY a.id, b.id")
+        self.assert_plan_labels(statement, ("PX COORDINATOR", "SEMANTIC JOIN", "DOP=4"))
+        gate = self.fixtures.gate()
+        prompts = []
+        for index, value in enumerate(self.prompts):
+            prompt = json.dumps({"rule": rule, "left": value, "right": value},
+                                separators=(",", ":"))
+            prompts.append(prompt)
+            self.mock_a.scenarios[prompt] = [Reply(
+                body=completion(json.dumps({"value": index % 2 == 0}), finish_reason="stop"),
+                gate=gate)]
+        start = self.log.stat().st_size
+        pending = self.fixtures.start(lambda: self.select_join_pairs(statement))
+        semantic.wait_evidence(
+            self, self.mock_a, lambda: len(self.mock_a.requests) >= ADMITTED_ROWS, pending,
+            message="parallel semantic join did not fill its query-wide admission window")
+        records = self.wait_for_preparations(start)
+        self.assertEqual(len({record[0] for record in records}), 1)
+        self.assertGreaterEqual(len({record[3] for record in records}), 2)
+        semantic.assert_held(self, self.mock_a, [gate])
+        with self.mock_a.condition:
+            self.mock_a.condition.wait_for(
+                lambda: len(self.mock_a.requests) > ADMITTED_ROWS or pending.done.is_set(),
+                timeout=0.2)
+            self.assertEqual(len(self.mock_a.requests), ADMITTED_ROWS,
+                             "DOP multiplied semantic join's shared admission window")
+        gate.set()
+        self.assertEqual(sorted(pending.result(timeout=20)),
+                         [(index, index) for index in range(ROWS) if index % 2 == 0])
+        self.assert_counts(self.mock_a, prompts)
+        self.assert_counts(self.mock_b, [])
+        for body in self.mock_a.requests:
+            semantic.assert_filter_request(self, body)
+            self.assertEqual(body["response_format"]["json_schema"]["name"], "ai_join")
+
+    def select_join_pairs(self, statement):
+        self.cursor.execute(statement)
+        return self.cursor.fetchall()
 
     def test_suspended_px_drivers_execute_another_parallel_query(self):
         pending, gate, records = self.start_held_map()

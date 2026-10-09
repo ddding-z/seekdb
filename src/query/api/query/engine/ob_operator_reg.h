@@ -162,13 +162,18 @@ REGISTER_OPERATOR(LogAIFunc, PHY_AI_FUNC, AIFuncSpec, AIFuncOp, NOINPUT,
 
 class LogSemanticMap;
 class LogSemanticFilter;
+class LogSemanticJoin;
 class SemanticMapSpec;
 class SemanticFilterSpec;
+class SemanticJoinSpec;
 class SemanticMapOp;
 class SemanticFilterOp;
+class SemanticJoinOp;
 REGISTER_OPERATOR(LogSemanticMap, PHY_SEMANTIC_MAP, SemanticMapSpec, SemanticMapOp, NOINPUT,
                   VECTORIZED_OP);
 REGISTER_OPERATOR(LogSemanticFilter, PHY_SEMANTIC_FILTER, SemanticFilterSpec, SemanticFilterOp, NOINPUT,
+                  VECTORIZED_OP);
+REGISTER_OPERATOR(LogSemanticJoin, PHY_SEMANTIC_JOIN, SemanticJoinSpec, SemanticJoinOp, NOINPUT,
                   VECTORIZED_OP);
 
 class ObMaterialSpec;
