@@ -279,7 +279,10 @@ cc_library(
 
 cc_library(
     name = "query_runtime_environment",
-    hdrs = ["api/query/runtime/ob_query_runtime_environment.h"],
+    hdrs = [
+        "api/query/runtime/ob_px_task_continuation.h",
+        "api/query/runtime/ob_query_runtime_environment.h",
+    ],
     includes = ["api"],
     features = ["layering_check"],
     tags = ["manual"],

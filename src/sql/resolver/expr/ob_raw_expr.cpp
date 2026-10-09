@@ -847,7 +847,8 @@ ObRawExpr *&ObTerminalRawExpr::get_param_expr(int64_t index)
 
 bool ObRawExpr::is_bool_expr() const
 {
-  return IS_BOOL_OP(type_) || (is_const_raw_expr() && static_cast<const ObConstRawExpr*>(this)->is_literal_bool());
+  return IS_BOOL_OP(type_) || T_FUN_SYS_AI_FILTER == type_
+         || (is_const_raw_expr() && static_cast<const ObConstRawExpr*>(this)->is_literal_bool());
 }
 
 bool ObRawExpr::is_json_expr() const
@@ -922,6 +923,8 @@ int ObRawExpr::is_const_inherit_expr(bool &is_const_inherit,
       || T_FUN_SYS_GUID == type_
       || T_FUN_SYS_STMT_ID == type_
       || T_FUN_SYS_SLEEP == type_
+      || T_FUN_SYS_AI_MAP == type_
+      || T_FUN_SYS_AI_FILTER == type_
       || T_OP_ASSIGN == type_
       || T_FUN_SYS_REMOVE_CONST == type_
       || T_FUN_SYS_WRAPPER_INNER == type_
@@ -1004,6 +1007,8 @@ int ObRawExpr::is_non_pure_sys_func_expr(bool &is_non_pure) const
         || T_FUN_SYS_UUID == type_
         || T_FUN_SYS_UUID_SHORT == type_
         || T_FUN_SYS_SLEEP == type_
+        || T_FUN_SYS_AI_MAP == type_
+        || T_FUN_SYS_AI_FILTER == type_
         || T_FUN_SYS_LAST_INSERT_ID == type_
         || T_FUN_SYS_ROW_COUNT == type_
         || T_FUN_SYS_FOUND_ROWS == type_

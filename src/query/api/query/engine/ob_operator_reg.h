@@ -160,6 +160,17 @@ class AIFuncOp;
 REGISTER_OPERATOR(LogAIFunc, PHY_AI_FUNC, AIFuncSpec, AIFuncOp, NOINPUT,
                   VECTORIZED_OP);
 
+class LogSemanticMap;
+class LogSemanticFilter;
+class SemanticMapSpec;
+class SemanticFilterSpec;
+class SemanticMapOp;
+class SemanticFilterOp;
+REGISTER_OPERATOR(LogSemanticMap, PHY_SEMANTIC_MAP, SemanticMapSpec, SemanticMapOp, NOINPUT,
+                  VECTORIZED_OP);
+REGISTER_OPERATOR(LogSemanticFilter, PHY_SEMANTIC_FILTER, SemanticFilterSpec, SemanticFilterOp, NOINPUT,
+                  VECTORIZED_OP);
+
 class ObMaterialSpec;
 class ObMaterialOp;
 class ObMaterialOpInput;

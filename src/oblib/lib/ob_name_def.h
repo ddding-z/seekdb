@@ -1091,4 +1091,6 @@
 #define N_AI_EMBED                          "ai_embed"
 #define N_AI_RERANK                         "ai_rerank"
 #define N_AI_PROMPT                         "ai_prompt"
+#define N_AI_MAP                            "ai_map"
+#define N_AI_FILTER                         "ai_filter"
 #endif //OCEANBASE_LIB_OB_NAME_DEF_H_

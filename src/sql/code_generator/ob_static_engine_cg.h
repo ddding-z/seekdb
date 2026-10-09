@@ -37,6 +37,12 @@ class ObLogMaterial;
 class ObMaterialSpec;
 class LogAIFunc;
 class AIFuncSpec;
+class LogSemantic;
+class LogSemanticMap;
+class LogSemanticFilter;
+class SemanticSpec;
+class SemanticMapSpec;
+class SemanticFilterSpec;
 class ObLogSort;
 class ObSortSpec;
 class ObLogSet;
@@ -245,7 +251,8 @@ private:
                           common::ObIArray<ObExpr *> &calc_exprs,
                           const log_op_def::ObLogOpType log_type,
                           bool check_eval_once,
-                          bool need_flatten_gen_col = true);
+                          bool need_flatten_gen_col = true,
+                          const common::ObIArray<ObRawExpr *> *stage_exprs = nullptr);
 
   /////////////////////////////////////////////////////////////////////////////////
   //
@@ -276,6 +283,9 @@ private:
 
   int generate_spec(ObLogMaterial &op, ObMaterialSpec &spec, const bool in_root_job);
   int generate_spec(LogAIFunc &op, AIFuncSpec &spec, const bool in_root_job);
+  int generate_semantic_spec(LogSemantic &op, SemanticSpec &spec);
+  int generate_spec(LogSemanticMap &op, SemanticMapSpec &spec, const bool in_root_job);
+  int generate_spec(LogSemanticFilter &op, SemanticFilterSpec &spec, const bool in_root_job);
 
   int generate_spec(ObLogSort &op, ObSortSpec &spec, const bool in_root_job);
 

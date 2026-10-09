@@ -50,16 +50,18 @@ class ObPxReduceTransmitOp : public ObPxTransmitOp
 {
 public:
   ObPxReduceTransmitOp(ObExecContext &exec_ctx, const ObOpSpec &spec, ObOpInput *input)
-  : ObPxTransmitOp(exec_ctx, spec, input)
+  : ObPxTransmitOp(exec_ctx, spec, input), resumable_slice_calc_(nullptr)
   {}
   virtual ~ObPxReduceTransmitOp() {}
 public:
   virtual int inner_open() override;
   virtual int inner_rescan() override { return ObPxTransmitOp::inner_rescan(); }
-  virtual void destroy() override {return ObPxTransmitOp::destroy(); }
+  virtual void destroy() override;
   virtual int inner_close() override;
 
   virtual int do_transmit() override;
+private:
+  ObAllToOneSliceIdxCalc *resumable_slice_calc_;
 };
 
 } // end namespace sql

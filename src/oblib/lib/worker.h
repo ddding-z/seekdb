@@ -43,6 +43,7 @@ public:
   void cancel(int ret) { cancel_ret_ = ret; }
   int cancel_ret() const { return cancel_ret_; }
   bool is_pending() const { return nullptr != ready_; }
+  bool owns(const void *owner) const { return owner_ == owner; }
   bool is_ready() const { return is_pending() && ready_(data_); }
   static RequestAwait *current() { return current_; }
   static bool suspend(const void *owner, const void *data, ReadyCheck ready)

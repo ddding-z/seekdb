@@ -228,6 +228,12 @@ int ObLimitOp::inner_get_next_row()
 }
 
 // Batch version of ObLimitOp::inner_get_next_row
+bool ObLimitOp::supports_semantic_suspend() const
+{
+  return spec_.is_vectorized() && !MY_SPEC.calc_found_rows_ &&
+         !MY_SPEC.is_fetch_with_ties_ && nullptr == MY_SPEC.percent_expr_;
+}
+
 int ObLimitOp::inner_get_next_batch(const int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
@@ -245,7 +251,7 @@ int ObLimitOp::inner_get_next_batch(const int64_t max_row_cnt)
     } else {
       input_cnt_ += (child_brs->size_ - child_brs->skip_->accumulate_bit_cnt(child_brs->size_));
     }
-    if (child_brs->end_) {
+    if (OB_SUCC(ret) && child_brs->end_) {
       brs_.end_ = true;
       break;
     }
@@ -291,7 +297,11 @@ int ObLimitOp::inner_get_next_batch(const int64_t max_row_cnt)
       }
 
       if (!skip_fetch_rows && OB_FAIL(child_->get_next_batch(batch_cnt, child_brs))) {
-        LOG_WARN("child_op failed to get next row", K(ret), K(limit_), K(batch_cnt));
+        if (ret != OB_EAGAIN || nullptr == lib::RequestAwait::current() ||
+            !lib::RequestAwait::current()->owns(&ctx_) ||
+            !lib::RequestAwait::current()->is_pending()) {
+          LOG_WARN("child_op failed to get next row", K(ret), K(limit_), K(batch_cnt));
+        }
       } else if (is_percent_first_ && OB_FAIL(convert_limit_percent())) {
         LOG_WARN("failed to convert limit percent", K(ret));
       } else if (limit_ == 0) {

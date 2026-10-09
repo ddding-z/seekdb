@@ -20,6 +20,8 @@
 #include "sql/engine/expr/ob_expr_estimate_ndv.h"
 #include "share/rc/ob_server_runtime.h"
 #include "sql/engine/px/ob_px_util.h"
+#include "sql/engine/basic/ob_semantic_runtime.h"
+#include "lib/worker.h"
 
 namespace oceanbase
 {
@@ -163,6 +165,8 @@ int ObGroupRowHashTable::likely_equal(
 
 void ObHashGroupByOp::reset()
 {
+  reset_batch_collection();
+  dump_started_ = false;
   curr_group_id_ = common::OB_INVALID_INDEX;
   cur_group_item_idx_ = 0;
   cur_group_item_buf_ = nullptr;
@@ -401,6 +405,7 @@ int ObHashGroupByOp::init_group_store()
 
 int ObHashGroupByOp::inner_close()
 {
+  reset_batch_collection();
   sql_mem_processor_.unregister_profile();
   distinct_sql_mem_processor_.unregister_profile();
   curr_group_id_ = common::OB_INVALID_INDEX;
@@ -422,6 +427,8 @@ int ObHashGroupByOp::init_mem_context()
 
 void ObHashGroupByOp::destroy()
 {
+  reset_batch_collection();
+  batch_collection_.~BatchCollectionState();
   sql_mem_processor_.unregister_profile_if_necessary();
   distinct_sql_mem_processor_.unregister_profile_if_necessary();
   dup_groupby_exprs_.reset();
@@ -1315,6 +1322,7 @@ int ObHashGroupByOp::setup_dump_env(const int64_t part_id, const int64_t input_r
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(input_rows), KP(parts));
   } else {
+    dump_started_ = true;
     int64_t pre_part_cnt = 0;
     part_cnt = pre_part_cnt = detect_part_cnt(input_rows);
     adjust_part_cnt(part_cnt);
@@ -1477,10 +1485,13 @@ int ObHashGroupByOp::inner_get_next_batch(const int64_t max_row_cnt)
             K(agged_dumped_cnt_), K(agged_group_cnt_), K(agged_row_cnt_),
             K(max_row_cnt), K(MY_SPEC.max_batch_size_));
   int64_t op_max_batch_size = min(max_row_cnt, MY_SPEC.max_batch_size_);
-  if (iter_end_) {
+  if (BatchCollectionState::Phase::FAILED == batch_collection_.phase_) {
+    ret = batch_collection_.error_;
+  } else if (iter_end_) {
     brs_.size_ = 0;
     brs_.end_ = true;
-  } else if (curr_group_id_ < 0 && !bypass_ctrl_.by_passing()) {
+  } else if (BatchCollectionState::Phase::COLLECTING == batch_collection_.phase_
+             || (curr_group_id_ < 0 && !bypass_ctrl_.by_passing())) {
     if (bypass_ctrl_.by_pass_ctrl_enabled_ && force_by_pass_) {
       curr_group_id_ = 0;
       bypass_ctrl_.start_by_pass();
@@ -1515,6 +1526,7 @@ int ObHashGroupByOp::inner_get_next_batch(const int64_t max_row_cnt)
   }
 
   if (OB_SUCC(ret) && !brs_.end_) {
+    SemanticSuspendScope output_scope(MY_SPEC.type_);
     clear_evaluated_flag();
     if (!bypass_ctrl_.by_passing() && curr_group_id_ >= local_group_rows_.size()) {
       if (bypass_ctrl_.processing_ht()
@@ -1584,35 +1596,89 @@ int ObHashGroupByOp::inner_get_next_batch(const int64_t max_row_cnt)
   return ret;
 }
 
+bool ObHashGroupByOp::supports_semantic_suspend() const
+{
+  return is_vectorized() && !MY_SPEC.by_pass_enabled_ && !force_by_pass_
+      && MY_SPEC.aggr_stage_ == ObThreeStageAggrStage::NONE_STAGE
+      && !aggr_processor_.has_distinct() && !aggr_processor_.has_order_by()
+      && !force_dump_ && !dump_started_ && !use_distinct_data_
+      && nullptr == batch_collection_.cur_part_ && batch_collection_.part_cnt_ == 0
+      && nullptr == batch_collection_.bloom_filter_ && dumped_group_parts_.is_empty();
+}
+
+int ObHashGroupByOp::finish_batch_collection(bool dump_success)
+{
+  int ret = OB_SUCCESS;
+  BatchCollectionState &state = batch_collection_;
+  state.row_store_iter_.reset();
+  if (OB_FAIL(cleanup_dump_env(dump_success, state.part_id_, state.parts_,
+                              state.part_cnt_, state.bloom_filter_))) {
+    LOG_WARN("cleanup batch dump environment failed", K(ret), K(state.part_id_));
+  }
+  if (nullptr != state.cur_part_) {
+    if (OB_ISNULL(mem_context_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("batch partition has no memory context", K(ret));
+    } else {
+      state.cur_part_->~DatumStoreLinkPartition();
+      mem_context_->get_malloc_allocator().free(state.cur_part_);
+      state.cur_part_ = nullptr;
+    }
+  }
+  state.reset();
+  return ret;
+}
+
+void ObHashGroupByOp::reset_batch_collection()
+{
+  if (BatchCollectionState::Phase::COLLECTING == batch_collection_.phase_) {
+    int ret = finish_batch_collection(false);
+    if (OB_SUCCESS != ret) {
+      LOG_WARN("failed to reset hash group by batch collection", K(ret));
+    }
+  } else {
+    batch_collection_.reset();
+  }
+}
+
 int ObHashGroupByOp::load_data_batch(int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
-  ObChunkDatumStore::Iterator row_store_iter;
-  DatumStoreLinkPartition *cur_part = NULL;
-  int64_t part_id = 0;
-  int64_t part_shift = part_shift_; // low half bits for hash table lookup.
-  int64_t input_rows = get_input_rows();
-  int64_t input_size = get_input_size();
+  BatchCollectionState &state = batch_collection_;
+  ObChunkDatumStore::Iterator &row_store_iter = state.row_store_iter_;
+  DatumStoreLinkPartition *&cur_part = state.cur_part_;
+  int64_t &part_id = state.part_id_;
+  int64_t &part_shift = state.part_shift_;
+  int64_t &input_rows = state.input_rows_;
+  int64_t &input_size = state.input_size_;
   static_assert(MAX_PARTITION_CNT <= (1 << (CHAR_BIT)), "max partition cnt is too big");
 
-  if (!dumped_group_parts_.is_empty() || (is_init_distinct_data_ && !use_distinct_data_)) {
-    // not force dump for dumped data, avoid too many recursion
-    force_dump_ = false;
-    if (OB_FAIL(switch_part(cur_part, row_store_iter, part_id,
-                            part_shift, input_rows, input_size))) {
+  if (BatchCollectionState::Phase::FAILED == state.phase_) {
+    return state.error_;
+  } else if (BatchCollectionState::Phase::IDLE == state.phase_) {
+    SemanticSuspendScope init_scope(MY_SPEC.type_);
+    state.phase_ = BatchCollectionState::Phase::COLLECTING;
+    part_shift = part_shift_;
+    input_rows = get_input_rows();
+    input_size = get_input_size();
+    if (!dumped_group_parts_.is_empty() || (is_init_distinct_data_ && !use_distinct_data_)) {
+      // not force dump for dumped data, avoid too many recursion
+      force_dump_ = false;
+      if (OB_FAIL(switch_part(cur_part, row_store_iter, part_id,
+                              part_shift, input_rows, input_size))) {
+      }
     }
   }
 
   // We use sort based group by for aggregation which need distinct or sort right now,
   // disable operator dump for compatibility.
-  DatumStoreLinkPartition *parts[MAX_PARTITION_CNT] = {};
-  int64_t part_cnt = 0;
-  int64_t est_part_cnt = 0;
+  DatumStoreLinkPartition **parts = state.parts_;
+  int64_t &part_cnt = state.part_cnt_;
+  int64_t &est_part_cnt = state.est_part_cnt_;
   bool check_dump = false;
-  ObGbyBloomFilter *bloom_filter = NULL;
+  ObGbyBloomFilter *&bloom_filter = state.bloom_filter_;
   const ObChunkDatumStore::StoredRow **store_rows = NULL;
-  int64_t loop_cnt = 0;
-  int64_t last_batch_size = 0;
+  int64_t &loop_cnt = state.loop_cnt_;
 
   while (OB_SUCC(ret)) {
     bypass_ctrl_.gby_process_state(local_group_rows_.get_probe_cnt(),
@@ -1625,8 +1691,33 @@ int ObHashGroupByOp::load_data_batch(int64_t max_row_cnt)
     const ObBatchRows *child_brs = NULL;
     start_calc_hash_idx_ = 0;
     has_calc_base_hash_ = false;
-    if (OB_FAIL(next_batch(NULL != cur_part, row_store_iter, max_row_cnt, child_brs))) {
-    } else if (child_brs->size_ > 0) {
+    lib::RequestAwait *await = lib::RequestAwait::current();
+    if (nullptr != await && await->owns(&ctx_) && OB_FAIL(await->cancel_ret())) {
+      LOG_WARN("hash group by input collection cancelled", K(ret), K(part_id), K(loop_cnt));
+    } else if (OB_FAIL(try_check_status())) {
+    } else {
+      const bool can_suspend = supports_semantic_suspend();
+      {
+        SemanticSuspendScope fetch_scope(MY_SPEC.type_, false, can_suspend);
+        ret = next_batch(NULL != cur_part, row_store_iter, max_row_cnt, child_brs);
+      }
+      if (OB_FAIL(ret)) {
+        await = lib::RequestAwait::current();
+        if (nullptr != await && await->owns(&ctx_) && OB_SUCCESS != await->cancel_ret()) {
+          ret = await->cancel_ret();
+        } else if (ret == OB_EAGAIN && nullptr == cur_part && !use_distinct_data_
+            && can_suspend && nullptr != await && await->owns(&ctx_)
+            && await->is_pending()) {
+          brs_.size_ = 0;
+          brs_.end_ = false;
+          return ret;
+        }
+        LOG_WARN("failed to collect hash group by input batch", K(ret), K(part_id), K(loop_cnt));
+      }
+    }
+    if (OB_SUCC(ret) && child_brs->size_ > 0) {
+      // No borrowed child batch or partially aggregated group crosses a wait.
+      SemanticSuspendScope aggregate_scope(MY_SPEC.type_);
       if (NULL != cur_part) {
         store_rows = batch_rows_from_dump_;
       }
@@ -1673,11 +1764,12 @@ int ObHashGroupByOp::load_data_batch(int64_t max_row_cnt)
       if (child_brs->end_) {
         break;
       }
-    } else {
+    } else if (OB_SUCC(ret) && child_brs->end_) {
       break;
     }
   } // while end
 
+  SemanticSuspendScope finish_scope(MY_SPEC.type_);
   if (OB_FAIL(ret)) {
   } else if (bypass_ctrl_.by_pass_ctrl_enabled_ && MY_SPEC.skew_detection_enabled_
       && OB_FAIL(popular_value_detect())) {
@@ -1696,17 +1788,17 @@ int ObHashGroupByOp::load_data_batch(int64_t max_row_cnt)
     LOG_WARN("failed to finish insert distinct data", K(ret));
   }
 
-  // cleanup_dump_env() must be called whether success or not
-  int tmp_ret = cleanup_dump_env(common::OB_SUCCESS == ret, part_id, parts, part_cnt, bloom_filter);
+  // A pending child returned above without finishing or releasing collection.
+  int tmp_ret = finish_batch_collection(common::OB_SUCCESS == ret);
   if (OB_SUCCESS != tmp_ret) {
     LOG_WARN("cleanup dump environment failed", K(tmp_ret), K(ret));
     ret = OB_SUCCESS == ret ? tmp_ret : ret;
   }
 
-  if (NULL != mem_context_ && NULL != cur_part) {
-    cur_part->~DatumStoreLinkPartition();
-    mem_context_->get_malloc_allocator().free(cur_part);
-    cur_part = NULL;
+  if (OB_FAIL(ret)) {
+    state.phase_ = BatchCollectionState::Phase::FAILED;
+    state.error_ = ret;
+    LOG_WARN("hash group by batch collection failed", K(ret));
   }
   IGNORE_RETURN sql_mem_processor_.update_used_mem_size(get_mem_used_size());
 

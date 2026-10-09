@@ -85,7 +85,8 @@ int ObExprAIComplete::calc_result_typeN(ObExprResType &type,
 
 int ObExprAIComplete::prepare_input(const ObExpr &expr, ObEvalCtx &ctx,
                                     MultimodeAlloctor &temp_allocator, ObString &model_id,
-                                    ObString &prompt, ObJsonObject *&config, ObJsonObject **fields)
+                                    ObString &prompt, ObJsonObject *&config, ObJsonObject **fields,
+                                    bool parse_config)
 {
   INIT_SUCC(ret);
   if (nullptr != fields) {
@@ -138,7 +139,7 @@ int ObExprAIComplete::prepare_input(const ObExpr &expr, ObEvalCtx &ctx,
     }
 
     if (OB_FAIL(ret)) {
-    } else if (OB_NOT_NULL(arg_config)) {
+    } else if (parse_config && OB_NOT_NULL(arg_config)) {
       if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_config, expr.args_[2]->datum_meta_, expr.args_[2]->obj_meta_.has_lob_header(), config_str))) {
       } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(temp_allocator, config_str, config))) {
       }

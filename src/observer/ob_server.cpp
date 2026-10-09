@@ -567,6 +567,51 @@ int ObServer::submit_px_task(
   return ret;
 }
 
+int ObServer::submit_resumable_px_task(
+    int64_t group_id,
+    query::IPxTaskContinuation *task) const
+{
+  int ret = OB_SUCCESS;
+  omt::ObPxPool *pool = nullptr;
+  static constexpr int64_t MAX_ATTEMPTS = 100;
+  if (OB_ISNULL(task)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("resumable PX task is null", K(ret));
+  } else if (OB_ISNULL(mods_px_pools_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("PX pools are unavailable", K(ret));
+  } else if (OB_FAIL(mods_px_pools_->get_or_create(group_id, pool))) {
+    LOG_WARN("get PX pool failed", K(ret), K(group_id));
+  } else if (OB_ISNULL(pool)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("PX pool is null", K(ret), K(group_id));
+  } else {
+    for (int64_t attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
+      ret = pool->submit(task);
+      if (OB_SIZE_OVERFLOW != ret) {
+        break;
+      } else if (0 == attempt && OB_FAIL(pool->inc_thread_count(1))) {
+        LOG_WARN("grow PX pool for resumable task failed", K(ret), K(group_id));
+        break;
+      } else if (IS_INTERRUPTED()) {
+        ret = GET_INTERRUPT_CODE().code_;
+        if (OB_SUCCESS == ret) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_ERROR("PX admission received an invalid interrupt code", K(ret));
+        }
+        LOG_WARN("resumable PX admission interrupted", K(ret), K(group_id));
+        break;
+      }
+      ret = OB_SIZE_OVERFLOW;
+      ob_usleep(5000);
+    }
+    if (OB_SUCCESS != ret) {
+      LOG_WARN("submit resumable PX task failed", K(ret), K(group_id));
+    }
+  }
+  return ret;
+}
+
 int ObServer::create_virtual_table_factory(
     common::ObIAllocator &allocator,
     sql::ObIVirtualTableIteratorFactory *&factory)

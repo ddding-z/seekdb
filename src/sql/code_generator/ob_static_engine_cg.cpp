@@ -19,6 +19,8 @@
 #include "ob_static_engine_cg.h"
 #include "sql/optimizer/ob_log_ai_func.h"
 #include "sql/engine/basic/ob_ai_func_op.h"
+#include "sql/optimizer/ob_log_semantic.h"
+#include "sql/engine/basic/ob_semantic_op.h"
 #include "sql/optimizer/ob_log_group_by.h"
 #include "sql/optimizer/ob_log_sort.h"
 #include "sql/optimizer/ob_log_limit.h"
@@ -649,9 +651,14 @@ int ObStaticEngineCG::generate_spec_basic(ObLogicalOperator &op,
     // dependence expr and generate column self don't add to calc exprs
     bool need_flatten_gen_col = !(log_op_def::LOG_TABLE_SCAN == op.get_type()
                                   && static_cast<ObLogTableScan&>(op).get_is_index_global());
+    const ObIArray<ObRawExpr *> *stage_exprs = nullptr;
+    if (op.get_type() == log_op_def::LOG_SEMANTIC_MAP ||
+        op.get_type() == log_op_def::LOG_SEMANTIC_FILTER) {
+      stage_exprs = &static_cast<LogSemantic &>(op).owned_exprs();
+    }
     // get calc exprs
     OZ(generate_calc_exprs(child_outputs, cur_op_exprs_, spec.calc_exprs_, op.get_type(),
-                           check_eval_once, need_flatten_gen_col),
+                           check_eval_once, need_flatten_gen_col, stage_exprs),
                            op.get_op_id(), op.get_name(), K(op.get_type()));
     LOG_DEBUG("just for debug, after generate_calc_exprs", K(ret), K(op.get_op_id()), K(op.get_name()), K(op.get_type()));
   }
@@ -715,7 +722,8 @@ int ObStaticEngineCG::generate_calc_exprs(
     ObIArray<ObExpr *> &calc_exprs,
     const log_op_def::ObLogOpType log_type,
     bool check_eval_once,
-    bool need_flatten_gen_col)
+    bool need_flatten_gen_col,
+    const ObIArray<ObRawExpr *> *stage_exprs)
 {
   int ret = OB_SUCCESS;
   ObSEArray<ObRawExpr *, 16> calc_raw_exprs;
@@ -745,6 +753,7 @@ int ObStaticEngineCG::generate_calc_exprs(
               || contain_batch_stmt_parameter // calculate the folding parameter containing batch optimization
               || !raw_expr->is_const_expr())) {
         if (check_eval_once
+            && !(nullptr != stage_exprs && has_exist_in_array(*stage_exprs, raw_expr))
             && T_ORA_ROWSCN != raw_expr->get_expr_type()
             && !(raw_expr->is_const_expr() || raw_expr->has_flag(IS_DYNAMIC_USER_VARIABLE))
             && !(T_FUN_SYS_PART_HASH == raw_expr->get_expr_type() || T_FUN_SYS_PART_KEY == raw_expr->get_expr_type())) {
@@ -1043,6 +1052,44 @@ int ObStaticEngineCG::generate_spec(LogAIFunc &op, AIFuncSpec &spec, const bool 
   } else if (OB_FAIL(mark_expr_self_produced(op.get_ai_expr()))) {
   }
   return ret;
+}
+
+int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObRawExpr *, 16> local_exprs;
+  for (int64_t index = 0; OB_SUCC(ret) && index < op.local_exprs().count(); ++index) {
+    if (!op.is_child_output_exprs(op.local_exprs().at(index))) {
+      ret = local_exprs.push_back(op.local_exprs().at(index));
+    }
+  }
+  spec.query_task_count_ = op.query_task_count();
+  spec.filter_expr_count_ = op.get_type() == log_op_def::LOG_SEMANTIC_FILTER
+      ? op.expressions().count() : 0;
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(generate_rt_exprs(op.expressions(), spec.expressions_))) {
+  } else if (OB_FAIL(generate_rt_exprs(op.semantic_exprs(), spec.semantic_exprs_))) {
+  } else if (OB_FAIL(generate_rt_exprs(op.owned_exprs(), spec.owned_exprs_))) {
+  } else if (OB_FAIL(generate_rt_exprs(local_exprs, spec.local_exprs_))) {
+  } else if (OB_FAIL(generate_rt_exprs(op.shared_exprs(), spec.shared_exprs_))) {
+  } else if (OB_FAIL(generate_rt_exprs(op.carried_exprs(), spec.carried_exprs_))) {
+  } else if (OB_FAIL(mark_expr_self_produced(op.owned_exprs()))) {
+  }
+  return ret;
+}
+
+int ObStaticEngineCG::generate_spec(LogSemanticMap &op, SemanticMapSpec &spec,
+                                    const bool in_root_job)
+{
+  UNUSED(in_root_job);
+  return generate_semantic_spec(op, spec);
+}
+
+int ObStaticEngineCG::generate_spec(LogSemanticFilter &op, SemanticFilterSpec &spec,
+                                    const bool in_root_job)
+{
+  UNUSED(in_root_job);
+  return generate_semantic_spec(op, spec);
 }
 
 int ObStaticEngineCG::generate_spec(ObLogOptimizerStatsGathering &op, ObOptimizerStatsGatheringSpec &spec, const bool in_root_job)
@@ -6366,6 +6413,14 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
     }
     case log_op_def::LOG_AI_FUNC: {
       type = PHY_AI_FUNC;
+      break;
+    }
+    case log_op_def::LOG_SEMANTIC_MAP: {
+      type = PHY_SEMANTIC_MAP;
+      break;
+    }
+    case log_op_def::LOG_SEMANTIC_FILTER: {
+      type = PHY_SEMANTIC_FILTER;
       break;
     }
     case log_op_def::LOG_WINDOW_FUNCTION: {

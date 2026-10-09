@@ -28,6 +28,7 @@ class ObRequest;
 }
 namespace query
 {
+class IPxTaskContinuation;
 
 class ObIQueryRuntimeEnvironment
 {
@@ -47,6 +48,10 @@ public:
   virtual int submit_px_task(
       int64_t group_id,
       const std::function<void(bool)> &task) const = 0;
+  // Takes a caller-owned, unsubmitted task. Ownership transfers only on success.
+  virtual int submit_resumable_px_task(
+      int64_t group_id,
+      IPxTaskContinuation *task) const = 0;
 };
 
 inline uint64_t query_cpu_frequency_khz(

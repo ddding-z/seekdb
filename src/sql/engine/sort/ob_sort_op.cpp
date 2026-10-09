@@ -20,6 +20,9 @@
 #include "sql/engine/px/ob_px_util.h"
 #include "sql/engine/aggregate/ob_hash_groupby_op.h"
 #include "sql/engine/expr/ob_expr_topn_filter.h"
+#include "sql/engine/basic/ob_semantic_runtime.h"
+#include "lib/worker.h"
+#include "lib/utility/ob_tracepoint.h"
 
 namespace oceanbase
 {
@@ -71,9 +74,24 @@ ObSortOp::ObSortOp(ObExecContext &ctx_, const ObOpSpec &spec, ObOpInput *input)
   read_batch_func_(&ObSortOp::sort_impl_next_batch),
   sort_row_count_(0),
   is_first_(true),
+  batch_sort_phase_(BatchSortPhase::INITIAL),
+  batch_sort_error_(OB_SUCCESS),
   ret_row_count_(0),
-  iter_end_(false)
+  iter_end_(false),
+  prefix_frame_()
 {}
+
+bool ObSortOp::supports_semantic_suspend() const
+{
+  // Capability checks must not consume the force-dump tracepoint.
+  const common::EventItem &force_dump_event = common::EventTable::EN_SORT_IMPL_FORCE_DO_DUMP.item_;
+  return is_vectorized() && MY_SPEC.prefix_pos_ == 0 && !MY_SPEC.prescan_enabled_
+      && !MY_SPEC.is_local_merge_sort_ && MY_SPEC.part_cnt_ == 0
+      && nullptr == MY_SPEC.topk_limit_expr_ && !MY_SPEC.is_fetch_with_ties_
+      && !MY_SPEC.enable_pd_topn_filter()
+      && ATOMIC_LOAD(&force_dump_event.error_code_) == 0
+      && op_monitor_info_.otherstat_4_id_ != ObSqlMonitorStatIds::SORT_DUMP_DATA_TIME;
+}
 
 int ObSortOp::inner_open()
 {
@@ -108,6 +126,7 @@ void ObSortOp::reset_pd_topn_filter_expr_ctx()
 
 void ObSortOp::reset()
 {
+  prefix_frame_.reset();
   sort_impl_.reset();
   prefix_sort_impl_.reset();
   read_func_ = &ObSortOp::sort_impl_next;
@@ -115,10 +134,14 @@ void ObSortOp::reset()
   sort_row_count_ = 0;
   ret_row_count_ = 0;
   is_first_ = true;
+  batch_sort_phase_ = BatchSortPhase::INITIAL;
+  batch_sort_error_ = OB_SUCCESS;
 }
 
 void ObSortOp::destroy()
 {
+  prefix_frame_.destroy();
+  prefix_frame_.~ObBatchResultHolder();
   sort_impl_.unregister_profile_if_necessary();
   sort_impl_.~ObSortOpImpl();
   prefix_sort_impl_.unregister_profile_if_necessary();
@@ -127,6 +150,8 @@ void ObSortOp::destroy()
   read_batch_func_ = nullptr;
   sort_row_count_ = 0;
   is_first_ = true;
+  batch_sort_phase_ = BatchSortPhase::INITIAL;
+  batch_sort_error_ = OB_SUCCESS;
   ret_row_count_ = 0;
   ObOperator::destroy();
 }
@@ -136,6 +161,7 @@ int ObSortOp::inner_close()
   sort_impl_.collect_memory_dump_info(op_monitor_info_);
   sort_impl_.unregister_profile();
   prefix_sort_impl_.unregister_profile();
+  reset();
   return OB_SUCCESS;
 }
 
@@ -248,9 +274,10 @@ int ObSortOp::process_sort()
   return ret;
 }
 
-int ObSortOp::process_sort_batch()
+int ObSortOp::process_sort_batch(bool &suspended)
 {
   int ret = OB_SUCCESS;
+  suspended = false;
   if (read_batch_func_ == &ObSortOp::prefix_sort_impl_next_batch) {
     // prefix sort get child row in it's own wrap, do nothing here
   } else if (read_batch_func_ == &ObSortOp::sort_impl_next_batch) {
@@ -258,9 +285,33 @@ int ObSortOp::process_sort_batch()
     while (OB_SUCC(ret)) {
       clear_evaluated_flag();
       const ObBatchRows *input_brs = NULL;
-      if (OB_FAIL(try_check_status())) {
-      } else if (OB_FAIL(child_->get_next_batch(MY_SPEC.max_batch_size_, input_brs))) {
+      lib::RequestAwait *await = lib::RequestAwait::current();
+      if (nullptr != await && await->owns(&ctx_) && OB_FAIL(await->cancel_ret())) {
+        LOG_WARN("sort input collection cancelled", K(ret), K(sort_row_count_));
+      } else if (OB_FAIL(try_check_status())) {
       } else {
+        const bool can_suspend = supports_semantic_suspend();
+        {
+          SemanticSuspendScope fetch_scope(MY_SPEC.type_, false, can_suspend);
+          ret = child_->get_next_batch(MY_SPEC.max_batch_size_, input_brs);
+        }
+        if (OB_FAIL(ret)) {
+          await = lib::RequestAwait::current();
+          if (nullptr != await && await->owns(&ctx_) && OB_SUCCESS != await->cancel_ret()) {
+            ret = await->cancel_ret();
+          } else if (ret == OB_EAGAIN && can_suspend && nullptr != await
+              && await->owns(&ctx_) && await->is_pending()) {
+            suspended = true;
+            brs_.size_ = 0;
+            brs_.end_ = false;
+            return ret;
+          }
+          LOG_WARN("failed to collect sort input batch", K(ret), K(sort_row_count_));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        // Only fetching the child may unwind; materializing a batch must finish.
+        SemanticSuspendScope materialize_scope(MY_SPEC.type_);
         if (input_brs->size_ > 0) {
           sort_row_count_ += input_brs->size_
               - input_brs->skip_->accumulate_bit_cnt(input_brs->size_);
@@ -273,16 +324,19 @@ int ObSortOp::process_sort_batch()
         }
       }
     }
+    SemanticSuspendScope finish_scope(MY_SPEC.type_);
     if (OB_SUCC(ret) && need_dump && MY_SPEC.prescan_enabled_
         && OB_FAIL(scan_all_then_sort_batch())) {
       if (OB_ITER_END != ret) {
         LOG_WARN("fail to scan all rows before inmem sort", K(ret));
       }
     }
-    op_monitor_info_.otherstat_7_id_ = ObSqlMonitorStatIds::ROW_COUNT;
-    op_monitor_info_.otherstat_7_value_ = sort_row_count_; 
-    OZ(sort_impl_.sort());
-    sort_impl_.collect_memory_dump_info(op_monitor_info_);
+    if (OB_SUCC(ret)) {
+      op_monitor_info_.otherstat_7_id_ = ObSqlMonitorStatIds::ROW_COUNT;
+      op_monitor_info_.otherstat_7_value_ = sort_row_count_;
+      OZ(sort_impl_.sort());
+      sort_impl_.collect_memory_dump_info(op_monitor_info_);
+    }
   } else {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid read function pointer",
@@ -407,6 +461,9 @@ int ObSortOp::init_prefix_sort(int64_t row_count,
                                int64_t topn_cnt)
 {
   int ret = OB_SUCCESS;
+  if (is_batch && OB_FAIL(prefix_frame_.init(MY_SPEC.all_exprs_, eval_ctx_, &ctx_.get_allocator()))) {
+    LOG_WARN("failed to initialize prefix sort frame snapshot", K(ret));
+  }
   OZ(prefix_sort_impl_.init(MY_SPEC.prefix_pos_, MY_SPEC.all_exprs_,
       &MY_SPEC.sort_collations_, &MY_SPEC.sort_cmp_funs_, &eval_ctx_, child_,
       this, ctx_, MY_SPEC.enable_encode_sortkey_opt_, sort_row_count_, topn_cnt,
@@ -422,6 +479,21 @@ int ObSortOp::init_prefix_sort(int64_t row_count,
   prefix_sort_impl_.set_operator_type(MY_SPEC.type_);
   prefix_sort_impl_.set_operator_id(MY_SPEC.id_);
   prefix_sort_impl_.set_io_event_observer(&io_event_observer_);
+  return ret;
+}
+
+int ObSortOp::prefix_sort_impl_next_batch(const int64_t max_cnt)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(prefix_frame_.restore())) {
+    LOG_WARN("failed to restore prefix sort live frame", K(ret));
+  } else if (OB_FAIL(sort_component_next_batch(prefix_sort_impl_, max_cnt))) {
+  } else if (brs_.end_) {
+    prefix_frame_.reset();
+  } else if (OB_FAIL(prefix_frame_.save(eval_ctx_.max_batch_size_))) {
+    // The next prefix remains live beyond the rows returned to the parent.
+    LOG_WARN("failed to preserve prefix sort live frame", K(ret), K(brs_.size_));
+  }
   return ret;
 }
 
@@ -512,11 +584,14 @@ int ObSortOp::inner_get_next_row()
 int ObSortOp::inner_get_next_batch(const int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(iter_end_)) {
+  bool suspended = false;
+  if (BatchSortPhase::FAILED == batch_sort_phase_) {
+    ret = batch_sort_error_;
+  } else if (OB_UNLIKELY(iter_end_)) {
     brs_.end_ = true;
     brs_.size_ = 0;
-  } else if (is_first_) {
-    is_first_ = false;
+  } else if (BatchSortPhase::INITIAL == batch_sort_phase_) {
+    SemanticSuspendScope init_scope(MY_SPEC.type_);
     int64_t topn_cnt = INT64_MAX;
     int64_t row_count = MY_SPEC.rows_;
     
@@ -526,6 +601,7 @@ int ObSortOp::inner_get_next_batch(const int64_t max_row_cnt)
     } else if (topn_cnt <= 0) { 
       brs_.end_ = true;
       brs_.size_ = 0;
+      iter_end_ = true;
     } else if (MY_SPEC.prefix_pos_ > 0) {
       if (OB_FAIL(init_prefix_sort(row_count, true, topn_cnt))) {
       }
@@ -533,13 +609,24 @@ int ObSortOp::inner_get_next_batch(const int64_t max_row_cnt)
       if (OB_FAIL(init_sort(row_count, true, topn_cnt))) {
       }
     }
-    if (OB_SUCC(ret) && !brs_.end_) {
-      if (OB_FAIL(process_sort_batch())) {
+    if (OB_SUCC(ret)) {
+      batch_sort_phase_ = brs_.end_ ? BatchSortPhase::OUTPUT : BatchSortPhase::COLLECTING;
+      if (brs_.end_) {
+        is_first_ = false;
       }
     }
   }
 
+  if (OB_SUCC(ret) && BatchSortPhase::COLLECTING == batch_sort_phase_) {
+    if (OB_FAIL(process_sort_batch(suspended))) {
+    } else {
+      batch_sort_phase_ = BatchSortPhase::OUTPUT;
+      is_first_ = false;
+    }
+  }
+
   if (OB_SUCC(ret) && !brs_.end_) {
+    SemanticSuspendScope output_scope(MY_SPEC.type_);
     clear_evaluated_flag();
     if (OB_FAIL((this->*read_batch_func_)(std::min(max_row_cnt, MY_SPEC.max_batch_size_)))) {
     } else {
@@ -551,6 +638,11 @@ int ObSortOp::inner_get_next_batch(const int64_t max_row_cnt)
         }
       }
     }
+  }
+  if (OB_FAIL(ret) && !suspended && BatchSortPhase::FAILED != batch_sort_phase_) {
+    batch_sort_phase_ = BatchSortPhase::FAILED;
+    batch_sort_error_ = ret;
+    LOG_WARN("sort batch execution failed", K(ret), K(sort_row_count_), K(ret_row_count_));
   }
   return ret;
 }

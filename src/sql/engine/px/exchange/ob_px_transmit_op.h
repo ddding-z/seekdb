@@ -34,6 +34,7 @@
 #include "sql/engine/px/ob_px_basic_info.h"
 #include "sql/engine/basic/ob_ra_datum_store.h"
 #include "sql/engine/px/datahub/components/ob_dh_init_channel.h"
+#include "lib/worker.h"
 
 namespace oceanbase
 {
@@ -109,6 +110,13 @@ public:
   virtual int inner_get_next_row() override;
   virtual int inner_get_next_batch(const int64_t max_row_cnt) override;
   virtual int transmit();
+  virtual bool supports_semantic_suspend() const override
+  {
+    return resumable_ && PHY_PX_REDUCE_TRANSMIT == spec_.type_;
+  }
+private:
+  friend class ObPxTaskProcess;
+  void enable_resumable() { resumable_ = true; }
 public:
   int init_channel(ObPxTransmitOpInput &trans_input);
   int init_dfc(dtl::ObDtlDfoKey &parent_key, dtl::ObDtlSqcInfo &child_info);
@@ -188,6 +196,8 @@ protected:
   // const ObChunkDatum::LastStoredRow first_row_;
   bool iter_end_;
   bool consume_first_row_;
+  bool resumable_;
+  bool first_row_pending_;
   dtl::ObDtlUnblockingMsgP dfc_unblock_msg_proc_;
   dtl::ObDtlFlowControl dfc_;
   dtl::ObDtlChannelLoop loop_;
@@ -305,7 +315,10 @@ int ObPxTransmitOp::send_rows_in_batch(ObSliceIdxCalc &slice_calc)
   ObEvalCtx::BatchInfoScopeGuard batch_info_guard(eval_ctx_);
   while (OB_SUCC(ret)) {
     if (OB_FAIL(next_row())) {
-      LOG_WARN("fetch next rows failed", K(ret));
+      if (!resumable_ || OB_EAGAIN != ret || nullptr == lib::RequestAwait::current() ||
+          !lib::RequestAwait::current()->is_pending()) {
+        LOG_WARN("fetch next rows failed", K(ret));
+      }
       break;
     }
     if (dfc_.all_ch_drained()) {

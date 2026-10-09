@@ -124,6 +124,8 @@ ObPxTransmitOp::ObPxTransmitOp(ObExecContext &exec_ctx, const ObOpSpec &spec, Ob
   // first_row_(),
   iter_end_(false),
   consume_first_row_(false),
+  resumable_(false),
+  first_row_pending_(false),
   dfc_unblock_msg_proc_(dfc_),
   loop_(op_monitor_info_),
   chs_agent_(),
@@ -185,7 +187,10 @@ int ObPxTransmitOp::inner_open()
     rand48_buf_[0] = 0x330E; // 0x330E is the arbitrary value of srand48
     rand48_buf_[1] = trans_input->get_sqc_id();
     rand48_buf_[2] = trans_input->get_task_id();
-    if (is_object_sample()) {
+    if (resumable_) {
+      first_row_pending_ = true;
+      OZ(init_channel(*trans_input));
+    } else if (is_object_sample()) {
       OZ(init_channel(*trans_input));
       OZ(set_expect_range_count());
       OZ(fetch_first_row());
@@ -617,7 +622,13 @@ int ObPxTransmitOp::broadcast_eof_row()
 int ObPxTransmitOp::next_row()
 {
   int ret = OB_SUCCESS;
-  if (iter_end_) {
+  if (first_row_pending_) {
+    if (OB_FAIL(fetch_first_row())) {
+    } else {
+      first_row_pending_ = false;
+      consume_first_row_ = true;
+    }
+  } else if (iter_end_) {
     if (is_vectorized()) {
       brs_.end_ = true;
       brs_.size_ = 0;

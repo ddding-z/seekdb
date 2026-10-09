@@ -623,6 +623,9 @@ public:
   int submit_px_task(
       int64_t group_id,
       const std::function<void(bool)> &task) const override;
+  int submit_resumable_px_task(
+      int64_t group_id,
+      query::IPxTaskContinuation *task) const override;
   int create_virtual_table_factory(
       common::ObIAllocator &allocator,
       sql::ObIVirtualTableIteratorFactory *&factory) override;

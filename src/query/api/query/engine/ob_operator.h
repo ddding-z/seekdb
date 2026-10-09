@@ -248,6 +248,7 @@ public:
     { UNUSED(ctx); return common::OB_SUCCESS; }
 
   uint32_t get_child_cnt() const { return child_cnt_; }
+  bool has_semantic_operator() const;
   ObOpSpec **get_children() const { return children_; }
 
   int set_children_pointer(ObOpSpec **children, const uint32_t child_cnt);
@@ -447,6 +448,7 @@ public:
   const char *op_name() const { return spec_.op_name(); }
 
   OB_INLINE void clear_evaluated_flag();
+  virtual bool supports_semantic_suspend() const { return false; }
 
   // clear evaluated flag of current datum (ObEvalCtx::batch_idx_) of batch.
   inline void clear_datum_eval_flag();

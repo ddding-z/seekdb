@@ -41,12 +41,86 @@ using namespace oceanbase::sql::dtl;
 ObPxTaskProcess::ObPxTaskProcess(const share::ObGlobalContext &gctx, ObPxInitTaskArgs &arg)
   : gctx_(gctx), arg_(arg),
     schema_guard_(share::schema::ObSchemaMgrItem::MOD_PX_TASK_PROCESSS),
-    enqueue_timestamp_(0), process_timestamp_(0), exec_start_timestamp_(0), exec_end_timestamp_(0)
+    enqueue_timestamp_(0), process_timestamp_(0), exec_start_timestamp_(0), exec_end_timestamp_(0),
+    await_(nullptr), execution_started_(false), prepared_(false), root_opened_(false),
+    result_reported_(false)
 {
 }
 
 ObPxTaskProcess::~ObPxTaskProcess()
 {
+}
+
+bool ObPxTaskProcess::supports_resumable(const ObPxInitTaskArgs &arg)
+{
+  bool supported = nullptr != arg.op_spec_root_ && nullptr != arg.sqc_handler_ &&
+      PHY_PX_REDUCE_TRANSMIT == arg.op_spec_root_->type_ &&
+      arg.op_spec_root_->max_batch_size_ > 0 && 1 == arg.op_spec_root_->get_child_cnt() &&
+      0 == arg.sqc_handler_->get_sqc_init_arg().sqc_.get_rescan_batch_params().get_count();
+  const ObOpSpec *op = supported ? arg.op_spec_root_ : nullptr;
+  if (supported) {
+    const ObPxTransmitSpec &transmit = static_cast<const ObPxTransmitSpec &>(*op);
+    supported = transmit.is_no_repart_exchange() && 0 == transmit.filters_.count() &&
+        ObPxSampleType::NOT_INIT_SAMPLE_TYPE == transmit.sample_type_ &&
+        nullptr == transmit.tablet_id_expr_ && nullptr == transmit.random_expr_ &&
+        nullptr == transmit.wf_hybrid_aggr_status_expr_ && !transmit.is_wf_hybrid_ &&
+        !transmit.need_null_aware_shuffle_;
+    op = supported ? op->get_child() : nullptr;
+  }
+  bool has_semantic = false;
+  while (supported && nullptr != op &&
+         (PHY_SEMANTIC_MAP == op->type_ || PHY_SEMANTIC_FILTER == op->type_)) {
+    has_semantic = true;
+    supported = op->max_batch_size_ > 0 && 1 == op->get_child_cnt();
+    op = supported ? op->get_child() : nullptr;
+  }
+  // GI is below the semantic region: it never has to unwind an async child.
+  while (supported && nullptr != op && PHY_GRANULE_ITERATOR == op->type_) {
+    supported = 1 == op->get_child_cnt();
+    op = supported ? op->get_child() : nullptr;
+  }
+  return supported && has_semantic && nullptr != op && 0 == op->get_child_cnt() &&
+      (PHY_TABLE_SCAN == op->type_ || PHY_EXPR_VALUES == op->type_);
+}
+
+bool ObPxTaskProcess::is_suspended(int ret) const
+{
+  return OB_EAGAIN == ret && nullptr != await_ && await_->is_pending();
+}
+
+namespace
+{
+void accumulate_exec_record(ObExecRecord &total, const ObExecRecord &slice)
+{
+#define EVENT_INFO(def, name) total.name##_end_ += slice.get_##name();
+#include "sql/monitor/ob_exec_stat.h"
+#undef EVENT_INFO
+}
+
+void accumulate_sqlstat_record(ObExecutingSqlStatRecord &total,
+                               const ObExecutingSqlStatRecord &slice)
+{
+#define ACCUMULATE_SQLSTAT(name) total.name##_end_ += slice.get_##name##_delta()
+  ACCUMULATE_SQLSTAT(disk_reads);
+  ACCUMULATE_SQLSTAT(buffer_gets);
+  ACCUMULATE_SQLSTAT(elapsed_time);
+  ACCUMULATE_SQLSTAT(cpu_time);
+  ACCUMULATE_SQLSTAT(ccwait);
+  ACCUMULATE_SQLSTAT(userio_wait);
+  ACCUMULATE_SQLSTAT(apwait);
+  ACCUMULATE_SQLSTAT(physical_read_requests);
+  ACCUMULATE_SQLSTAT(physical_read_bytes);
+  ACCUMULATE_SQLSTAT(write_throttle);
+  ACCUMULATE_SQLSTAT(rows_processed);
+  ACCUMULATE_SQLSTAT(memstore_read_rows);
+  ACCUMULATE_SQLSTAT(minor_ssstore_read_rows);
+  ACCUMULATE_SQLSTAT(major_ssstore_read_rows);
+  ACCUMULATE_SQLSTAT(rpc);
+  ACCUMULATE_SQLSTAT(fetches);
+  ACCUMULATE_SQLSTAT(partition);
+  ACCUMULATE_SQLSTAT(nested_sql);
+#undef ACCUMULATE_SQLSTAT
+}
 }
 
 int ObPxTaskProcess::check_inner_stat()
@@ -80,7 +154,7 @@ int ObPxTaskProcess::check_inner_stat()
   return ret;
 }
 // The runtime PX pool invokes this function.
-void ObPxTaskProcess::run()
+int ObPxTaskProcess::run()
 {
   int ret = OB_SUCCESS;
 
@@ -96,8 +170,7 @@ void ObPxTaskProcess::run()
   ObPxWorkerStatList::instance().push(stat);
   ret = process();
   ObPxWorkerStatList::instance().remove(stat);
-  // The runtime PX pool has no feedback channel, so interruption handles every error.
-  UNUSED(ret);
+  return ret;
 }
 
 int ObPxTaskProcess::process()
@@ -105,8 +178,11 @@ int ObPxTaskProcess::process()
   int ret = OB_SUCCESS;
   common::ob_setup_default_tsi_warning_buffer();
   common::ob_reset_tsi_warning_buffer();
-  enqueue_timestamp_ = ObTimeUtility::current_time();
-  process_timestamp_ = enqueue_timestamp_;
+  const bool first_slice = !execution_started_;
+  if (first_slice) {
+    enqueue_timestamp_ = ObTimeUtility::current_time();
+    process_timestamp_ = enqueue_timestamp_;
+  }
   ObExecRecord exec_record;
   ObExecutingSqlStatRecord sqlstat_record;
   ObExecTimestamp exec_timestamp;
@@ -117,7 +193,8 @@ int ObPxTaskProcess::process()
   if (OB_ISNULL(session)  || OB_ISNULL(sqc_handler)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("session or sqc_handler is NULL", K(ret));
-  } else if (OB_FAIL(session->store_query_string(ObString::make_string("PX DFO EXECUTING")))) {
+  } else if (first_slice &&
+             OB_FAIL(session->store_query_string(ObString::make_string("PX DFO EXECUTING")))) {
   } else {
     // Set diagnostic function environment
     ObPxInitSqcArgs &arg = arg_.sqc_handler_->get_sqc_init_arg();
@@ -127,13 +204,17 @@ int ObPxTaskProcess::process()
     ObWorkerSessionGuard worker_session_guard(session);
     ObSQLSessionInfo::LockGuard lock_guard(session->get_query_lock());
     session->set_current_trace_id(ObCurTraceId::get_trace_id());
-    session->get_raw_audit_record().request_memory_used_ = 0;
+    if (first_slice) {
+      session->get_raw_audit_record().request_memory_used_ = 0;
+    }
     ObProcessMallocCallback pmcb(0,
           session->get_raw_audit_record().request_memory_used_);
     lib::ObMallocCallbackGuard guard(pmcb);
     session->set_cur_phy_plan(arg_.des_phy_plan_);
     session->set_thread_id(GETTID());
-    arg_.exec_ctx_->reference_my_plan(arg_.des_phy_plan_);
+    if (first_slice) {
+      arg_.exec_ctx_->reference_my_plan(arg_.des_phy_plan_);
+    }
     arg_.exec_ctx_->set_sqc_handler(arg_.sqc_handler_);
     arg_.exec_ctx_->set_px_task_id(arg_.task_.get_task_id());
     arg_.exec_ctx_->set_px_sqc_id(arg_.task_.get_sqc_id());
@@ -149,12 +230,34 @@ int ObPxTaskProcess::process()
         session->sql_sess_record_sql_stat_start_value(sqlstat_record);
       }
       // Monitoring item statistics start
-      exec_start_timestamp_ = enqueue_timestamp_;
+      if (first_slice) {
+        exec_start_timestamp_ = enqueue_timestamp_;
+        execution_started_ = true;
+      }
 
       if (OB_FAIL(do_process())) {
       }
       // Monitoring item statistics end
-      exec_end_timestamp_ = ObTimeUtility::current_time();
+      if (!is_suspended(ret)) {
+        exec_end_timestamp_ = ObTimeUtility::current_time();
+      }
+    }
+
+    if (nullptr != await_) {
+      exec_record.record_end();
+      accumulate_exec_record(cumulative_exec_record_, exec_record);
+      if (enable_sqlstat && OB_NOT_NULL(arg_.exec_ctx_->get_sql_ctx())) {
+        sqlstat_record.record_sqlstat_end_value(
+            *arg_.exec_ctx_->get_query_runtime_environment());
+        accumulate_sqlstat_record(cumulative_sqlstat_record_, sqlstat_record);
+      }
+      if (is_suspended(ret)) {
+        return ret;
+      }
+      exec_record = cumulative_exec_record_;
+      sqlstat_record = cumulative_sqlstat_record_;
+      sqlstat_record.elapsed_time_end_ = exec_end_timestamp_ - exec_start_timestamp_;
+      sqlstat_record.set_is_in_retry(session->get_is_in_retry());
     }
 
     // some statistics must be recorded for plan stat, even though sql audit disabled
@@ -163,13 +266,17 @@ int ObPxTaskProcess::process()
     audit_record.exec_timestamp_.update_stage_time();
 
     {
-      exec_record.record_end();
+      if (nullptr == await_) {
+        exec_record.record_end();
+      }
       audit_record.exec_record_ = exec_record;
       audit_record.update_event_stage_state();
     }
     if (enable_sqlstat && OB_NOT_NULL(arg_.exec_ctx_->get_sql_ctx())) {
-      sqlstat_record.record_sqlstat_end_value(
-          *arg_.exec_ctx_->get_query_runtime_environment());
+      if (nullptr == await_) {
+        sqlstat_record.record_sqlstat_end_value(
+            *arg_.exec_ctx_->get_query_runtime_environment());
+      }
       ObString sql = ObString::make_string("PX DFO EXECUTING");
       sqlstat_record.set_is_plan_cache_hit(arg_.exec_ctx_->get_sql_ctx()->plan_cache_hit_);
       sqlstat_record.move_to_sqlstat_cache(
@@ -189,8 +296,10 @@ int ObPxTaskProcess::process()
     }
 
     if (enable_sqlstat && OB_NOT_NULL(arg_.exec_ctx_->get_sql_ctx())) {
-      sqlstat_record.record_sqlstat_end_value(
-          *arg_.exec_ctx_->get_query_runtime_environment());
+      if (nullptr == await_) {
+        sqlstat_record.record_sqlstat_end_value(
+            *arg_.exec_ctx_->get_query_runtime_environment());
+      }
       const ObPhysicalPlan *phy_plan = arg_.des_phy_plan_;
       ObString sql = ObString::make_string("");
       sqlstat_record.set_is_plan_cache_hit(arg_.exec_ctx_->get_sql_ctx()->plan_cache_hit_);
@@ -278,7 +387,34 @@ int ObPxTaskProcess::execute(const ObOpSpec &root_spec)
       need_fill_batch_info = true;
     }
     CK(IS_PX_TRANSMIT(root_spec.get_type()));
-    for (int i = 0; i < batch_count && OB_SUCC(ret); ++i) {
+    if (nullptr != await_) {
+      if (!supports_resumable(arg_) || !root->is_vectorized()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("unsupported resumable PX operator path", K(ret), K(root_spec.type_));
+      } else if (OB_FAIL(await_->cancel_ret())) {
+      } else if (!root_opened_) {
+        static_cast<ObPxTransmitOp *>(root)->enable_resumable();
+        root_opened_ = true;
+        if (OB_FAIL(root->open())) {
+          if (is_suspended(ret)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_ERROR("resumable PX operator suspended during open", K(ret), K(root_spec.type_));
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ret = static_cast<ObPxTransmitOp *>(root)->transmit();
+      }
+      if (OB_SUCCESS == ret && await_->is_pending()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("PX operator recorded an await without returning pending",
+                  K(ret), K(root_spec.type_));
+      }
+      if (is_suspended(ret)) {
+        return ret;
+      }
+    }
+    for (int i = 0; nullptr == await_ && i < batch_count && OB_SUCC(ret); ++i) {
       if (need_fill_batch_info) {
         if (OB_FAIL(ctx.fill_px_batch_info(arg_.get_sqc_handler()->
           get_sqc_init_arg().sqc_.get_rescan_batch_params(), i,
@@ -346,7 +482,7 @@ int ObPxTaskProcess::do_process()
   int64_t dfo_id = arg_.task_.get_dfo_id();
   int64_t sqc_id = arg_.task_.get_sqc_id();
 
-  if (NULL != arg_.sqc_task_ptr_) {
+  if (NULL != arg_.sqc_task_ptr_ && !prepared_) {
     arg_.sqc_task_ptr_->set_task_state(SQC_TASK_START);
   }
 
@@ -371,7 +507,7 @@ int ObPxTaskProcess::do_process()
     LOG_TRACE("TIMERECORD ", "reserve:=0 name:=TASK dfoid:",dfo_id,"sqcid:",
              sqc_id,"taskid:", task_id,"start:", ObTimeUtility::current_time());
 
-    if (OB_SUCC(ret)) {
+    if (OB_SUCC(ret) && !prepared_) {
       ObSqlExecutorCtx *executor_ctx = NULL;
       if (OB_ISNULL(gctx_.schema_service_)) {
         ret = OB_ERR_UNEXPECTED;
@@ -392,7 +528,7 @@ int ObPxTaskProcess::do_process()
       }
     }
 
-    if (OB_SUCC(ret)) {
+    if (OB_SUCC(ret) && !prepared_) {
       // Set task id to transmit input, receive input, gi input in DFO
       OpPreparation setter;
       ObPxOperatorVisitor visitor; // Traverse all Operators of DFO
@@ -419,7 +555,7 @@ int ObPxTaskProcess::do_process()
       }
     }
 
-    if (OB_SUCC(ret)) {
+    if (OB_SUCC(ret) && !prepared_) {
       if (OB_NOT_NULL(arg_.sqc_handler_) && OB_NOT_NULL(arg_.exec_ctx_)) {
         ObIArray<ObSqlTempTableCtx> &ctx = arg_.sqc_handler_->get_sqc_init_arg().sqc_.get_temp_table_ctx();
         if (OB_FAIL(arg_.exec_ctx_->get_temp_table_ctx().assign(ctx))) {
@@ -427,6 +563,9 @@ int ObPxTaskProcess::do_process()
       }
     }
 
+    if (OB_SUCC(ret)) {
+      prepared_ = true;
+    }
     if (OB_SUCC(ret)) {
       if (nullptr != arg_.op_spec_root_) {
         // show monitoring information from qc
@@ -441,6 +580,14 @@ int ObPxTaskProcess::do_process()
     }
   }
 
+  if (is_suspended(ret)) {
+    const int warning_ret = record_user_error_msg(OB_SUCCESS);
+    if (OB_SUCCESS != warning_ret) {
+      LOG_WARN("record suspended PX warnings failed", K(warning_ret));
+    }
+    return ret;
+  }
+
   // for forward warning msg and user error msg
   (void)record_user_error_msg(ret);
   // for transaction
@@ -452,6 +599,7 @@ int ObPxTaskProcess::do_process()
            sqc_id,"taskid:", task_id,"end:", ObTimeUtility::current_time());
   // Task and Sqc are in two different threads, task needs to communicate with sqc
   if (NULL != arg_.sqc_task_ptr_) {
+    result_reported_ = true;
     arg_.sqc_task_ptr_->set_result(ret);
     if (OB_NOT_NULL(arg_.exec_ctx_)) {
       int das_retry_rc = DAS_CTX(*arg_.exec_ctx_).get_last_errno();

@@ -32,6 +32,7 @@
 #include "ob_log_values.h"
 #include "ob_log_material.h"
 #include "ob_log_ai_func.h"
+#include "ob_log_semantic.h"
 #include "ob_log_window_function.h"
 #include "ob_log_select_into.h"
 #include "ob_log_topk.h"
@@ -193,6 +194,20 @@ ObLogicalOperator *ObLogOperatorFactory::allocate(ObLogPlan &plan, ObLogOpType t
     ptr = allocator_.alloc(sizeof(LogAIFunc));
     if (NULL != ptr) {
       ret_op = new (ptr) LogAIFunc(plan);
+    }
+    break;
+  }
+  case LOG_SEMANTIC_MAP: {
+    ptr = allocator_.alloc(sizeof(LogSemanticMap));
+    if (NULL != ptr) {
+      ret_op = new (ptr) LogSemanticMap(plan);
+    }
+    break;
+  }
+  case LOG_SEMANTIC_FILTER: {
+    ptr = allocator_.alloc(sizeof(LogSemanticFilter));
+    if (NULL != ptr) {
+      ret_op = new (ptr) LogSemanticFilter(plan);
     }
     break;
   }

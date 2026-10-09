@@ -38,6 +38,7 @@
 #include "storage/meta_store/ob_server_runtime_meta.h"
 #include "lib/thread/ob_adaptive_worker_pool.h"
 #include "lib/lock/ob_tc_rwlock.h"      // TCRWLock
+#include "observer/omt/ob_px_task_continuation_store.h"
 
 namespace oceanbase
 {
@@ -55,12 +56,16 @@ class ObPxPool
   void run(int64_t idx) final;
   void run1() final;
   static const int64_t QUEUE_WAIT_TIME = 100 * 1000;
+  static const int64_t CONTINUATION_POLL_TIME = 5 * 1000;
+  static const size_t MAX_CONTINUATIONS = 64;
+  using ContinuationStore = PxTaskContinuationStore<MAX_CONTINUATIONS>;
 
 public:
 	class Task;
   ObPxPool() :
       group_id_(0),
       is_inited_(false),
+      stopped_(false),
       concurrency_(0),
       active_threads_(0)
   {}
@@ -72,10 +77,12 @@ public:
   }
   int64_t get_pool_size() const { return get_thread_count(); }
   int submit(const RunFuncT &func);
+  int submit(query::IPxTaskContinuation *task);
   void set_px_thread_name();
   int64_t get_queue_size() const { return queue_.size(); }
 private:
-  void handle(common::ObLink *task);
+  void handle(common::ObLink *task, bool need_exec);
+  void handle_continuation(const ContinuationStore::Lease &lease);
   void try_recycle(int64_t idle_time);
   void disable_recycle()
   {
@@ -89,9 +96,11 @@ private:
   uint64_t group_id_;
 	common::ObPriorityQueue2<0, 1> queue_;
   bool is_inited_;
+  bool stopped_;
   int64_t concurrency_;
   int64_t active_threads_;
   mutable common::ObSpinLock recycle_lock_;
+  ContinuationStore continuations_;
 };
 
 class ObPxPool::Task : public common::ObLink

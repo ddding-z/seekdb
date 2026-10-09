@@ -20,6 +20,7 @@
 #include "ob_operator_factory.h"
 #include "query/runtime/ob_query_runtime_environment.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
+#include "sql/engine/basic/ob_semantic_runtime.h"
 
 namespace oceanbase
 {
@@ -29,6 +30,17 @@ namespace sql
 
 OB_SERIALIZE_MEMBER(ObDynamicParamSetter, param_idx_, src_, dst_);
 OB_SERIALIZE_MEMBER(ObOpSchemaObj, obj_type_, is_not_null_, order_type_);
+
+bool ObOpSpec::has_semantic_operator() const
+{
+  bool present = type_ == PHY_SEMANTIC_MAP || type_ == PHY_SEMANTIC_FILTER;
+  for (uint32_t index = 0; !present && index < child_cnt_; ++index) {
+    if (nullptr != children_[index]) {
+      present = children_[index]->has_semantic_operator();
+    }
+  }
+  return present;
+}
 
 int ObDynamicParamSetter::set_dynamic_param(ObEvalCtx &eval_ctx) const
 {
@@ -616,6 +628,7 @@ int ObOperator::output_expr_decint_datum_len_check_batch()
 // copy from ob_phy_operator.cpp
 int ObOperator::open()
 {
+  SemanticSuspendScope semantic_scope(spec_.type_, true);
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_stack_overflow())) {
   } else {
@@ -923,6 +936,8 @@ int ObOperator::setup_op_feedback_info()
 
 int ObOperator::get_next_row()
 {
+  SemanticSuspendScope semantic_scope(spec_.type_, false,
+                                       spec_.is_vectorized() && supports_semantic_suspend());
   int ret = OB_SUCCESS;
   begin_cpu_time_counting();
   if (OB_FAIL(check_stack_once())) {
@@ -1062,6 +1077,7 @@ int ObOperator::push_stash_rows(const int64_t max_row_cnt, const int64_t output_
 
 int ObOperator::get_next_batch(const int64_t max_row_cnt, const ObBatchRows *&batch_rows)
 {
+  SemanticSuspendScope semantic_scope(spec_.type_, false, supports_semantic_suspend());
   int ret = OB_SUCCESS;
   begin_cpu_time_counting();
 

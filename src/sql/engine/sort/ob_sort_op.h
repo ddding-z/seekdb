@@ -78,6 +78,7 @@ public:
   virtual int inner_rescan() override;
   virtual int inner_get_next_row() override;
   virtual int inner_get_next_batch(const int64_t max_row_cnt) override;
+  virtual bool supports_semantic_suspend() const override;
   virtual void destroy() override;
   virtual int inner_close() override;
 
@@ -119,15 +120,12 @@ private:
     return sort_component_next_batch(sort_impl_, max_cnt);
   }
 
-  int prefix_sort_impl_next_batch(const int64_t max_cnt)
-  {
-    return sort_component_next_batch(prefix_sort_impl_, max_cnt);
-  }
+  int prefix_sort_impl_next_batch(const int64_t max_cnt);
 
   int get_int_value(const ObExpr *in_val, int64_t &out_val);
   int get_topn_count(int64_t &topn_cnt);
   int process_sort();
-  int process_sort_batch();
+  int process_sort_batch(bool &suspended);
   int scan_all_then_sort();
   int scan_all_then_sort_batch();
   int init_prefix_sort(int64_t row_count,
@@ -138,19 +136,28 @@ private:
                 int64_t topn_cnt = INT64_MAX);
   void reset_pd_topn_filter_expr_ctx();
 private:
+  enum class BatchSortPhase
+  {
+    INITIAL,
+    COLLECTING,
+    OUTPUT,
+    FAILED
+  };
+
   ObSortOpImpl sort_impl_;
   ObPrefixSortImpl prefix_sort_impl_;
   int (ObSortOp::*read_func_)();
   int (ObSortOp::*read_batch_func_)(const int64_t max_cnt);
   int64_t sort_row_count_;
   bool is_first_;
+  BatchSortPhase batch_sort_phase_;
+  int batch_sort_error_;
   int64_t ret_row_count_;
   bool iter_end_;
+  ObBatchResultHolder prefix_frame_;
 };
 
 } // end namespace sql
 } // end namespace oceanbase
 
 #endif /* OCEANBASE_SQL_ENGINE_SORT_SORT_OP_H_ */
-
-

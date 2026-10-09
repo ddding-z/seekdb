@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SERVER_OMT
+#include <algorithm>
 #include "ob_server_runtime.h"
 #include "observer/ob_server.h"   // T3d
 #include "share/rc/ob_server_runtime.h"
@@ -146,6 +147,7 @@ int ObPxPools::DeletePoolFunc::operator() (common::hash::HashMapPair<int64_t, Ob
   if (NULL == pool) {
     LOG_WARN("pool is null", K(group_id));
   } else {
+    pool->stop();
     pool->wait();
     LOG_INFO("DEL_POOL_STEP_2: wait pool empty succ!", K(group_id));
     pool->destroy();
@@ -190,13 +192,19 @@ int ObPxPool::submit(const RunFuncT &func)
   }
   disable_recycle();
   ATOMIC_INC(&concurrency_);
-  if (ATOMIC_LOAD(&active_threads_) < ATOMIC_LOAD(&concurrency_)) {
+  if (ATOMIC_LOAD(&stopped_)) {
+    ret = OB_CANCELED;
+    LOG_WARN("PX pool is stopped", K(ret), K(group_id_));
+  } else if (ATOMIC_LOAD(&active_threads_) <
+             ATOMIC_LOAD(&concurrency_) + static_cast<int64_t>(continuations_.runnable_count())) {
     ret = OB_SIZE_OVERFLOW;
   } else {
     Task *t = OB_NEW(Task, ObMemAttr("PxTask"), func);
     if (OB_ISNULL(t)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else if (OB_FAIL(queue_.push(static_cast<ObLink*>(t), 0))) {
+      OB_DELETE(Task, "PxTask", t);
+      LOG_WARN("enqueue PX task failed", K(ret), K(group_id_));
     }
   }
   if (ret != OB_SUCCESS) {
@@ -206,17 +214,68 @@ int ObPxPool::submit(const RunFuncT &func)
   return ret;
 }
 
-void ObPxPool::handle(ObLink *task)
+int ObPxPool::submit(query::IPxTaskContinuation *task)
+{
+  int ret = OB_SUCCESS;
+  disable_recycle();
+  if (OB_ISNULL(task)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (ATOMIC_LOAD(&stopped_)) {
+    ret = OB_CANCELED;
+  } else if (continuations_.size() >= MAX_CONTINUATIONS) {
+    ret = OB_QUEUE_OVERFLOW;
+  } else if (ATOMIC_LOAD(&active_threads_) <=
+             ATOMIC_LOAD(&concurrency_) + static_cast<int64_t>(continuations_.runnable_count())) {
+    ret = OB_SIZE_OVERFLOW;
+  } else {
+    switch (continuations_.submit(task)) {
+      case PxContinuationAdmission::ACCEPTED:
+        break;
+      case PxContinuationAdmission::FULL:
+        ret = OB_QUEUE_OVERFLOW;
+        break;
+      case PxContinuationAdmission::STOPPED:
+        ret = OB_CANCELED;
+        break;
+      case PxContinuationAdmission::DUPLICATE:
+        ret = OB_INIT_TWICE;
+        break;
+      case PxContinuationAdmission::INVALID:
+        ret = OB_INVALID_ARGUMENT;
+        break;
+    }
+  }
+  enable_recycle();
+  if (OB_SUCCESS != ret && OB_SIZE_OVERFLOW != ret) {
+    LOG_WARN("register resumable PX task failed", K(ret), K(group_id_));
+  }
+  return ret;
+}
+
+void ObPxPool::handle(ObLink *task, bool need_exec)
 {
   Task *t  = static_cast<Task*>(task);
   if (t == nullptr) {
     LOG_ERROR_RET(OB_INVALID_ARGUMENT, "px task is invalid");
   } else {
-    bool need_exec = true;
     t->func_(need_exec);
     OB_DELETE(Task, "PxTask", t);
   }
   ATOMIC_DEC(&concurrency_);
+}
+
+void ObPxPool::handle_continuation(const ContinuationStore::Lease &lease)
+{
+  const bool need_exec = lease.need_exec_ && !ATOMIC_LOAD(&stopped_);
+  const query::PxTaskRunResult result = lease.task_->run(need_exec);
+  if (!need_exec && query::PxTaskRunResult::SUSPENDED == result) {
+    LOG_ERROR_RET(OB_ERR_UNEXPECTED, "PX shutdown continuation suspended again", K(group_id_));
+  }
+  if (!continuations_.finish(lease, result)) {
+    LOG_ERROR_RET(OB_ERR_UNEXPECTED, "invalid PX continuation lease", K(group_id_));
+  } else if (query::PxTaskRunResult::FINISHED == result) {
+    lease.task_->destroy();
+  }
 }
 
 void ObPxPool::set_px_thread_name()
@@ -234,6 +293,7 @@ void ObPxPool::run(int64_t idx)
   sql::ObPxWorker worker;
   Worker::set_worker_to_thread_local(&worker);
   run1();
+  Worker::set_worker_to_thread_local(nullptr);
 }
 
 void ObPxPool::run1()
@@ -255,15 +315,23 @@ void ObPxPool::run1()
 
   ObLink *task = nullptr;
   int64_t idle_time = 0;
-  while (!Thread::current().has_set_stop()) {
+  while (!Thread::current().has_set_stop() || continuations_.needs_shutdown_drain()) {
 	  if (!is_inited_) {
       ob_usleep(10 * 1000L);
     } else {
-      if (OB_SUCC(queue_.pop(task, QUEUE_WAIT_TIME))) {
-        handle(task);
+      ContinuationStore::Lease lease;
+      const bool resumed = continuations_.take_ready(lease);
+      if (resumed) {
+        handle_continuation(lease);
+        idle_time = 0;
+      }
+      const int64_t wait_time = resumed ? 0 :
+          (continuations_.size() > 0 ? CONTINUATION_POLL_TIME : QUEUE_WAIT_TIME);
+      if (OB_SUCC(queue_.pop(task, wait_time))) {
+        handle(task, !ATOMIC_LOAD(&stopped_));
         idle_time = 0; // reset recycle timer
-      } else {
-        idle_time += QUEUE_WAIT_TIME;
+      } else if (!resumed) {
+        idle_time += wait_time;
         // if idle for more than 10 min, exit thread
         try_recycle(idle_time);
       }
@@ -282,7 +350,11 @@ void ObPxPool::try_recycle(int64_t idle_time)
   if ((idle_time > 10LL * 60 * 1000 * 1000 && get_thread_count() >= N)
       || idle_time > 60LL * 60 * 1000 * 1000) {
     if (OB_SUCCESS == recycle_lock_.trylock()) {
-      if (ATOMIC_LOAD(&active_threads_) > ATOMIC_LOAD(&concurrency_)) {
+      const int64_t continuation_workers = std::max(
+          static_cast<int64_t>(continuations_.runnable_count()),
+          continuations_.size() > 0 ? int64_t(1) : int64_t(0));
+      if (ATOMIC_LOAD(&active_threads_) >
+          ATOMIC_LOAD(&concurrency_) + continuation_workers) {
         ATOMIC_DEC(&active_threads_);
         // when thread marked as stopped,
         // it will exit the event loop and recycled by background deamon
@@ -296,7 +368,11 @@ void ObPxPool::try_recycle(int64_t idle_time)
 void ObPxPool::stop()
 {
   int ret = OB_SUCCESS;
+  disable_recycle();
+  ATOMIC_STORE(&stopped_, true);
+  continuations_.stop();
   Threads::stop();
+  enable_recycle();
   ObLink *task = nullptr;
   bool need_exec = false;
   while (OB_SUCC(queue_.pop(task, QUEUE_WAIT_TIME))) {

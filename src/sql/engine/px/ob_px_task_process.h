@@ -21,6 +21,9 @@
 #include "sql/engine/px/ob_dfo.h"
 #include "sql/engine/px/ob_px_util.h"
 #include "sql/engine/px/ob_granule_iterator_op.h"
+#include "sql/monitor/ob_exec_stat.h"
+#include "sql/monitor/ob_sql_stat_record.h"
+#include "lib/worker.h"
 
 namespace oceanbase
 {
@@ -72,7 +75,10 @@ public:
   ObPxTaskProcess(const share::ObGlobalContext &gctx, ObPxInitTaskArgs &arg);
   virtual ~ObPxTaskProcess();
   int process();
-  void run();
+  int run();
+  static bool supports_resumable(const ObPxInitTaskArgs &arg);
+  void enable_resumable(lib::RequestAwait &await) { await_ = &await; }
+  bool has_reported_result() const { return result_reported_; }
   // for corotine RunFuncT
 
   ObPxSqcHandler *get_sqc_handler() { return arg_.sqc_handler_; }
@@ -103,6 +109,7 @@ private:
   /* functions */
   int do_process();
   int check_inner_stat();
+  bool is_suspended(int ret) const;
   /* remember to call this function at the end of process() */
   virtual void record_exec_timestamp(bool is_first, ObExecTimestamp &exec_timestamp)
   { ObExecStatUtils::record_exec_timestamp(*this, is_first, exec_timestamp); }
@@ -120,6 +127,13 @@ private:
   int64_t process_timestamp_;
   int64_t exec_start_timestamp_;
   int64_t exec_end_timestamp_;
+  lib::RequestAwait *await_;
+  bool execution_started_;
+  bool prepared_;
+  bool root_opened_;
+  bool result_reported_;
+  ObExecRecord cumulative_exec_record_;
+  ObExecutingSqlStatRecord cumulative_sqlstat_record_;
 
   DISALLOW_COPY_AND_ASSIGN(ObPxTaskProcess);
 };

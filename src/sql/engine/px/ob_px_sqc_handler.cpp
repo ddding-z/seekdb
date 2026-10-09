@@ -355,7 +355,7 @@ int ObPxSqcHandler::link_qc_sqc_channel()
 void ObPxSqcHandler::check_interrupt()
 {
   if (OB_UNLIKELY(IS_INTERRUPTED())) {
-    has_interrupted_ = true;
+    ATOMIC_STORE(&has_interrupted_, true);
     // Interrupt error handling
     ObInterruptCode code = GET_INTERRUPT_CODE();
     int ret = code.code_;

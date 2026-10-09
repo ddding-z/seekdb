@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX SQL_OPT
 #include "ob_select_log_plan.h"
 #include "ob_log_ai_func.h"
+#include "ob_log_semantic.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_log_table_scan.h"
 #include "sql/optimizer/ob_log_join.h"
@@ -4947,6 +4949,314 @@ static int check_solo_plan(const ObLogicalOperator *node, bool &supported)
   return ret;
 }
 
+namespace
+{
+int collect_semantic_calls(ObRawExpr *expr, ObIArray<ObRawExpr *> &calls,
+                           bool stop_at_aggregate = false)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null expression while collecting semantic calls", K(ret));
+  } else if (stop_at_aggregate && expr->is_aggr_expr()) {
+  } else {
+    if (SemanticExprUtils::is_semantic(expr->get_expr_type())) {
+      if (expr->get_param_count() < 2 || expr->get_param_count() > 3 ||
+          !expr->get_param_expr(0)->is_static_scalar_const_expr() ||
+          (expr->get_param_count() == 3 &&
+           !expr->get_param_expr(2)->is_static_scalar_const_expr())) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_MAP and AI_FILTER require static model and options");
+      } else {
+        ret = add_var_to_array_no_dup(calls, expr);
+      }
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && index < expr->get_param_count(); ++index) {
+      ret = SMART_CALL(collect_semantic_calls(expr->get_param_expr(index), calls,
+                                             stop_at_aggregate));
+    }
+  }
+  return ret;
+}
+
+bool semantic_plan_present(const ObLogicalOperator &node)
+{
+  bool present = node.get_type() == LOG_SEMANTIC_MAP || node.get_type() == LOG_SEMANTIC_FILTER;
+  for (int64_t index = 0; !present && index < node.get_num_of_child(); ++index) {
+    if (nullptr != node.get_child(index)) {
+      present = semantic_plan_present(*node.get_child(index));
+    }
+  }
+  return present;
+}
+
+class SemanticPlanLowering
+{
+public:
+  explicit SemanticPlanLowering(ObSelectLogPlan &plan) : plan_(plan) {}
+  int lower(ObLogicalOperator *&node)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_ISNULL(node)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      for (int64_t index = 0; OB_SUCC(ret) && index < node->get_num_of_child(); ++index) {
+        ObLogicalOperator *child = node->get_child(index);
+        if (OB_FAIL(SMART_CALL(lower(child)))) {
+        } else {
+          node->set_child(index, child);
+        }
+      }
+      if (OB_SUCC(ret) && (node->get_type() == LOG_SEMANTIC_MAP ||
+                           node->get_type() == LOG_SEMANTIC_FILTER)) {
+        auto *semantic = static_cast<LogSemantic *>(node);
+        if (OB_FAIL(stages_.push_back(semantic))) {
+        } else {
+          ret = append_array_no_dup(available_calls_, semantic->semantic_exprs());
+        }
+      } else if (OB_SUCC(ret)) {
+        ObSEArray<ObRawExpr *, 8> inputs;
+        if (node->get_type() == LOG_GROUP_BY) {
+          auto &group = *static_cast<ObLogGroupBy *>(node);
+          if (OB_FAIL(append(inputs, group.get_group_by_exprs()))) {
+          } else if (OB_FAIL(append_array_no_dup(inputs, group.get_rollup_exprs()))) {
+          } else {
+            for (int64_t aggregate_index = 0; OB_SUCC(ret) &&
+                 aggregate_index < group.get_aggr_funcs().count(); ++aggregate_index) {
+              ObRawExpr *aggregate = group.get_aggr_funcs().at(aggregate_index);
+              for (int64_t index = 0; OB_SUCC(ret) && index < aggregate->get_param_count(); ++index) {
+                ret = add_var_to_array_no_dup(inputs, aggregate->get_param_expr(index));
+              }
+            }
+          }
+        } else if (node->get_type() == LOG_SORT) {
+          const auto &sort = *static_cast<ObLogSort *>(node);
+          for (int64_t key_index = 0; OB_SUCC(ret) &&
+               key_index < sort.get_sort_keys().count(); ++key_index) {
+            const OrderItem &key = sort.get_sort_keys().at(key_index);
+            if (OB_SUCC(ret)) {
+              ret = add_var_to_array_no_dup(inputs, key.expr_);
+            }
+          }
+        } else if (node->get_type() == LOG_DISTINCT) {
+          ret = append(inputs, static_cast<ObLogDistinct *>(node)->get_distinct_exprs());
+        }
+        ObSEArray<ObRawExpr *, 8> required;
+        for (int64_t index = 0; OB_SUCC(ret) && index < inputs.count(); ++index) {
+          bool needed = false;
+          if (OB_FAIL(needs_stage(inputs.at(index), needed))) {
+          } else if (needed) {
+            ret = add_var_to_array_no_dup(required, inputs.at(index));
+          }
+        }
+        if (OB_SUCC(ret) && !required.empty()) {
+          ObLogicalOperator *child = node->get_child(ObLogicalOperator::first_child);
+          if (OB_ISNULL(child)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(wrap(child, required, false))) {
+          } else {
+            node->set_child(ObLogicalOperator::first_child, child);
+          }
+        }
+        ObSEArray<ObRawExpr *, 8> predicates;
+        if (OB_SUCC(ret) && OB_FAIL(extract_filters(node->get_filter_exprs(), predicates))) {
+        } else if (OB_SUCC(ret) && OB_FAIL(extract_filters(node->get_pushdown_filter_exprs(), predicates))) {
+        } else if (OB_SUCC(ret) && OB_FAIL(extract_filters(node->get_startup_exprs(), predicates))) {
+        }
+        if (OB_SUCC(ret) && node->get_type() == LOG_JOIN) {
+          auto &join = *static_cast<ObLogJoin *>(node);
+          for (int64_t condition_index = 0; OB_SUCC(ret) &&
+               condition_index < join.get_equal_join_conditions().count(); ++condition_index) {
+            ObRawExpr *condition = join.get_equal_join_conditions().at(condition_index);
+            ObSEArray<ObRawExpr *, 4> calls;
+            if (OB_SUCC(ret) && OB_FAIL(collect_semantic_calls(condition, calls))) {
+            } else if (OB_SUCC(ret) && !calls.empty()) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "semantic calls in equality join keys");
+            }
+          }
+          if (OB_SUCC(ret) && join.get_join_type() == INNER_JOIN) {
+            ret = extract_filters(join.get_join_filters(), predicates);
+          } else if (OB_SUCC(ret)) {
+            for (int64_t condition_index = 0; OB_SUCC(ret) &&
+                 condition_index < join.get_other_join_conditions().count(); ++condition_index) {
+              ObRawExpr *condition = join.get_other_join_conditions().at(condition_index);
+              ObSEArray<ObRawExpr *, 4> calls;
+              if (OB_SUCC(ret) && OB_FAIL(collect_semantic_calls(condition, calls))) {
+              } else if (OB_SUCC(ret) && !calls.empty()) {
+                ret = OB_NOT_SUPPORTED;
+                LOG_USER_ERROR(OB_NOT_SUPPORTED, "semantic calls in outer or semi join conditions");
+              }
+            }
+          }
+        }
+        if (OB_SUCC(ret) && !predicates.empty()) {
+          ret = wrap(node, predicates, true);
+        }
+      }
+    }
+    return ret;
+  }
+
+  int add_projection(ObLogicalOperator *&node, const ObIArray<ObRawExpr *> &selects)
+  {
+    int ret = OB_SUCCESS;
+    ObSEArray<ObRawExpr *, 8> required;
+    for (int64_t index = 0; OB_SUCC(ret) && index < selects.count(); ++index) {
+      bool needed = false;
+      if (OB_FAIL(needs_stage(selects.at(index), needed))) {
+      } else if (needed) {
+        ret = add_var_to_array_no_dup(required, selects.at(index));
+      }
+    }
+    if (OB_SUCC(ret) && !required.empty()) {
+      ret = wrap(node, required, false);
+    }
+    return ret;
+  }
+
+  int assign_query_limits()
+  {
+    int ret = OB_SUCCESS;
+    ObSEArray<ObRawExpr *, 16> calls;
+    for (LogSemantic *stage : stages_) {
+      if (OB_SUCC(ret)) {
+        ret = append_array_no_dup(calls, stage->semantic_exprs());
+      }
+    }
+    for (LogSemantic *stage : stages_) {
+      stage->set_query_task_count(calls.count());
+    }
+    return ret;
+  }
+
+private:
+  int needs_stage(ObRawExpr *expr, bool &needed)
+  {
+    int ret = OB_SUCCESS;
+    needed = false;
+    ObSEArray<ObRawExpr *, 8> calls;
+    if (OB_FAIL(collect_semantic_calls(expr, calls, true))) {
+    } else {
+      needed = !calls.empty();
+      for (int64_t index = 0; needed && index < stages_.count(); ++index) {
+        const LogSemantic &stage = *stages_.at(index);
+        if (stage.get_type() == LOG_SEMANTIC_MAP &&
+            ObOptimizerUtil::find_item(stage.expressions(), expr)) {
+          needed = false;
+        }
+      }
+    }
+    return ret;
+  }
+
+  int extract_filters(ObIArray<ObRawExpr *> &filters, ObIArray<ObRawExpr *> &predicates)
+  {
+    int ret = OB_SUCCESS;
+    ObSEArray<ObRawExpr *, 8> retained;
+    for (int64_t index = 0; OB_SUCC(ret) && index < filters.count(); ++index) {
+      ObSEArray<ObRawExpr *, 8> calls;
+      if (OB_FAIL(collect_semantic_calls(filters.at(index), calls, true))) {
+      } else if (calls.empty()) {
+        ret = retained.push_back(filters.at(index));
+      } else {
+        ret = add_var_to_array_no_dup(predicates, filters.at(index));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ret = filters.assign(retained);
+    }
+    return ret;
+  }
+
+  int wrap(ObLogicalOperator *&child, const ObIArray<ObRawExpr *> &expressions, bool filter)
+  {
+    int ret = OB_SUCCESS;
+    auto *stage = static_cast<LogSemantic *>(plan_.get_log_op_factory().allocate(
+        plan_, filter ? LOG_SEMANTIC_FILTER : LOG_SEMANTIC_MAP));
+    if (OB_ISNULL(stage) || OB_ISNULL(child)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate semantic logical stage failed", K(ret));
+    } else {
+      ObSEArray<ObRawExpr *, 8> calls;
+      for (int64_t index = 0; OB_SUCC(ret) && index < expressions.count(); ++index) {
+        ret = collect_semantic_calls(expressions.at(index), calls, true);
+      }
+      for (ObRawExpr *call : calls) {
+        if (OB_SUCC(ret) && ObOptimizerUtil::find_item(available_calls_, call)) {
+          if (OB_FAIL(stage->add_shared_expression(call))) {
+          } else {
+            bool carried = false;
+            for (int64_t index = stages_.count() - 1;
+                 OB_SUCC(ret) && !carried && index >= 0; --index) {
+              if (ObOptimizerUtil::find_item(stages_.at(index)->semantic_exprs(), call)) {
+                ret = stages_.at(index)->add_carried_expression(call);
+                carried = true;
+              }
+            }
+          }
+        }
+      }
+      for (int64_t index = 0; OB_SUCC(ret) && index < expressions.count(); ++index) {
+        ret = stage->add_expression(expressions.at(index));
+      }
+      if (OB_SUCC(ret)) {
+        stage->set_child(ObLogicalOperator::first_child, child);
+        stage->set_is_plan_root(child->is_plan_root());
+        child->set_is_plan_root(false);
+        if (OB_FAIL(stage->compute_property())) {
+        } else if (OB_FAIL(stages_.push_back(stage))) {
+        } else if (OB_FAIL(append_array_no_dup(available_calls_, stage->semantic_exprs()))) {
+        } else {
+          child = stage;
+        }
+      }
+    }
+    return ret;
+  }
+
+  ObSelectLogPlan &plan_;
+  ObSEArray<ObRawExpr *, 16> available_calls_;
+  ObSEArray<LogSemantic *, 8> stages_;
+};
+}
+
+int ObSelectLogPlan::candi_allocate_semantic(bool projection)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObRawExpr *, 16> relations;
+  ObSEArray<ObRawExpr *, 16> calls;
+  ObSEArray<ObRawExpr *, 8> selects;
+  if (OB_FAIL(get_stmt()->get_relation_exprs(relations))) {
+  } else {
+    for (int64_t index = 0; OB_SUCC(ret) && index < relations.count(); ++index) {
+      ret = collect_semantic_calls(relations.at(index), calls);
+    }
+  }
+  bool present = !calls.empty();
+  for (int64_t index = 0; !present && index < candidates_.candidate_plans_.count(); ++index) {
+    present = semantic_plan_present(*candidates_.candidate_plans_.at(index).plan_tree_);
+  }
+  if (OB_SUCC(ret) && present) {
+    const ObSelectStmt &stmt = *get_stmt();
+    if (stmt.is_set_stmt() || stmt.has_window_function() || stmt.has_for_update() ||
+        stmt.has_select_into() || stmt.get_subquery_expr_size() != 0) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "semantic operators in set, window, locking or scalar-subquery SELECT");
+    } else if (OB_FAIL(stmt.get_select_exprs(selects))) {
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && index < candidates_.candidate_plans_.count(); ++index) {
+      ObLogicalOperator *&root = candidates_.candidate_plans_.at(index).plan_tree_;
+      SemanticPlanLowering lowering(*this);
+      if (OB_FAIL(lowering.lower(root))) {
+      } else if (projection && OB_FAIL(lowering.add_projection(root, selects))) {
+      } else if (OB_FAIL(lowering.assign_query_limits())) {
+      }
+    }
+  }
+  return ret;
+}
+
 int ObSelectLogPlan::candi_allocate_ai_func()
 {
   int ret = OB_SUCCESS;
@@ -5061,6 +5371,8 @@ int ObSelectLogPlan::allocate_plan_top()
     bool for_update_is_allocated = false;
     ObSEArray<OrderItem, 4> order_items;
     LOG_TRACE("start to allocate operators for ", "sql", optimizer_context_.get_query_ctx()->get_sql_stmt());
+    if (OB_FAIL(candi_allocate_semantic(false))) {
+    }
     // step. allocate subplan filter if needed, mainly for the subquery in where statement
     if (OB_SUCC(ret)) {
       if (get_subquery_filters().count() > 0) {
@@ -5176,6 +5488,8 @@ int ObSelectLogPlan::allocate_plan_top()
       }
     }
 
+    if (OB_SUCC(ret) && OB_FAIL(candi_allocate_semantic())) {
+    }
     if (OB_SUCC(ret) && OB_FAIL(candi_allocate_ai_func())) {
     }
 

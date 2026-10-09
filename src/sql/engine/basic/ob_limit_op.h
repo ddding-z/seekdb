@@ -57,6 +57,7 @@ public:
 
   virtual int inner_get_next_row() override;
   virtual int inner_get_next_batch(const int64_t max_row_cnt) override;
+  bool supports_semantic_suspend() const override;
 
   virtual void destroy() override { ObOperator::destroy(); }
 

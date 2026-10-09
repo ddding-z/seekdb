@@ -45,9 +45,10 @@ public:
   virtual bool need_rt_ctx() const override { return true; }
 private:
   friend class AIFuncOp;
+  friend class SemanticExprUtils;
   static int prepare_input(const ObExpr &expr, ObEvalCtx &ctx, MultimodeAlloctor &allocator,
                            ObString &model_id, ObString &prompt, ObJsonObject *&config,
-                           ObJsonObject **fields = nullptr);
+                           ObJsonObject **fields = nullptr, bool parse_config = true);
   static constexpr int MODEL_IDX = 0;
   static constexpr int PROMPT_IDX = 1;
   static constexpr int CONFIG_IDX = 2;

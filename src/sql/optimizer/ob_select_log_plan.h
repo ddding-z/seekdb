@@ -550,6 +550,7 @@ private:
      */
   int allocate_plan_top();
   int candi_allocate_ai_func();
+  int candi_allocate_semantic(bool projection = true);
   /**
    * Process subqueries in the select clause, generate SubPlan
    * @param

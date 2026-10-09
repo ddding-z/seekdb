@@ -42,7 +42,7 @@ void ObInterruptChecker::unregister_checker(const ObInterruptibleTaskID &tid)
 
 bool ObInterruptChecker::is_interrupted()
 {
-  return interrupted_;
+  return ATOMIC_LOAD(&interrupted_);
 }
 
 ObInterruptCode &ObInterruptChecker::get_interrupt_code()
@@ -52,22 +52,22 @@ ObInterruptCode &ObInterruptChecker::get_interrupt_code()
 
 void ObInterruptChecker::interrupt(ObInterruptCode &interrupt_code)
 {
-  if (!interrupted_) {
+  if (!ATOMIC_LOAD(&interrupted_)) {
     interrupt_code_array_ = interrupt_code;
-    interrupted_ = true;
+    ATOMIC_STORE(&interrupted_, true);
   }
 }
 
 void ObInterruptChecker::clear_status()
 {
-  interrupted_ = false;
+  ATOMIC_STORE(&interrupted_, false);
   ref_count_ = 0;
   interrupt_code_array_.reset();
 }
 
 void ObInterruptChecker::clear_interrupt_status()
 {
-  interrupted_ = false;
+  ATOMIC_STORE(&interrupted_, false);
 }
 
 ObInterruptCheckerGuard::ObInterruptCheckerGuard(ObInterruptChecker &new_checker)

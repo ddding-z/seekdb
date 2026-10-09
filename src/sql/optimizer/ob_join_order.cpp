@@ -25,6 +25,7 @@
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/rewrite/ob_query_range_define.h"
 #include "sql/engine/expr/ob_expr_result_type_util.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
 #include "sql/engine/px/ob_px_util.h"
 #include "sql/das/iter/ob_das_text_retrieval_eval_node.h"
 using namespace oceanbase;
@@ -16140,9 +16141,14 @@ int ObJoinOrder::extract_pushdown_quals(const ObIArray<ObRawExpr *> &quals,
   int ret = OB_SUCCESS;
   for (int64_t i = 0; OB_SUCC(ret) && i < quals.count(); ++i) {
     ObRawExpr *qual = quals.at(i);
+    bool semantic = false;
     if (OB_ISNULL(qual)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("get unexpected null", K(qual), K(ret));
+    } else if (OB_FAIL(SemanticExprUtils::contains_semantic(qual, semantic))) {
+      LOG_WARN("failed to check semantic join dependencies", K(ret));
+    } else if (semantic) {
+      // Semantic pair predicates need both owned join inputs, not mutable NL parameters.
     // can not push down expr with subquery
     } else if (force_inner_nl && qual->has_flag(CNT_MATCH_EXPR)) {
       ret = OB_NOT_SUPPORTED;

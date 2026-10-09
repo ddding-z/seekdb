@@ -21,6 +21,8 @@
 #include "ob_operator_factory.h"
 #include "sql/optimizer/ob_log_ai_func.h"
 #include "sql/engine/basic/ob_ai_func_op.h"
+#include "sql/optimizer/ob_log_semantic.h"
+#include "sql/engine/basic/ob_semantic_op.h"
 #include "sql/optimizer/ob_log_group_by.h"
 #include "sql/optimizer/ob_log_sort.h"
 #include "sql/optimizer/ob_log_limit.h"

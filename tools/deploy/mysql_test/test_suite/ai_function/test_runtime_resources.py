@@ -1,62 +1,23 @@
 """Compile resource fault tests against the existing Linux Debug build."""
 
 import argparse
-import json
-import os
 from pathlib import Path
-import re
 import subprocess
-import sys
 import tempfile
 import threading
 
+from native_test_build import ROOT, build_native_test
 import test_runtime as runtime
 from test_runtime_contracts import Reply, configure_mock
 
 
-ROOT = Path(__file__).resolve().parents[5]
 WRAPPED = ("curl_easy_init", "curl_easy_cleanup", "curl_multi_init", "curl_multi_cleanup",
            "curl_multi_add_handle", "curl_multi_remove_handle", "curl_multi_perform",
            "curl_multi_poll", "curl_slist_append", "curl_slist_free_all")
 
 
 def build_test(build_dir, output):
-    entries = json.loads((ROOT / "compile_commands.json").read_text())
-    entry = next(item for item in entries if item["file"].endswith("/ob_ai_func_op.cpp"))
-    directory = Path(entry["directory"])
-    query = subprocess.run([
-        sys.executable, str(ROOT / "bazel.py"), f"--build-dir={build_dir}", "aquery",
-        'mnemonic(".*Link.*", deps(//src/observer:seekdb))', "-c", "dbg",
-        "--action_env=CARGO_NET_OFFLINE=true", "--action_env=CC=clang", "--output=jsonproto",
-    ], cwd=ROOT, check=True, stdout=subprocess.PIPE, text=True)
-    actions = json.loads(query.stdout)["actions"]
-    main_object = "/_observer_main_ob_main_0_objects/"
-    action = next(item for item in actions
-                  if any(main_object in value for value in item.get("arguments", [])))
-    arguments = iter(entry["arguments"][1:])
-    compile_args = [entry["arguments"][0]]
-    for value in arguments:
-        if value in ("-o", "-MF", "-MT", "-MQ"):
-            next(arguments)
-        elif value not in ("-MD", "-MMD", "-MP") and not value.startswith("-frandom-seed="):
-            compile_args.append(str(Path(__file__).with_suffix(".cpp"))
-                                if value == entry["file"] else value)
-    object_file = output.with_suffix(".o")
-    subprocess.run(compile_args + ["-o", str(object_file)], cwd=directory, check=True)
-    link_args = list(action["arguments"])
-    replacements = [index for index, value in enumerate(link_args) if main_object in value]
-    if len(replacements) != 1:
-        raise RuntimeError("Expected exactly one seekdb entry-point object")
-    link_args[replacements[0]] = str(object_file)
-    link_args[link_args.index("-o") + 1] = str(output)
-    link_args.extend(f"-Wl,--wrap={symbol}" for symbol in WRAPPED)
-    subprocess.run(link_args, cwd=directory, check=True)
-    library_dirs = dict.fromkeys(str((directory / value).resolve().parent)
-                                for value in action["arguments"]
-                                if re.search(r"\.so(?:\.\d+)*$", value))
-    environment = dict(os.environ)
-    environment["LD_LIBRARY_PATH"] = ":".join([*library_dirs, environment.get("LD_LIBRARY_PATH", "")])
-    return environment
+    return build_native_test(build_dir, output, Path(__file__).with_suffix(".cpp"), wrapped=WRAPPED)
 
 
 def main():

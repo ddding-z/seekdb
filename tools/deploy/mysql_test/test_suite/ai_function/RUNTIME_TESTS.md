@@ -1,6 +1,164 @@
 # AI Function Runtime Regression
 
-Latest validation (2026-09-29): the Debug build, all **105 SQL contracts** (including ten [global SOLO contracts](#global-solo-prompt-reordering-2026-09-29)), **five fixture self-tests**, the [native resource tests](#resource-reliability-tests), and the separate server-shutdown contract passed. The earlier [suspended-statement cache lifetime fix](#suspended-statement-cache-lifetime-2026-09-29) remains covered. Eligible single-statement AI pipeline SELECTs return their worker while waiting and resume from the retained result cursor.
+Legacy baseline validation (2026-09-29): the Debug build, all **105 SQL contracts** (including ten [global SOLO contracts](#global-solo-prompt-reordering-2026-09-29)), **five fixture self-tests**, the [native resource tests](#resource-reliability-tests), and the separate server-shutdown contract passed. The earlier [suspended-statement cache lifetime fix](#suspended-statement-cache-lifetime-2026-09-29) remains covered. Eligible single-statement AI pipeline SELECTs return their worker while waiting and resume from the retained result cursor. The newer semantic-operator validation is recorded below.
+
+For the current architecture, code map, maintenance invariants and handoff checklist, see the [Chinese maintenance handoff](../../../../../docs/developer-guide/zh/ai-function-runtime-handoff.md).
+
+## Asynchronous Semantic Operators (2026-10-08)
+
+`AI_MAP(model, prompt[, options])` returns per-row LONGTEXT.
+`AI_FILTER(model, prompt[, options])` returns SQL Boolean 1/0, accepting only a
+strict JSON object `{"value": true}` or `{"value": false}` from the provider.
+Invalid output is an error, never a false result. Models and options must be
+static; prompts can use ordinary SQL expressions, positional `AI_PROMPT`, or a
+preceding semantic result. Structured global SOLO input is not supported by
+these new interfaces. Existing AI functions retain their existing paths.
+Set/window/locking/SELECT-INTO and scalar-subquery SELECTs, semantic equality
+join keys, and semantic outer/semi-join ON conditions are explicitly unsupported
+in this stage; ordinary inner-join pair filtering and noncorrelated derived
+semantic stages are covered.
+
+```sql
+SELECT id, AI_MAP('classifier', prompt) AS category
+FROM inputs
+WHERE AI_FILTER('selector', prompt)
+ORDER BY id;
+```
+
+The planner creates `SEMANTIC MAP` and `SEMANTIC FILTER` stages, not synchronous
+completion aliases. Projecting `AI_FILTER` is a Boolean **map** and preserves
+false rows; using its result in WHERE/HAVING consumes it as a row filter.
+CASE/AND/OR/NOT retain their SQL demand boundaries. Independent expressions can
+submit together; same-row dependencies wait for their inputs, while independent
+batches and filter-to-map stages can overlap. Results remain mapped to owned
+input rows, including duplicates and partial final batches.
+
+Call ownership does not mean every surviving row has requested that call.
+Earlier stages explicitly carry completed semantic values or a private
+undemanded tag; subsequent materializers reuse ready values and request only
+missing ones at their SQL boundary. Valid semantic outputs are never SQL NULL,
+so only declared carried AI expressions use an internal NULL tag. False and
+empty-string results remain ready values, not missing values. These tags must
+never become SQL-visible fallback results. Projection materialization stays
+after LIMIT; sort/group consumers materialize their required expressions before
+the corresponding CPU operator.
+
+CPU recipes derived from partial semantic values, including their conditional
+fallback branches, are not advertised as completed relational inputs. Consumers
+recompute them inside their semantic runtime, preserving already-completed
+child inputs. Per-row availability masks keep ready peers initialized when a
+missing peer is requested, avoiding cache replay.
+Completing a whole CASE/OR condition does not complete its skipped CPU branches;
+those descendants retain deferred classification even when the condition itself
+is an exportable stage target.
+
+AI_FILTER uses the existing native `response_format.json_schema` mechanism with
+required Boolean `value`, no additional properties, and `strict=true`. The exact
+case-sensitive `Schema` key is reserved only for AI_FILTER. A matching caller
+native format and its nonempty name are preserved; conflicting formats fail.
+AI_MAP retains completion-style option passthrough rather than interpreting
+`Schema` as a new shorthand.
+
+### Budgets And Suspension Boundaries
+
+- Each operator retains at most `ai_pipeline_slots` input batches. All stages
+  and PX contexts of the same execution share `ai_pipeline_memory_limit`.
+- Query-wide active **client-batch** admission is `ai_pipeline_slots` times the
+  number of distinct semantic calls in the plan, not that product times DOP.
+  A completion client-batch still contains independent per-row HTTP requests;
+  neither this bound nor the existing scheduler's 64-client limit is a count
+  of HTTP requests.
+- Owned inputs/results, prompts, static model/configuration, and HTTP buffers
+  participate in logical accounting. Configuration is prepared once per
+  submission wave; temporary expression/JSON allocation and allocator overhead
+  mean the limit is not a whole-process RSS cap. Existing 4MiB request, 8MiB
+  response, and 64MiB client-batch limits remain in effect.
+- Outward suspension is default-deny for ordinary parents with unsafe
+  stack-local progress, and always disabled during open. Unsupported suspension
+  shapes still use the asynchronous semantic batches but do not necessarily
+  release their SQL worker. A plan containing a semantic stage is not by itself
+  evidence that every ancestor can suspend.
+- Resumable PX is narrowly checked: vectorized reduce-transmit, a contiguous
+  semantic map/filter region, optional GI, and scan/expr-values. Rescans,
+  sampling, shuffle/hybrid modes and unsafe join/receive/blocking ancestors are
+  excluded from this gate. The existing PX pool retains at most 64 continuation
+  records; memory/context/session/schema/interrupt state survives a wait, and
+  completion/admission ownership is released only at true finish.
+- WHERE lowering happens before LIMIT/Top-N pushdown. Semantic pair predicates
+  are not pushed into mutable NLJ inner parameters. Prefetch preserves the
+  entire child datum frame, including live tails retained by prefix sorting.
+- The owning SQL worker polls completed tasks across all registered semantic
+  stages before preparing its own frame. Polling collects owned buffers and
+  releases task credits without evaluating another operator's SQL frame.
+  Ready upstream batches therefore cannot pin every credit while a full
+  downstream stage waits to submit missing values.
+- If the first input cannot fit a query-local memory quota while an upstream
+  batch remains pinned, execution reports the quota error rather than awaiting
+  memory that the same pull stack cannot release. This is a conservative quota
+  policy, not a claim of adaptive concurrency under all memory pressure.
+
+### Test Entrypoints
+
+All SQL runners below create new temporary unix-socket databases with loopback
+mocks. They do not connect to the existing debug database or call a real model.
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_runtime.py \
+  --self-test
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_runtime.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_composition.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_px.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_px.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb" --shutdown-test
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_resources.py \
+  --build-dir build_debug --repeat 10
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_collection.py \
+  --build-dir build_debug
+```
+
+Repeat `--case` to select SQL contracts. PX shutdown is a separate invocation
+because it intentionally stops its own private database.
+
+The composition suite checks joins, aggregate arguments, GROUP BY/HAVING,
+derived stages, Boolean NULL logic, and exact ordered LIMIT/OFFSET results.
+It also checks partial HAVING/conditional-sort results, nested prompt recipes,
+invalid unselected CPU fallbacks, empty strings, 67-row LOB carriers, streaming
+credit progress, and exact once-only request counts after LIMIT.
+The eight PX contracts use eight partitions and `PARALLEL(4)`, require four
+preparing task IDs under one execution ID and multiple actual CPU thread IDs,
+and enforce held-request limits of 32 rows for one call or 64 for two calls at
+slots=2/batch=16. Unconditional shapes must fill the exact ceiling; guarded
+client-batches can have fewer demanded rows, but retain the same hard ceiling.
+These are two or four client-batches, not provider batching.
+They verify exact rows/call multiplicities, filter pruning, nested dependencies,
+cancel/deadline/provider-error recovery, and socket cleanup.
+
+The driver-release case additionally requires no active PX execution slices
+while all replies are held, then runs another parallel query on the same
+physical driver threads. Normal shutdown must exit with status zero before
+the held query deadline. Native budget tests check exact byte/task boundaries,
+global rollback, DOP-independent capacity, fatal-error admission, scope/TLS
+isolation, concurrent final registry teardown, and completion-credit release
+without another child pull. Native collection tests cover waits, errors,
+cancel/rescan/close, worker handoff, spill gates and prefix live tails using
+cached Debug objects. Actual spill I/O remains uncertified. Native continuation
+tests are separate from the real SQL PX proof.
+
+The complete legacy 105 SQL contracts, legacy native resources, and independent
+legacy normal-shutdown contract have been rerun successfully. The new 39
+semantic SQL contracts, 26 composition contracts, and eight PX contracts pass.
+Both independent normal-shutdown contracts, eleven semantic fixture self-tests,
+120 repeated semantic budget/scope/registry/completion checks, and 78 native
+collection scenarios also pass. The continuation lifecycle suite separately
+passed nine cases repeated twenty times and ASan/UBSan; TSan could not initialize
+on this host and is not counted as a pass. SQL contract deadlines remain strict;
+only metadata bootstrap uses a separate 30-second setup timeout.
+These checks do not establish real-model quality, GPU utilization, or a SemBench speedup.
+Semantic cost-based optimization, approximate retrieval/cascades, and dedicated
+set-level semantic join/aggregation algorithms are not implemented here.
 
 ## Global SOLO Prompt Reordering (2026-09-29)
 

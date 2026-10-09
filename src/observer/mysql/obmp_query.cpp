@@ -1360,7 +1360,8 @@ OB_INLINE int ObMPQuery::response_result(ObMySQLResultSet &result,
       // Pilot ObQuerySyncDriver
       const ObOpSpec *root = result.get_physical_plan()->get_root_op_spec();
       if (nullptr != lib::RequestAwait::current() && nullptr != root &&
-          PHY_AI_FUNC == root->type_ && root->is_vectorized() &&
+          (PHY_AI_FUNC == root->type_ || root->has_semantic_operator()) &&
+          root->is_vectorized() &&
           stmt::T_SELECT == result.get_stmt_type() && !is_com_filed_list_ &&
           !session.is_diagnosis_enabled() && static_cast<int64_t>(GCONF.debug_sync_timeout) <= 0 &&
           !force_sync_resp && !result.has_more_result() &&

@@ -229,6 +229,7 @@ OBSERVER_PRIVATE_HEADERS = [
     "ob_tablet_runtime_meta_updater.h",
     "omt/ob_ai_service.h",
     "omt/ob_server_module_lifecycle.h",
+    "omt/ob_px_task_continuation_store.h",
     "omt/ob_server_runtime.h",
     "omt/ob_server_runtime_controller.h",
     "omt/ob_srs_service.h",

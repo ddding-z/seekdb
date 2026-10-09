@@ -131,7 +131,7 @@ public:
   int64_t get_request_level() { return request_level_; }
   void set_request_level(int64_t level) { request_level_ = level; }
   int thread_count_auto_scaling(int64_t &reserved_px_thread_count);
-  bool has_interrupted() const { return has_interrupted_; }
+  bool has_interrupted() const { return ATOMIC_LOAD(&has_interrupted_); }
   const Ob2DArray<ObPxTabletRange> &get_partition_ranges() const { return part_ranges_; }
   int set_partition_ranges(const Ob2DArray<ObPxTabletRange> &part_ranges,
                            char *buf = NULL, int64_t max_size = 0);

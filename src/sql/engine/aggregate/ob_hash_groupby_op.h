@@ -271,6 +271,8 @@ public:
       iter_end_(false),
       enable_dump_(false),
       force_dump_(false),
+      dump_started_(false),
+      batch_collection_(),
       batch_rows_from_dump_(NULL),
       hash_vals_(NULL),
       gri_cnt_per_batch_(0),
@@ -333,6 +335,7 @@ public:
 
   // for batch
   virtual int inner_get_next_batch(const int64_t max_row_cnt) override;
+  virtual bool supports_semantic_suspend() const override;
   void calc_avg_group_mem();
   OB_INLINE void llc_add_value(int64_t hash_value) 
   {
@@ -447,6 +450,8 @@ private:
                                   ObGbyBloomFilter *&bloom_filter,
                                   bool &process_check_dump);
   int load_data_batch(int64_t max_row_cnt);
+  int finish_batch_collection(bool dump_success);
+  void reset_batch_collection();
   int switch_part(DatumStoreLinkPartition *&cur_part,
                   ObChunkDatumStore::Iterator &row_store_iter,
                   int64_t &part_id,
@@ -612,8 +617,60 @@ private:
   bool iter_end_;
   bool enable_dump_;
   bool force_dump_;
+  bool dump_started_;
 
   // for batch
+  struct BatchCollectionState
+  {
+    enum class Phase
+    {
+      IDLE,
+      COLLECTING,
+      FAILED
+    };
+
+    BatchCollectionState()
+      : phase_(Phase::IDLE), error_(common::OB_SUCCESS), row_store_iter_(),
+        cur_part_(nullptr), part_id_(0), part_shift_(0), input_rows_(0), input_size_(0),
+        parts_{}, part_cnt_(0), est_part_cnt_(0), loop_cnt_(0)
+    {}
+
+    void reset()
+    {
+      row_store_iter_.reset();
+      phase_ = Phase::IDLE;
+      error_ = common::OB_SUCCESS;
+      cur_part_ = nullptr;
+      part_id_ = 0;
+      part_shift_ = 0;
+      input_rows_ = 0;
+      input_size_ = 0;
+      MEMSET(parts_, 0, sizeof(parts_));
+      part_cnt_ = 0;
+      est_part_cnt_ = 0;
+      loop_cnt_ = 0;
+      bloom_filter_ = nullptr;
+    }
+
+    Phase phase_;
+    int error_;
+    ObChunkDatumStore::Iterator row_store_iter_;
+    DatumStoreLinkPartition *cur_part_;
+    int64_t part_id_;
+    int64_t part_shift_;
+    int64_t input_rows_;
+    int64_t input_size_;
+    DatumStoreLinkPartition *parts_[MAX_PARTITION_CNT];
+    int64_t part_cnt_;
+    int64_t est_part_cnt_;
+    int64_t loop_cnt_;
+    ObGbyBloomFilter *bloom_filter_ = nullptr;
+
+  private:
+    DISALLOW_COPY_AND_ASSIGN(BatchCollectionState);
+  };
+
+  BatchCollectionState batch_collection_;
   const ObChunkDatumStore::StoredRow **batch_rows_from_dump_;
   ObBatchRows dumped_batch_rows_;
   uint64_t *hash_vals_;

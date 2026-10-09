@@ -43,9 +43,33 @@ int ObPxReduceTransmitOp::inner_open()
 int ObPxReduceTransmitOp::do_transmit()
 {
   int ret = OB_SUCCESS;
-  ObAllToOneSliceIdxCalc fixed_slice_calc(ctx_.get_allocator());
-  ret = send_rows<ObSliceIdxCalc::ALL_TO_ONE>(fixed_slice_calc);
+  if (!resumable_) {
+    ObAllToOneSliceIdxCalc fixed_slice_calc(ctx_.get_allocator());
+    ret = send_rows<ObSliceIdxCalc::ALL_TO_ONE>(fixed_slice_calc);
+  } else {
+    if (nullptr == resumable_slice_calc_) {
+      void *buffer = ctx_.get_allocator().alloc(sizeof(ObAllToOneSliceIdxCalc));
+      if (OB_ISNULL(buffer)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("allocate resumable PX slice calculator failed", K(ret));
+      } else {
+        resumable_slice_calc_ = new (buffer) ObAllToOneSliceIdxCalc(ctx_.get_allocator());
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ret = send_rows<ObSliceIdxCalc::ALL_TO_ONE>(*resumable_slice_calc_);
+    }
+  }
   return ret;
+}
+
+void ObPxReduceTransmitOp::destroy()
+{
+  if (nullptr != resumable_slice_calc_) {
+    resumable_slice_calc_->~ObAllToOneSliceIdxCalc();
+    resumable_slice_calc_ = nullptr;
+  }
+  ObPxTransmitOp::destroy();
 }
 
 int ObPxReduceTransmitOp::inner_close()
