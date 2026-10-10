@@ -1208,7 +1208,8 @@ int ObObj::build_not_strict_default_value(
 int ObObj::deep_copy(const ObObj &src, char *buf, const int64_t size, int64_t &pos)
 {
   int ret = OB_SUCCESS;
-  if (ob_is_string_type(src.get_type()) || ob_is_json(src.get_type()) || ob_is_geometry(src.get_type())) {
+  if (ob_is_string_type(src.get_type()) || ob_is_json(src.get_type())
+      || ob_is_geometry(src.get_type()) || ob_is_file(src.get_type())) {
     ObString src_str = src.get_string();
     if (OB_UNLIKELY(size < (pos + src_str.length()))) {
       ret = OB_BUF_NOT_ENOUGH;
@@ -1264,7 +1265,8 @@ void* ObObj::get_deep_copy_obj_ptr()
   if (ob_is_string_type(this->get_type())
       || ob_is_json(this->get_type())
       || ob_is_geometry(this->get_type())
-      || ob_is_collection_sql_type(this->get_type())) {
+      || ob_is_collection_sql_type(this->get_type())
+      || ob_is_file(this->get_type())) {
     // val_len_ == 0 is empty string, and it may point to unexpected address
     // Therefore, reset it to NULL
     if (val_len_ != 0) {
@@ -1629,6 +1631,7 @@ ObObjTypeFuncs OBJ_FUNCS[ObMaxType] =
   DEF_FUNC_ENTRY(ObCollectionSQLType), // 51, collection
   DEF_FUNC_ENTRY(ObMySQLDateType),     // 52, mysql date
   DEF_FUNC_ENTRY(ObMySQLDateTimeType), // 53, mysql datetime
+  DEF_FUNC_ENTRY(ObFileType),
 };
 
 

@@ -300,6 +300,13 @@ int ObExprCast::calc_result_type2(ObExprResType &type,
                                                              type1.get_collation_level(),
                                                              cs_level))) {
   } else if (!dst_type.is_collection_sql_type() && FALSE_IT(dst_type.set_collation_level(cs_level))) {
+  } else if ((ObFileType == type1.get_type() && ObFileType != dst_type.get_type())
+             || (ObFileType == dst_type.get_type()
+                 && ObFileType != type1.get_type() && ObNullType != type1.get_type())) {
+    ret = OB_ERR_INVALID_TYPE_FOR_OP;
+    LOG_USER_ERROR(OB_ERR_INVALID_TYPE_FOR_OP, ob_obj_type_str(type1.get_type()),
+                   ob_obj_type_str(dst_type.get_type()));
+    LOG_WARN("FILE casts require the same type or a NULL source", K(ret), K(type1), K(dst_type));
   } else if (OB_UNLIKELY(!cast_supported(type1.get_type(), type1.get_collation_type(),
                                         dst_type.get_type(), dst_type.get_collation_type()))) {
     if (session->is_varparams_sql_prepare()) {
@@ -574,6 +581,10 @@ int ObExprCast::get_cast_type(const bool enable_decimal_int,
       }
     } else if (ob_is_json(obj_type)) {
       dst_type.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+    } else if (ObFileType == obj_type) {
+      dst_type.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObFileType]);
+      dst_type.set_collation_type(CS_TYPE_BINARY);
+      dst_type.set_collation_level(CS_LEVEL_IMPLICIT);
     } else if (ob_is_geometry(obj_type)) {
       dst_type.set_collation_type(CS_TYPE_BINARY);
       dst_type.set_collation_level(CS_LEVEL_IMPLICIT);

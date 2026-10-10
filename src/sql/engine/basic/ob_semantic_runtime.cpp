@@ -1,5 +1,6 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/basic/ob_semantic_runtime.h"
+#include "sql/engine/basic/ob_semantic_media.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
@@ -182,6 +183,7 @@ SemanticExecutionState::~SemanticExecutionState()
     LOG_ERROR_RET(OB_ERR_UNEXPECTED, "semantic execution state still has registered operators",
                   "count", waiters_.size());
   }
+  media_.reset();
   auto &registry = runtime_registry();
   std::lock_guard<std::mutex> guard(registry.mutex_);
   if (registered_) {
@@ -218,6 +220,36 @@ int SemanticExecutionState::register_operator(void *operation, ReadyCheck ready,
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("allocate semantic readiness registration failed", K(ret));
     }
+  }
+  return ret;
+}
+
+int SemanticExecutionState::media_runtime(std::shared_ptr<SemanticMediaRuntime> &runtime)
+{
+  int ret = OB_SUCCESS;
+  if (!media_) {
+    ObArenaAllocator policy_allocator("SemanticPolicy");
+    ObObj global_root;
+    ObString root;
+    int64_t max_bytes = 0;
+    int64_t parallel = 0;
+    ObSQLSessionInfo *session = ctx_->get_my_session();
+    if (OB_ISNULL(session)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(ObBasicSessionInfo::get_global_sys_variable(
+        policy_allocator, session->get_dtc_params(), share::SYS_VAR_AI_MEDIA_ROOT, global_root))) {
+    } else if (OB_FAIL(global_root.get_varchar(root))) {
+    } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_AI_MEDIA_MAX_BYTES, max_bytes))) {
+    } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_AI_MEDIA_PARALLEL, parallel))) {
+    } else if (OB_FAIL(SemanticMediaRuntime::acquire(budget_, root, max_bytes, parallel,
+                                                   deadline_, media_))) {
+    }
+    if (OB_FAIL(ret)) {
+      LOG_WARN("failed to initialize query media runtime", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    runtime = media_;
   }
   return ret;
 }

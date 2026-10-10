@@ -139,6 +139,10 @@ public:
       set_collation_type(CS_TYPE_BINARY);
     } else if (ObJsonType == type_) {
       set_collation_type(CS_TYPE_UTF8MB4_BIN);
+    } else if (ObFileType == type_) {
+      set_collation_level(CS_LEVEL_IMPLICIT);
+      set_collation_type(CS_TYPE_BINARY);
+      scale_ = -1;
     } else if (ObUserDefinedSQLType == type_ ||
                ObCollectionSQLType == type_) {
       set_subschema_id(UINT_MAX16);
@@ -237,6 +241,7 @@ public:
     set_collation_level(CS_LEVEL_IMPLICIT);
     set_collation_type(CS_TYPE_BINARY);
   }
+  OB_INLINE void set_file() { set_type(ObFileType); }
 
   OB_INLINE void set_otimestamp_type(const ObObjType type) { type_ = static_cast<uint8_t>(type); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
   OB_INLINE void set_decimal_int() { type_ = static_cast<uint8_t>(ObDecimalIntType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
@@ -250,6 +255,7 @@ public:
   OB_INLINE bool is_invalid() const { return !ob_is_valid_obj_type(static_cast<ObObjType>(type_)); }
 
   OB_INLINE bool is_null() const { return type_ == static_cast<uint8_t>(ObNullType); }
+  OB_INLINE bool is_file() const { return type_ == static_cast<uint8_t>(ObFileType); }
   OB_INLINE bool is_tinyint() const { return type_ == static_cast<uint8_t>(ObTinyIntType); }
   OB_INLINE bool is_smallint() const { return type_ == static_cast<uint8_t>(ObSmallIntType); }
   OB_INLINE bool is_mediumint() const { return type_ == static_cast<uint8_t>(ObMediumIntType); }
@@ -1467,6 +1473,8 @@ public:
 
   void set_string(const ObObjType type, const char *ptr, const ObString::obstr_size_t size);
   void set_string(const ObObjType type, const ObString &value);
+  void set_file(const ObString &value);
+  void set_file(const char *ptr, const ObString::obstr_size_t size);
   void set_varchar(const ObString &value);
   void set_varchar(const char *ptr, const ObString::obstr_size_t size);
   void set_varchar_value(const char *ptr, const ObString::obstr_size_t size);
@@ -1555,6 +1563,7 @@ public:
   inline int get_year(uint8_t &value) const;
 
   inline int get_string(ObString &value) const;
+  inline int get_file(ObString &value) const;
   inline int get_varchar(ObString &value) const;
   inline int get_char(ObString &value) const;
   inline int get_varbinary(ObString &value) const;
@@ -1611,6 +1620,7 @@ public:
     return ObString(val_len_, v_.string_);
   }
   OB_INLINE ObString get_varchar() const { return ObString(val_len_, v_.string_); }
+  OB_INLINE ObString get_file() const { return ObString(val_len_, v_.string_); }
   OB_INLINE ObString get_char() const { return ObString(val_len_, v_.string_); }
   OB_INLINE ObString get_varbinary() const { return ObString(val_len_, v_.string_); }
   OB_INLINE ObString get_binary() const { return ObString(val_len_, v_.string_); }
@@ -1725,6 +1735,7 @@ public:
   OB_INLINE bool is_invalid_type() const { return meta_.is_invalid(); }
 
   OB_INLINE bool is_null() const { return meta_.is_null(); }
+  OB_INLINE bool is_file() const { return meta_.is_file(); }
   OB_INLINE bool is_null_or_empty_string() const { return meta_.is_null()
       || (meta_.is_character_type() && (0 == get_string_len())); }
   OB_INLINE bool is_tinyint() const { return meta_.is_tinyint(); }
@@ -2479,6 +2490,18 @@ inline void ObObj::set_string(const ObObjType type, const ObString &value)
   val_len_ = value.length();
 }
 
+inline void ObObj::set_file(const ObString &value)
+{
+  set_file(value.ptr(), value.length());
+}
+
+inline void ObObj::set_file(const char *ptr, const ObString::obstr_size_t size)
+{
+  meta_.set_file();
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
 inline void ObObj::set_varchar(const ObString &value)
 {
   meta_.set_varchar();
@@ -2794,7 +2817,8 @@ inline bool ObObj::need_deep_copy()const
   return (((ob_is_string_type(meta_.get_type())
             || ob_is_json(meta_.get_type())
             || ob_is_geometry(meta_.get_type())
-            || ob_is_collection_sql_type(meta_.get_type())) && 0 != val_len_ && NULL != get_string_ptr())
+            || ob_is_collection_sql_type(meta_.get_type())
+            || ob_is_file(meta_.get_type())) && 0 != val_len_ && NULL != get_string_ptr())
             || (ob_is_number_tc(meta_.get_type())
              && 0 != nmb_desc_.len_ && NULL != get_number_digits())
             || (ob_is_decimal_int(meta_.get_type())
@@ -3031,7 +3055,7 @@ inline int ObObj::get_year(uint8_t &v) const
 inline int ObObj::get_string(ObString &v) const
 {
   int ret = OB_OBJ_TYPE_ERROR;
-  if (meta_.is_string_or_lob_locator_type() || is_lob_storage()) {
+  if (meta_.is_string_or_lob_locator_type() || is_lob_storage() || is_file()) {
     if (is_lob_storage()) {
       if (val_len_ == 0) {
         v.assign_ptr(v_.string_, val_len_);
@@ -3113,6 +3137,16 @@ inline int ObObj::get_print_string(ObString &v) const
     ret = OB_SUCCESS;
   } else if (meta_.is_null()) {
     v.assign_ptr(NULL, 0);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_file(ObString &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (is_file()) {
+    v = get_file();
     ret = OB_SUCCESS;
   }
   return ret;
@@ -3319,7 +3353,8 @@ inline const void *ObObj::get_data_ptr() const
 {
   const void *ret = NULL;
   if (ob_is_string_type(get_type()) || ob_is_json(get_type())
-      || ob_is_geometry(get_type()) || ob_is_collection_sql_type(get_type())) {
+      || ob_is_geometry(get_type()) || ob_is_collection_sql_type(get_type())
+      || ob_is_file(get_type())) {
     ret = const_cast<char *>(v_.string_);
   } else if (ob_is_number_tc(get_type())) {
     ret = const_cast<uint32_t *>(v_.nmb_digits_);
@@ -3334,7 +3369,8 @@ inline const void *ObObj::get_data_ptr() const
 inline void ObObj::set_data_ptr(void *data_ptr)
 {
   if (ob_is_string_type(get_type()) || ob_is_json(get_type())
-      || ob_is_geometry(get_type()) || ob_is_collection_sql_type(get_type())) {
+      || ob_is_geometry(get_type()) || ob_is_collection_sql_type(get_type())
+      || ob_is_file(get_type())) {
     v_.string_ = static_cast<char*>(data_ptr);
   } else if (ob_is_number_tc(get_type())) {
     v_.nmb_digits_ = static_cast<uint32_t*>(data_ptr);
@@ -3404,7 +3440,8 @@ inline int64_t ObObj::get_data_length() const
   if (ob_is_string_type(get_type()) ||
       ob_is_json(get_type()) ||
       ob_is_geometry(get_type()) ||
-      ob_is_collection_sql_type(get_type())) {
+      ob_is_collection_sql_type(get_type()) ||
+      ob_is_file(get_type())) {
     ret = val_len_;
   } else if (ob_is_number_tc(get_type())) {
     ret = nmb_desc_.len_ * sizeof(uint32_t);
@@ -3840,7 +3877,7 @@ OB_INLINE int64_t ObObj::get_deep_copy_size() const
 {
   int64_t ret = 0;
   if (is_string_type() || is_json()
-      || is_geometry() || ob_is_decimal_int(get_type()) || is_collection_sql_type()) {
+      || is_geometry() || ob_is_decimal_int(get_type()) || is_collection_sql_type() || is_file()) {
     ret += val_len_;
   } else if (ob_is_number_tc(get_type())) {
     ret += (sizeof(uint32_t) * nmb_desc_.len_);

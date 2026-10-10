@@ -1,4 +1,4 @@
-static constexpr ObObjType ABS_RESULT_TYPE[ObMaxType] =
+static constexpr ObObjType LEGACY_ABS_RESULT_TYPE[ObFileType] =
 {
     ObDoubleType,   /* NullType             */
     ObIntType,      /* TinyIntType          */
@@ -45,4 +45,7 @@ static constexpr ObObjType ABS_RESULT_TYPE[ObMaxType] =
     ObDoubleType,   /* ObMySQLDateTimeType */
 };
 
+static_assert(is_array_fully_initialized(LEGACY_ABS_RESULT_TYPE), "ABS_RESULT_TYPE is partially initlized");
+static constexpr auto FILE_ABS_RESULT_TYPE = sql::extend_file_type_map(LEGACY_ABS_RESULT_TYPE);
+static constexpr auto &ABS_RESULT_TYPE = FILE_ABS_RESULT_TYPE.values_;
 static_assert(is_array_fully_initialized(ABS_RESULT_TYPE), "ABS_RESULT_TYPE is partially initlized");

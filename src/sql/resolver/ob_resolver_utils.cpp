@@ -2666,7 +2666,9 @@ bool ObResolverUtils::is_valid_partition_column_type(const ObObjType type,
                                                      const bool is_string_lob)
 {
   int bret = false;
-  if (is_key_part(part_type)) {
+  if (ObFileType == type) {
+    bret = false;
+  } else if (is_key_part(part_type)) {
     if (!ob_is_text_tc(type) && !ob_is_json_tc(type) && !ob_is_collection_sql_type(type)) {
       bret = true;
     } else if (is_string_lob) {
@@ -4632,6 +4634,12 @@ int ObResolverUtils::resolve_data_type(const ParseNode &type_node,
         data_type.set_collation_type(CS_TYPE_UTF8MB4_BIN);
       }
       break;
+    case ObFileTC:
+      data_type.set_length(default_accuracy.get_length());
+      data_type.set_scale(default_accuracy.get_scale());
+      data_type.set_charset_type(CHARSET_BINARY);
+      data_type.set_collation_type(CS_TYPE_BINARY);
+      break;
     case ObGeometryTC: {
       data_type.set_length(length);
       data_type.set_scale(default_accuracy.get_scale());
@@ -4676,6 +4684,20 @@ int ObResolverUtils::resolve_data_type(const ParseNode &type_node,
   }
   }
   LOG_DEBUG("resolve data type", K(ret), K(data_type), K(lbt()));
+  return ret;
+}
+
+int ObResolverUtils::check_file_key_expr(const ObRawExpr *expr, const char *operation)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr) || OB_ISNULL(operation)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid FILE key check", K(ret), KP(expr), KP(operation));
+  } else if (ObFileType == expr->get_data_type()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, operation);
+    LOG_WARN("FILE cannot be used as a SQL key", K(ret), K(operation));
+  }
   return ret;
 }
 
@@ -5303,6 +5325,10 @@ int ObResolverUtils::check_foreign_key_columns_type(const ObTableSchema &child_t
         } else if (OB_ISNULL(parent_col)) {
           ret = OB_ERR_COLUMN_NOT_FOUND;
           LOG_WARN("parent column is not exist", K(ret));
+        } else if (ObFileType == child_col->get_data_type() || ObFileType == parent_col->get_data_type()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "FILE foreign key columns");
+          LOG_WARN("FILE cannot be used in foreign keys", K(ret));
         } else if ((child_col->get_data_type() != parent_col->get_data_type())
                       && !is_synonymous_type(child_col->get_data_type(),
                                               parent_col->get_data_type())) {

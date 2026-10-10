@@ -2564,7 +2564,8 @@ all_ai_model_def = dict(
     normal_columns = [
         ('name', 'varchar:128', 'false'),
         ('type', 'int', 'false'),
-        ('model_name', 'varchar:128', 'false')
+        ('model_name', 'varchar:128', 'false'),
+        ('input_modalities', 'int', 'false', 1)
   ]
 )
 

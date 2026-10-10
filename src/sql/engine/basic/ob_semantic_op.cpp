@@ -1,9 +1,12 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/basic/ob_semantic_op.h"
+#include "sql/engine/basic/ob_semantic_media.h"
+#include "common/object/file_ref.h"
 #include "query/ai/ob_ai_endpoint_resolver.h"
 #include "share/rc/ob_server_runtime.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_input.h"
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -23,6 +26,29 @@ bool contains_expression(const ObIArray<ObExpr *> &expressions, const ObExpr *ex
     contains = expressions.at(index) == expr;
   }
   return contains;
+}
+
+struct SemanticRequestMemory
+{
+  int64_t body_;
+  int64_t wire_;
+};
+
+SemanticRequestMemory request_memory(const SemanticInput &input)
+{
+  SemanticRequestMemory bytes{input.parts_.count() * 1024, input.parts_.count() * 512};
+  if (input.has_files_ || input.parts_.count() > 1) {
+    bytes.body_ += 2 * input.owned_bytes_;
+  }
+  for (const auto &part : input.parts_) {
+    if (part.kind_ == SemanticInputPart::TEXT) {
+      bytes.wire_ += 6 * part.value_.length();
+    } else if (part.media_) {
+      bytes.body_ += 3 * part.media_->base64().length();
+      bytes.wire_ += part.media_->base64().length();
+    }
+  }
+  return bytes;
 }
 }
 
@@ -67,25 +93,57 @@ int SemanticJoinSpec::validate_bindings() const
   return ret;
 }
 
+struct SemanticOp::Dispatch
+{
+  Dispatch()
+      : arena_("SemanticBody"), allocator_(arena_), batch_(allocator_),
+        next_(nullptr), retained_bytes_(0) {}
+  ~Dispatch() { batch_.cancel(); }
+  ObArenaAllocator arena_;
+  MultimodeAlloctor allocator_;
+  AIFuncBatch batch_;
+  ObArray<int64_t> positions_;
+  ObArray<ObString> prompts_;
+  ObArray<ObJsonArray *> media_parts_;
+  Dispatch *next_;
+  int64_t retained_bytes_;
+};
+
 struct SemanticOp::Task
 {
   enum RowState : uint8_t { UNREQUESTED, QUEUED, IN_FLIGHT, COMPLETE };
-  Task(const ObExpr *expr)
+  Task(const ObExpr *expr, int64_t max_parallel)
       : expression_(expr), request_arena_("SemanticReq"), request_allocator_(request_arena_),
-        batch_(request_allocator_), states_(nullptr), results_(nullptr), config_(nullptr),
-        input_bytes_(0), active_(false), credit_(false) {}
+        dispatches_(nullptr), states_(nullptr), results_(nullptr), config_(nullptr), info_(nullptr),
+        input_bytes_(0), in_flight_rows_(0), max_parallel_(max_parallel), credit_(false) {}
+  ~Task()
+  {
+    while (nullptr != dispatches_) {
+      Dispatch *dispatch = dispatches_;
+      dispatches_ = dispatch->next_;
+      dispatch->~Dispatch();
+      ob_free(dispatch);
+    }
+    for (SemanticInput *input : inputs_) {
+      input->~SemanticInput();
+    }
+  }
   const ObExpr *expression_;
   ObArenaAllocator request_arena_;
   MultimodeAlloctor request_allocator_;
-  AIFuncBatch batch_;
+  Dispatch *dispatches_;
   uint8_t *states_;
   ObString *results_;
   ObArray<int64_t> rows_;
-  ObArray<ObString> prompts_;
+  ObArray<SemanticInput *> inputs_;
   ObString model_;
   ObJsonObject *config_;
+  ObAIFuncExprInfo *info_;
+  share::ObAiModelEndpointInfo endpoint_;
+  std::shared_ptr<SemanticMediaRuntime> media_;
   int64_t input_bytes_;
-  bool active_;
+  int64_t in_flight_rows_;
+  int64_t max_parallel_;
   bool credit_;
 };
 
@@ -202,24 +260,45 @@ int SemanticOp::reserve(Slot &slot, int64_t bytes)
   return ret;
 }
 
+void SemanticOp::reset_dispatch(Slot &slot, Dispatch &dispatch)
+{
+  const int64_t bytes = dispatch.retained_bytes_;
+  dispatch.~Dispatch();
+  ob_free(&dispatch);
+  if (bytes > 0) {
+    execution_->budget().release(bytes);
+    slot.retained_bytes_ -= bytes;
+  }
+}
+
 void SemanticOp::reset_task(Slot &slot, Task &task)
 {
-  task.batch_.cancel();
+  while (nullptr != task.dispatches_) {
+    Dispatch *dispatch = task.dispatches_;
+    task.dispatches_ = dispatch->next_;
+    reset_dispatch(slot, *dispatch);
+  }
+  task.in_flight_rows_ = 0;
   if (task.credit_) {
     execution_->budget().release_task();
     task.credit_ = false;
   }
+  for (SemanticInput *input : task.inputs_) {
+    input->~SemanticInput();
+  }
+  task.inputs_.reset();
+  task.media_.reset();
+  task.request_allocator_.reset();
+  task.rows_.reset();
+  task.model_.reset();
+  task.config_ = nullptr;
+  task.info_ = nullptr;
+  task.endpoint_.reset();
   if (task.input_bytes_ > 0) {
     execution_->budget().release(task.input_bytes_);
     slot.retained_bytes_ -= task.input_bytes_;
   }
-  task.request_allocator_.reset();
-  task.rows_.reset();
-  task.prompts_.reset();
-  task.model_.reset();
-  task.config_ = nullptr;
   task.input_bytes_ = 0;
-  task.active_ = false;
 }
 
 void SemanticOp::reset_slot(Slot &slot)
@@ -350,14 +429,11 @@ int SemanticOp::allocate_slot(Slot &slot, int64_t size)
       new (&slot.values_[index]) ObDatum();
     }
     for (int64_t index = 0; OB_SUCC(ret) && index < tasks; ++index) {
-      auto *task = OB_NEWx(Task, &allocator, semantic_spec().semantic_exprs_.at(index));
+      auto *task = OB_NEWx(Task, &allocator, semantic_spec().semantic_exprs_.at(index), size);
       if (OB_ISNULL(task)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else {
         slot.tasks_[index] = task;
-        task->batch_.set_shared_buffer_usage(*execution_->budget().memory_counter(),
-                                              execution_->budget().memory_limit());
-        task->batch_.set_nonblocking_admission();
         task->states_ = static_cast<uint8_t *>(allocator.alloc(size));
         task->results_ = static_cast<ObString *>(allocator.alloc(size * sizeof(ObString)));
         if (OB_ISNULL(task->states_) || OB_ISNULL(task->results_)) {
@@ -619,23 +695,23 @@ int SemanticOp::evaluate(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &result)
       LOG_WARN("semantic expression is not owned by its operator", K(ret), K(expr));
     } else if (task->states_[row] == Task::COMPLETE) {
       ret = SemanticExprUtils::set_result(expr, ctx, result, task->results_[row]);
-    } else if (task->states_[row] != Task::UNREQUESTED || task->active_) {
+    } else if (task->states_[row] != Task::UNREQUESTED) {
       ret = OB_EAGAIN;
     } else {
       ObEvalCtx::TempAllocGuard input_guard(ctx);
       MultimodeAlloctor input_allocator(input_guard.get_allocator());
       ObString model;
-      ObString prompt;
+      SemanticInput input;
       ObJsonObject *config = nullptr;
       const bool first_request = task->rows_.empty();
       int64_t bytes = 0;
-      if (OB_FAIL(SemanticExprUtils::prepare_input(expr, ctx, input_allocator,
-                                                  model, prompt, config, first_request))) {
-      } else if (prompt.length() > ObAIFuncClient::MAX_REQUEST_BYTES) {
-        ret = OB_SIZE_OVERFLOW;
+      if (OB_FAIL(SemanticExprUtils::prepare_request_input(expr, ctx, input_allocator,
+                                                          model, input, config, first_request))) {
       } else {
         const uint64_t config_bytes = nullptr == config ? 0 : config->get_serialize_size();
-        bytes = prompt.length() + (first_request ? model.length() : 0);
+        bytes = input.owned_bytes_ + sizeof(SemanticInput) +
+                input.parts_.count() * sizeof(SemanticInputPart) +
+                (first_request ? model.length() : 0);
         if (bytes > ObAIFuncClient::MAX_BATCH_BYTES ||
             config_bytes > static_cast<uint64_t>(ObAIFuncClient::MAX_BATCH_BYTES - bytes)) {
           ret = OB_SIZE_OVERFLOW;
@@ -649,8 +725,17 @@ int SemanticOp::evaluate(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &result)
       } else if (OB_SUCC(ret) && OB_FAIL(reserve(*slot, bytes))) {
       } else if (OB_SUCC(ret)) {
         task->input_bytes_ += bytes;
-        ObString owned_prompt;
-        if (OB_FAIL(ob_write_string(task->request_allocator_, prompt, owned_prompt))) {
+        auto *owned_input = OB_NEWx(SemanticInput, &task->request_allocator_);
+        if (nullptr == owned_input) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (OB_FAIL(task->inputs_.push_back(owned_input))) {
+          owned_input->~SemanticInput();
+        }
+        for (int64_t part = 0; OB_SUCC(ret) && part < input.parts_.count(); ++part) {
+          const auto &value = input.parts_.at(part);
+          ret = owned_input->append(task->request_allocator_, value.kind_, value.value_);
+        }
+        if (OB_FAIL(ret)) {
         } else if (first_request &&
                    OB_FAIL(ob_write_string(task->request_allocator_, model, task->model_))) {
         } else if (first_request && nullptr != config &&
@@ -658,7 +743,6 @@ int SemanticOp::evaluate(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &result)
                        config->clone(&task->request_allocator_, true)))) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
         } else if (OB_FAIL(task->rows_.push_back(row))) {
-        } else if (OB_FAIL(task->prompts_.push_back(owned_prompt))) {
         } else {
           task->states_[row] = Task::QUEUED;
           ret = OB_EAGAIN;
@@ -738,38 +822,275 @@ int SemanticOp::prepare(Slot &slot, bool &progress)
   return ret;
 }
 
+int SemanticOp::advance_media(Task &task, bool &progress)
+{
+  int ret = OB_SUCCESS;
+  if (nullptr == task.info_) {
+    auto *resolver = share::server_service<query::ObIAiEndpointResolver>();
+    if (OB_FAIL(ObAIFuncUtils::get_ai_func_info(task.request_allocator_, task.model_, task.info_))) {
+    } else if (OB_ISNULL(resolver)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(resolver->resolve_by_model_name(task.model_, task.request_allocator_, task.endpoint_))) {
+    }
+  }
+  for (int64_t position = 0; OB_SUCC(ret) && position < task.rows_.count(); ++position) {
+    if (task.states_[task.rows_.at(position)] != Task::QUEUED) {
+      continue;
+    }
+    SemanticInput &input = *task.inputs_.at(position);
+    if (input.has_files_ && task.info_->type_ != share::EndpointType::COMPLETION) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "FILE inputs require a completion model");
+    } else if (input.has_files_ && (task.info_->input_modalities_ &
+               (share::AiInputModality::IMAGE | share::AiInputModality::AUDIO)) == 0) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "the model was registered for text-only inputs");
+    } else if (input.has_files_ && !ObAIFuncUtils::ob_provider_check(task.endpoint_.get_provider(),
+                                                                  ObAIFuncProviderUtils::OPENAI)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "FILE inputs currently require the openai provider");
+    }
+    for (int64_t part = 0; OB_SUCC(ret) && part < input.parts_.count(); ++part) {
+      auto &value = input.parts_.at(part);
+      if (value.kind_ != SemanticInputPart::FILE) {
+        continue;
+      }
+      if (!value.media_) {
+        FileRef reference;
+        if (OB_FAIL(FileRefCodec::decode(value.value_, reference))) {
+        } else if ((reference.mime_type_.prefix_match("image/") &&
+                    (task.info_->input_modalities_ & share::AiInputModality::IMAGE) == 0) ||
+                   (reference.mime_type_.prefix_match("audio/") &&
+                    (task.info_->input_modalities_ & share::AiInputModality::AUDIO) == 0)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "the model was not registered for this media modality");
+        } else if (!task.media_ && OB_FAIL(execution_->media_runtime(task.media_))) {
+        } else {
+          const int demanded = task.media_->demand(value.value_, value.media_);
+          if (demanded == OB_EAGAIN) {
+          } else if (demanded != OB_SUCCESS) {
+            ret = demanded;
+          } else {
+            progress = true;
+          }
+        }
+      }
+      if (OB_SUCC(ret) && value.media_ && value.media_->ready()) {
+        if (OB_FAIL(value.media_->result())) {
+        } else if ((task.info_->input_modalities_ & (value.media_->is_audio()
+                   ? share::AiInputModality::AUDIO : share::AiInputModality::IMAGE)) == 0) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "the model was not registered for this media modality");
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+bool SemanticOp::input_ready(const Task &task, int64_t position) const
+{
+  bool ready = task.states_[task.rows_.at(position)] == Task::QUEUED;
+  const SemanticInput &input = *task.inputs_.at(position);
+  for (int64_t part = 0; ready && part < input.parts_.count(); ++part) {
+    const auto &value = input.parts_.at(part);
+    ready = value.kind_ != SemanticInputPart::FILE ||
+            (value.media_ && value.media_->ready() && value.media_->result() == OB_SUCCESS);
+  }
+  return ready;
+}
+
+bool SemanticOp::has_pending_requests() const
+{
+  int64_t idle_credits = 0;
+  bool pending = false;
+  for (int64_t index = 0; !pending && index < count_; ++index) {
+    const Slot &slot = *slots_[(head_ + index) % slot_count_];
+    for (int64_t task_index = 0; !pending && task_index < slot.task_count_; ++task_index) {
+      const Task &task = *slot.tasks_[task_index];
+      pending = nullptr != task.dispatches_;
+      idle_credits += task.credit_ && !pending ? 1 : 0;
+    }
+  }
+  // A held wave credit without a dispatch cannot free request memory by itself.
+  return pending || execution_->budget().active_tasks() > idle_credits;
+}
+
+int SemanticOp::build_request_parts(Task &task, Dispatch &dispatch, int64_t position)
+{
+  int ret = OB_SUCCESS;
+  SemanticInput &input = *task.inputs_.at(position);
+  ObString prompt;
+  ObJsonArray *parts = nullptr;
+  if (!input.has_files_ && input.parts_.count() == 1) {
+    prompt = input.parts_.at(0).value_;
+  } else if (!input.has_files_) {
+    ObJsonBuffer buffer(&dispatch.allocator_);
+    for (int64_t index = 0; OB_SUCC(ret) && index < input.parts_.count(); ++index) {
+      const auto &part = input.parts_.at(index);
+      ret = buffer.append(part.value_.ptr(), part.value_.length());
+    }
+    if (OB_SUCC(ret) && OB_FAIL(ob_write_string(dispatch.allocator_, buffer.string(), prompt))) {
+    }
+  } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(dispatch.allocator_, parts))) {
+  } else {
+    for (int64_t index = 0; OB_SUCC(ret) && index < input.parts_.count(); ++index) {
+      auto &part = input.parts_.at(index);
+      if (part.kind_ == SemanticInputPart::FILE) {
+        if (!part.media_) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(part.media_->result())) {
+        } else if (part.media_->base64().empty() || part.media_->mime_type().empty()) {
+          ret = OB_INVALID_DATA;
+          LOG_WARN("successful media load has no usable content", K(ret));
+        } else if ((task.info_->input_modalities_ & (part.media_->is_audio()
+                   ? share::AiInputModality::AUDIO : share::AiInputModality::IMAGE)) == 0) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "the model was not registered for this media modality");
+        }
+      }
+      if (OB_FAIL(ret)) {
+        break;
+      }
+      ObJsonObject *object = nullptr;
+      ObJsonString *type = nullptr;
+      ObJsonString *data = nullptr;
+      ObString kind = part.kind_ == SemanticInputPart::TEXT ? ObString("text") :
+                      part.media_->is_audio() ? ObString("audio") : ObString("image");
+      ObString value = part.kind_ == SemanticInputPart::TEXT ? part.value_ : part.media_->base64();
+      if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(dispatch.allocator_, object))) {
+      } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(dispatch.allocator_, kind, type))) {
+      } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(dispatch.allocator_, value, data))) {
+      } else if (OB_FAIL(object->add("type", type))) {
+      } else if (OB_FAIL(object->add("data", data))) {
+      } else if (OB_FAIL(parts->append(object))) {
+      } else if (part.kind_ == SemanticInputPart::FILE) {
+        ObJsonString *metadata = nullptr;
+        ObString detail = part.media_->is_audio() ? part.media_->audio_format() : part.media_->mime_type();
+        if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(dispatch.allocator_, detail, metadata))) {
+        } else if (OB_FAIL(object->add(part.media_->is_audio() ? "format" : "mime_type", metadata))) {
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(dispatch.prompts_.push_back(prompt))) {
+  } else if (OB_SUCC(ret) && OB_FAIL(dispatch.media_parts_.push_back(parts))) {
+  } else if (OB_SUCC(ret) && OB_FAIL(dispatch.positions_.push_back(position))) {
+  }
+  return ret;
+}
+
 int SemanticOp::submit_tasks(Slot &slot, bool &progress)
 {
   int ret = OB_SUCCESS;
   for (int64_t index = 0; OB_SUCC(ret) && index < slot.task_count_; ++index) {
     Task &task = *slot.tasks_[index];
-    if (!task.active_ && !task.rows_.empty()) {
-      const int admission = execution_->budget().acquire_task();
+    if (task.rows_.empty()) {
+      continue;
+    } else if (OB_FAIL(advance_media(task, progress))) {
+      break;
+    } else if (task.in_flight_rows_ >= task.max_parallel_) {
+      continue;
+    }
+    const int64_t config_bytes = nullptr == task.config_ ? 0 : task.config_->get_serialize_size();
+    const int64_t overhead = sizeof(Dispatch) + 2 * config_bytes;
+    int64_t bytes = overhead;
+    int64_t wire_bytes = 0;
+    int64_t minimum = INT64_MAX;
+    ObArray<int64_t> positions;
+    const int64_t available_rows = task.max_parallel_ - task.in_flight_rows_;
+    for (int64_t position = 0; OB_SUCC(ret) && position < task.rows_.count() &&
+         positions.count() < available_rows; ++position) {
+      if (!input_ready(task, position)) {
+        continue;
+      }
+      const SemanticInput &input = *task.inputs_.at(position);
+      const SemanticRequestMemory extra = request_memory(input);
+      const int64_t wire = extra.wire_ + 6 * config_bytes;
+      minimum = std::min(minimum, extra.body_ + wire + overhead);
+      if (extra.body_ + wire + overhead > execution_->budget().memory_limit() ||
+          extra.body_ + wire > ObAIFuncClient::MAX_BATCH_BYTES) {
+        ret = OB_SIZE_OVERFLOW;
+      } else if (extra.body_ + wire <= execution_->budget().memory_limit() -
+                                      execution_->budget().memory_used() - bytes - wire_bytes &&
+                 extra.body_ + wire <= ObAIFuncClient::MAX_BATCH_BYTES - bytes - wire_bytes) {
+        bytes += extra.body_;
+        wire_bytes += wire;
+        ret = positions.push_back(position);
+      }
+    }
+    if (OB_SUCC(ret) && positions.empty() && minimum != INT64_MAX &&
+        !has_pending_requests() &&
+        (!task.media_ || !task.media_->has_pending())) {
+      ret = OB_SIZE_OVERFLOW;
+      LOG_WARN("prepared semantic inputs leave no room for request construction", K(ret), K(minimum));
+    }
+    if (OB_SUCC(ret) && !positions.empty()) {
+      const bool owned_credit = task.credit_;
+      const int admission = owned_credit ? OB_SUCCESS : execution_->budget().acquire_task();
       if (admission == OB_EAGAIN) {
       } else if (admission != OB_SUCCESS) {
         ret = admission;
       } else {
         task.credit_ = true;
-        ObAIFuncExprInfo *info = nullptr;
-        share::ObAiModelEndpointInfo endpoint;
-        auto *resolver = share::server_service<query::ObIAiEndpointResolver>();
-        if (OB_FAIL(ObAIFuncUtils::get_ai_func_info(task.request_allocator_, task.model_, info))) {
-        } else if (OB_ISNULL(resolver)) {
-          ret = OB_ERR_UNEXPECTED;
-        } else if (OB_FAIL(resolver->resolve_by_model_name(task.model_, task.request_allocator_, endpoint))) {
+        Dispatch *dispatch = nullptr;
+        const int reserved = reserve(slot, bytes);
+        if (reserved == OB_EAGAIN) {
+        } else if (reserved != OB_SUCCESS) {
+          ret = reserved;
         } else {
-          ObAIFuncModel model(task.request_allocator_, *info, endpoint);
-          ret = model.start_completion_batch(task.prompts_, task.config_, task.batch_);
-        }
-        if (OB_SUCC(ret)) {
-          task.active_ = true;
-          for (int64_t row : task.rows_) {
-            task.states_[row] = Task::IN_FLIGHT;
+          void *memory = ob_malloc(sizeof(Dispatch), ObMemAttr("SemanticBody"));
+          if (OB_ISNULL(memory)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            execution_->budget().release(bytes);
+            slot.retained_bytes_ -= bytes;
+          } else {
+            dispatch = new (memory) Dispatch();
+            dispatch->retained_bytes_ = bytes;
+            dispatch->batch_.set_shared_buffer_usage(*execution_->budget().memory_counter(),
+                                                      execution_->budget().memory_limit());
+            dispatch->batch_.set_nonblocking_admission();
+            dispatch->batch_.set_max_parallel(task.max_parallel_);
+            for (int64_t position : positions) {
+              if (OB_FAIL(build_request_parts(task, *dispatch, position))) {
+                break;
+              }
+            }
           }
-          progress = true;
+          if (OB_SUCC(ret)) {
+            ObJsonObject *config = nullptr;
+            if (nullptr != task.config_ &&
+                OB_ISNULL(config = static_cast<ObJsonObject *>(
+                    task.config_->clone(&dispatch->allocator_, true)))) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            }
+            ObAIFuncModel model(dispatch->allocator_, *task.info_, task.endpoint_);
+            if (OB_SUCC(ret)) {
+              ret = model.start_completion_batch(dispatch->prompts_, config, dispatch->batch_,
+                                                  &dispatch->media_parts_);
+            }
+          }
+          if (OB_SUCC(ret)) {
+            dispatch->next_ = task.dispatches_;
+            task.dispatches_ = dispatch;
+            task.in_flight_rows_ += dispatch->positions_.count();
+            for (int64_t position : dispatch->positions_) {
+              task.states_[task.rows_.at(position)] = Task::IN_FLIGHT;
+            }
+            progress = true;
+          } else if (nullptr != dispatch) {
+            reset_dispatch(slot, *dispatch);
+          }
+        }
+        if (!owned_credit && nullptr == task.dispatches_) {
+          execution_->budget().release_task();
+          task.credit_ = false;
         }
       }
     }
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to submit semantic requests", K(ret));
   }
   return ret;
 }
@@ -779,19 +1100,24 @@ int SemanticOp::poll_tasks(Slot &slot, bool &progress)
   int ret = OB_SUCCESS;
   for (int64_t index = 0; OB_SUCC(ret) && index < slot.task_count_; ++index) {
     Task &task = *slot.tasks_[index];
-    if (task.active_) {
+    Dispatch **link = &task.dispatches_;
+    while (OB_SUCC(ret) && nullptr != *link) {
+      Dispatch &dispatch = **link;
       bool finished = false;
-      if (OB_FAIL(task.batch_.poll(finished))) {
+      if (OB_FAIL(dispatch.batch_.poll(finished))) {
       } else if (finished) {
         ObArray<ObString> results;
-        if (OB_FAIL(task.batch_.get_results(results))) {
-        } else if (results.count() != task.rows_.count()) {
+        if (OB_FAIL(dispatch.batch_.get_results(results))) {
+        } else if (results.count() != dispatch.positions_.count()) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("semantic result count differs from submitted rows", K(ret));
         } else {
           for (int64_t row = 0; OB_SUCC(ret) && row < results.count(); ++row) {
-            const int64_t source_row = task.rows_.at(row);
-            if (OB_FAIL(reserve(slot, results.at(row).length()))) {
+            const int64_t source_row = task.rows_.at(dispatch.positions_.at(row));
+            if (task.states_[source_row] != Task::IN_FLIGHT) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("semantic result row is not in flight", K(ret), K(source_row));
+            } else if (OB_FAIL(reserve(slot, results.at(row).length()))) {
             } else if (OB_FAIL(ob_write_string(slot.allocator_, results.at(row),
                                               task.results_[source_row]))) {
             } else {
@@ -800,10 +1126,29 @@ int SemanticOp::poll_tasks(Slot &slot, bool &progress)
           }
         }
         if (OB_SUCC(ret)) {
-          reset_task(slot, task);
+          dispatch.batch_.cancel();
+          for (int64_t position : dispatch.positions_) {
+            for (auto &part : task.inputs_.at(position)->parts_) {
+              part.media_.reset();
+            }
+          }
+          *link = dispatch.next_;
+          task.in_flight_rows_ -= dispatch.positions_.count();
+          reset_dispatch(slot, dispatch);
           slot.needs_prepare_ = true;
           progress = true;
         }
+      } else {
+        link = &dispatch.next_;
+      }
+    }
+    if (OB_SUCC(ret) && task.credit_ && nullptr == task.dispatches_) {
+      bool complete = true;
+      for (int64_t row : task.rows_) {
+        complete = complete && task.states_[row] == Task::COMPLETE;
+      }
+      if (complete) {
+        reset_task(slot, task);
       }
     }
   }
@@ -892,7 +1237,9 @@ int SemanticOp::poll_ready_tasks(void *data, bool &progress)
   auto &operation = *static_cast<SemanticOp *>(data);
   for (int64_t index = 0; OB_SUCC(ret) && index < operation.count_; ++index) {
     Slot &slot = *operation.slots_[(operation.head_ + index) % operation.slot_count_];
-    ret = operation.poll_tasks(slot, progress);
+    if (OB_FAIL(operation.poll_tasks(slot, progress))) {
+    } else if (OB_FAIL(operation.submit_tasks(slot, progress))) {
+    }
   }
   return ret;
 }
@@ -909,10 +1256,44 @@ bool SemanticOp::can_resume(const void *data)
   }
   for (int64_t index = 0; !ready && index < operation.count_; ++index) {
     const Slot &slot = *operation.slots_[(operation.head_ + index) % operation.slot_count_];
+    ready = !slot.ready_ && slot.needs_prepare_;
     for (int64_t task_index = 0; !ready && task_index < slot.task_count_; ++task_index) {
       const Task &task = *slot.tasks_[task_index];
-      ready = task.active_ ? task.batch_.is_ready()
-                          : !task.rows_.empty() && operation.execution_->budget().task_available();
+      for (const Dispatch *dispatch = task.dispatches_; !ready && nullptr != dispatch;
+           dispatch = dispatch->next_) {
+        ready = dispatch->batch_.is_ready();
+      }
+      if (!ready && !task.rows_.empty()) {
+        for (int64_t position = 0; !ready && position < task.rows_.count(); ++position) {
+          if (task.states_[task.rows_.at(position)] != Task::QUEUED) {
+            continue;
+          }
+          bool media_ready = true;
+          for (const auto &part : task.inputs_.at(position)->parts_) {
+            if (part.kind_ == SemanticInputPart::FILE) {
+              if (!part.media_) {
+                ready = ready || !task.media_ || task.media_->can_demand();
+                media_ready = false;
+              } else if (!part.media_->ready()) {
+                media_ready = false;
+              } else if (part.media_->result() != OB_SUCCESS) {
+                ready = true;
+              }
+            }
+          }
+          if (!ready && media_ready) {
+            const auto &budget = operation.execution_->budget();
+            const SemanticRequestMemory bytes = request_memory(*task.inputs_.at(position));
+            const int64_t config_bytes = nullptr == task.config_ ? 0 : task.config_->get_serialize_size();
+            const int64_t required = sizeof(Dispatch) + bytes.body_ + bytes.wire_ + 8 * config_bytes;
+            ready = (task.in_flight_rows_ < task.max_parallel_ &&
+                     (task.credit_ || budget.task_available()) &&
+                     required <= budget.memory_limit() - budget.memory_used()) ||
+                    (!operation.has_pending_requests() &&
+                     (!task.media_ || !task.media_->has_pending()));
+          }
+        }
+      }
     }
   }
   return ready;

@@ -1,7 +1,7 @@
 /*
  * the following array is used to determine whether the equal compare is transitive in optimizer
  */
-static constexpr ObObjType RELATIONAL_EQUAL_TYPE[ObMaxType] =
+static constexpr ObObjType LEGACY_RELATIONAL_EQUAL_TYPE[ObFileType] =
 { 
   ObMaxType,            /* NullType             */
   ObIntType,            /* TinyIntType          */
@@ -48,4 +48,7 @@ static constexpr ObObjType RELATIONAL_EQUAL_TYPE[ObMaxType] =
   ObMySQLDateTimeType,  /* ObMySQLDateTimeType  */
 };
 
+static_assert(is_array_fully_initialized(LEGACY_RELATIONAL_EQUAL_TYPE), "RELATIONAL_EQUAL_TYPE is partially initlized");
+static constexpr auto FILE_RELATIONAL_EQUAL_TYPE = sql::extend_file_type_map(LEGACY_RELATIONAL_EQUAL_TYPE);
+static constexpr auto &RELATIONAL_EQUAL_TYPE = FILE_RELATIONAL_EQUAL_TYPE.values_;
 static_assert(is_array_fully_initialized(RELATIONAL_EQUAL_TYPE), "RELATIONAL_EQUAL_TYPE is partially initlized");

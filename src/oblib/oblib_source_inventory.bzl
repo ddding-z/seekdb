@@ -32,6 +32,7 @@ OBLIB_UNITY_GROUPS = {
             srcs = [
                 "src/oblib/common/cell/ob_cell_reader.cpp",
                 "src/oblib/common/cell/ob_cell_writer.cpp",
+                "src/oblib/common/object/file_ref.cpp",
                 "src/oblib/common/object/ob_obj_compare.cpp",
                 "src/oblib/common/object/ob_obj_type.cpp",
                 "src/oblib/common/object/ob_object.cpp",

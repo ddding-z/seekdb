@@ -71,6 +71,7 @@ public:
   int evaluate(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &result) override;
   bool supports_semantic_suspend() const override { return true; }
 private:
+  struct Dispatch;
   struct Task;
   struct Slot;
   const SemanticSpec &semantic_spec() const { return static_cast<const SemanticSpec &>(spec_); }
@@ -83,11 +84,16 @@ private:
   int capture(Slot &slot);
   int capture_join_candidates(Slot &slot);
   int prepare(Slot &slot, bool &progress);
+  int advance_media(Task &task, bool &progress);
+  bool input_ready(const Task &task, int64_t position) const;
+  bool has_pending_requests() const;
+  int build_request_parts(Task &task, Dispatch &dispatch, int64_t position);
   int submit_tasks(Slot &slot, bool &progress);
   int poll_tasks(Slot &slot, bool &progress);
   int restore_input(Slot &slot);
   void clear_owned_flags(int64_t size);
   int output(Slot &slot, int64_t max_row_cnt);
+  void reset_dispatch(Slot &slot, Dispatch &dispatch);
   void reset_task(Slot &slot, Task &task);
   void reset_slot(Slot &slot);
   void reset_pipeline();

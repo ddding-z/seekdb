@@ -1,4 +1,4 @@
-static constexpr ObObjType NEG_RESULT_TYPE[ObMaxType] =
+static constexpr ObObjType LEGACY_NEG_RESULT_TYPE[ObFileType] =
 {
     ObDoubleType,     /*NullType  */
     ObIntType,        /*TinyIntType  */
@@ -45,4 +45,7 @@ static constexpr ObObjType NEG_RESULT_TYPE[ObMaxType] =
     ObDoubleType,      /* ObMySQLDateTimeType */
 };
 
+static_assert(is_array_fully_initialized(LEGACY_NEG_RESULT_TYPE), "NEG_RESULT_TYPE is partially initlized");
+static constexpr auto FILE_NEG_RESULT_TYPE = sql::extend_file_type_map(LEGACY_NEG_RESULT_TYPE);
+static constexpr auto &NEG_RESULT_TYPE = FILE_NEG_RESULT_TYPE.values_;
 static_assert(is_array_fully_initialized(NEG_RESULT_TYPE), "NEG_RESULT_TYPE is partially initlized");

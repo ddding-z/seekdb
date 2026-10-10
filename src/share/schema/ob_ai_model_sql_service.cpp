@@ -20,6 +20,7 @@
 #include "share/ob_dml_sql_splicer.h"
 #include "share/inner_table/ob_inner_table_schema.h"
 #include "share/schema/ob_ai_model_mgr.h"
+#include "share/ob_rpc_struct.h"
 
 namespace oceanbase
 {
@@ -27,6 +28,80 @@ namespace share
 {
 namespace schema
 {
+int ObAiModelSqlService::prepare_input_modalities_upgrade(
+    const ObTableSchema &table_schema,
+    obcall::ObAlterTableArg &arg,
+    bool &needs_upgrade)
+{
+  int ret = OB_SUCCESS;
+  needs_upgrade = false;
+  ObTableSchema expected_schema;
+  const uint64_t table_id = table_schema.get_table_id();
+  const ObColumnSchemaV2 *expected_column = nullptr;
+  if (table_id != OB_ALL_AI_MODEL_TID && table_id != OB_ALL_AI_MODEL_HISTORY_TID) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("not an AI model system table", K(ret), K(table_id));
+  } else if (arg.alter_table_schema_.get_column_count() != 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("AI model upgrade requires an empty alter argument", K(ret), K(arg));
+  } else if (OB_FAIL(table_id == OB_ALL_AI_MODEL_TID
+      ? ObInnerTableSchema::all_ai_model_schema(expected_schema)
+      : ObInnerTableSchema::all_ai_model_history_schema(expected_schema))) {
+    LOG_WARN("failed to construct AI model system table schema", K(ret), K(table_id));
+  } else if (OB_ISNULL(expected_column = expected_schema.get_column_schema("input_modalities"))
+      || table_schema.get_table_name_str() != expected_schema.get_table_name_str()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid AI model system table definition", K(ret), K(table_id), K(table_schema));
+  } else {
+    const ObColumnSchemaV2 *column = table_schema.get_column_schema("input_modalities");
+    if (OB_NOT_NULL(column)) {
+      const ObObj &orig_default = column->get_orig_default_value();
+      const ObObj &cur_default = column->get_cur_default_value();
+      if (column->get_column_id() != expected_column->get_column_id()
+          || column->get_data_type() != ObIntType
+          || column->is_nullable() != expected_column->is_nullable()
+          || !orig_default.is_int() || orig_default.get_int() != AiInputModality::TEXT
+          || !cur_default.is_int() || cur_default.get_int() != AiInputModality::TEXT) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid persisted input_modalities column", K(ret), K(table_id), KPC(column));
+      }
+    } else if (expected_column->get_column_id() != table_schema.get_max_used_column_id() + 1) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("AI model upgrade must preserve existing column identifiers",
+               K(ret), K(table_id), KPC(expected_column), K(table_schema.get_max_used_column_id()));
+    } else {
+      AlterColumnSchema alter_column;
+      if (OB_FAIL(alter_column.assign(*expected_column))) {
+        LOG_WARN("failed to copy input_modalities column", K(ret), K(table_id));
+      } else if (OB_FAIL(arg.alter_table_schema_.set_origin_database_name(OB_SYS_DATABASE_NAME))) {
+        LOG_WARN("failed to set AI model upgrade database", K(ret));
+      } else if (OB_FAIL(arg.alter_table_schema_.set_origin_table_name(table_schema.get_table_name()))) {
+        LOG_WARN("failed to set AI model upgrade table", K(ret), K(table_id));
+      } else {
+        alter_column.alter_type_ = OB_DDL_ADD_COLUMN;
+        alter_column.is_set_default_ = true;
+        alter_column.is_set_nullable_ = true;
+        if (OB_FAIL(arg.alter_table_schema_.add_alter_column(alter_column, true /* need allocate */))) {
+          LOG_WARN("failed to add input_modalities upgrade column", K(ret), K(table_id));
+        } else {
+          arg.alter_table_schema_.set_table_id(table_id);
+          arg.alter_table_schema_.set_database_id(table_schema.get_database_id());
+          arg.table_id_ = table_id;
+          arg.is_alter_columns_ = true;
+          arg.is_alter_options_ = false;
+          arg.is_inner_ = true;
+          arg.skip_sys_table_check_ = true;
+          arg.ddl_stmt_str_ = ObString::make_string(table_id == OB_ALL_AI_MODEL_TID
+              ? "ALTER TABLE oceanbase.__all_ai_model ADD COLUMN input_modalities BIGINT NOT NULL DEFAULT 1"
+              : "ALTER TABLE oceanbase.__all_ai_model_history ADD COLUMN input_modalities BIGINT DEFAULT 1");
+          needs_upgrade = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObAiModelSqlService::create_ai_model(const ObAiModelSchema &new_schema,
                                          const ObString &ddl_stmt,
                                          common::ObISQLClient &sql_client)
@@ -45,6 +120,7 @@ int ObAiModelSqlService::create_ai_model(const ObAiModelSchema &new_schema,
   } else if (OB_FAIL(sql.add_column("name", ObHexEscapeSqlStr(new_schema.get_name())))) {
   } else if (OB_FAIL(sql.add_column("type", static_cast<int64_t>(new_schema.get_type())))) {
   } else if (OB_FAIL(sql.add_column("model_name", ObHexEscapeSqlStr(new_schema.get_model_name())))) {
+  } else if (OB_FAIL(sql.add_column("input_modalities", new_schema.get_input_modalities()))) {
   } else if (OB_FAIL(sql.splice_insert_sql(OB_ALL_AI_MODEL_TNAME, buffer))) {
   } else if (OB_FAIL(sql_client.write(buffer.ptr(), affected_rows))) {
   } else if (!is_single_row(affected_rows)) {
@@ -103,6 +179,7 @@ int ObAiModelSqlService::drop_ai_model(const ObAiModelSchema &schema,
     } else if (OB_FAIL(sql.add_column("name", ObHexEscapeSqlStr(schema.get_name())))) {
     } else if (OB_FAIL(sql.add_column("type", static_cast<int64_t>(schema.get_type())))) {
     } else if (OB_FAIL(sql.add_column("model_name", ObHexEscapeSqlStr(schema.get_model_name())))) {
+    } else if (OB_FAIL(sql.add_column("input_modalities", schema.get_input_modalities()))) {
     } else if (OB_FAIL(sql.splice_insert_sql(OB_ALL_AI_MODEL_HISTORY_TNAME, buffer))) {
     } else if (OB_FAIL(sql_client.write(buffer.ptr(), affected_rows))) {
     } else if (!is_single_row(affected_rows)) {

@@ -27,6 +27,7 @@
 #include "sql/engine/pdml/static/ob_px_multi_part_insert_op.h"
 #include "sql/engine/join/ob_join_filter_op.h"
 #include "sql/engine/basic/ob_select_into_op.h"
+#include "sql/engine/sort/ob_sort_op.h"
 #include "sql/monitor/ob_process_malloc_callback.h"
 #include "sql/ob_sql.h"
 #include "sql/engine/window_function/ob_window_function_op.h"
@@ -70,9 +71,14 @@ bool ObPxTaskProcess::supports_resumable(const ObPxInitTaskArgs &arg)
   bool has_semantic = false;
   while (supported && nullptr != op &&
          (PHY_SEMANTIC_MAP == op->type_ || PHY_SEMANTIC_FILTER == op->type_ ||
-          PHY_SEMANTIC_JOIN == op->type_)) {
-    has_semantic = true;
+          PHY_SEMANTIC_JOIN == op->type_ || PHY_SORT == op->type_)) {
     supported = op->max_batch_size_ > 0 && 1 == op->get_child_cnt();
+    if (PHY_SORT == op->type_) {
+      const ObSortSpec &sort = static_cast<const ObSortSpec &>(*op);
+      supported = supported && sort.supports_semantic_suspend() && sort.filters_.empty();
+    } else {
+      has_semantic = true;
+    }
     op = supported ? op->get_child() : nullptr;
   }
   // GI is below the semantic region: it never has to unwind an async child.

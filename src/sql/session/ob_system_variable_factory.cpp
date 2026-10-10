@@ -1278,6 +1278,9 @@ int ObSysVarFactory::create_all_sys_vars_()
         + sizeof(ObSysVarObSparseDropRatioSearch)
         + sizeof(ObSysVarAiPipelineSlots)
         + sizeof(ObSysVarAiPipelineMemoryLimit)
+        + sizeof(ObSysVarAiMediaRoot)
+        + sizeof(ObSysVarAiMediaMaxBytes)
+        + sizeof(ObSysVarAiMediaParallel)
         ;
     void *ptr = NULL;
     if (OB_ISNULL(ptr = allocator_.alloc(total_mem_size))) {
@@ -7775,6 +7778,33 @@ int ObSysVarFactory::create_all_sys_vars_()
         ptr = (void *)((char *)ptr + sizeof(ObSysVarAiPipelineMemoryLimit));
       }
     }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarAiMediaRoot())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarAiMediaRoot", K(ret));
+      } else {
+        store_buf_[share::ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(share::SYS_VAR_AI_MEDIA_ROOT))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarAiMediaRoot));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarAiMediaMaxBytes())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarAiMediaMaxBytes", K(ret));
+      } else {
+        store_buf_[share::ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(share::SYS_VAR_AI_MEDIA_MAX_BYTES))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarAiMediaMaxBytes));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarAiMediaParallel())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarAiMediaParallel", K(ret));
+      } else {
+        store_buf_[share::ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(share::SYS_VAR_AI_MEDIA_PARALLEL))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarAiMediaParallel));
+      }
+    }
 
   }
   return ret;
@@ -10682,6 +10712,18 @@ int ObSysVarFactory::create_sys_var(ObIAllocator &allocator_, share::ObSysVarCla
     }
     case share::SYS_VAR_AI_PIPELINE_MEMORY_LIMIT: {
       ret = create_one_sys_var<ObSysVarAiPipelineMemoryLimit>(allocator_, sys_var_ptr, "ObSysVarAiPipelineMemoryLimit");
+      break;
+    }
+    case share::SYS_VAR_AI_MEDIA_ROOT: {
+      ret = create_one_sys_var<ObSysVarAiMediaRoot>(allocator_, sys_var_ptr, "ObSysVarAiMediaRoot");
+      break;
+    }
+    case share::SYS_VAR_AI_MEDIA_MAX_BYTES: {
+      ret = create_one_sys_var<ObSysVarAiMediaMaxBytes>(allocator_, sys_var_ptr, "ObSysVarAiMediaMaxBytes");
+      break;
+    }
+    case share::SYS_VAR_AI_MEDIA_PARALLEL: {
+      ret = create_one_sys_var<ObSysVarAiMediaParallel>(allocator_, sys_var_ptr, "ObSysVarAiMediaParallel");
       break;
     }
 

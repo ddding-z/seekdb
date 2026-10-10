@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX COMMON
 
 #include "common/cell/ob_cell_reader.h"
+#include "common/object/file_ref.h"
 
 namespace oceanbase
 {
@@ -418,6 +419,19 @@ int ObCellReader::parse(uint64_t *column_id)
       case ObCharType:
         READ_CHAR(set_char, obj_);
         break;
+      case ObFileType: {
+        FileRef ref;
+        if (meta->attr_ > 1) {
+          ret = OB_DESERIALIZE_ERROR;
+          COMMON_LOG(WARN, "invalid FILE cell attribute", K(ret), K(meta->attr_));
+        } else {
+          READ_CHAR(set_file, obj_);
+          if (OB_SUCC(ret) && OB_FAIL(FileRefCodec::decode(obj_.get_file(), ref))) {
+            COMMON_LOG(WARN, "invalid persisted FILE reference", K(ret));
+          }
+        }
+        break;
+      }
       case ObHexStringType:
         READ_BINARY(set_hex_string, obj_);
         break;

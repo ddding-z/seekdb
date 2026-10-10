@@ -28,6 +28,7 @@ class ObJsonObject;
 }
 namespace sql
 {
+class SemanticInput;
 
 class ISemanticExprRuntime
 {
@@ -58,6 +59,10 @@ public:
                            MultimodeAlloctor &allocator,
                            common::ObString &model_id, common::ObString &prompt,
                            common::ObJsonObject *&config, bool prepare_config = true);
+  static int prepare_request_input(const ObExpr &expr, ObEvalCtx &ctx,
+                                  MultimodeAlloctor &allocator,
+                                  common::ObString &model_id, SemanticInput &input,
+                                  common::ObJsonObject *&config, bool prepare_config = true);
   static int set_result(const ObExpr &expr, ObEvalCtx &ctx, common::ObDatum &datum,
                         const common::ObString &result);
 private:

@@ -1,4 +1,4 @@
-static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
+static constexpr ObObjType LEGACY_MERGE_RESULT_TYPE[ObFileType][ObFileType] = {
     /*NullType*/
     {
         ObNullType,          /*NullType=>NullType  */
@@ -2008,4 +2008,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
 
 };
 
+static_assert(is_array_fully_initialized(LEGACY_MERGE_RESULT_TYPE, ObFileType), "MERGE_RESULT_TYPE is partially initlized");
+static constexpr auto FILE_MERGE_RESULT_TYPE = sql::extend_file_type_map(LEGACY_MERGE_RESULT_TYPE, true);
+static constexpr auto &MERGE_RESULT_TYPE = FILE_MERGE_RESULT_TYPE.values_;
 static_assert(is_array_fully_initialized(MERGE_RESULT_TYPE, ObMaxType), "MERGE_RESULT_TYPE is partially initlized");

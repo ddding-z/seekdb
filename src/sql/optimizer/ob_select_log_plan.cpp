@@ -4995,6 +4995,17 @@ bool semantic_plan_present(const ObLogicalOperator &node)
   return present;
 }
 
+bool can_project_semantic_before_sort(const ObSelectStmt &stmt)
+{
+  bool supported = stmt.has_order_by() && !stmt.has_limit();
+  for (int64_t index = 0; supported && index < stmt.get_order_item_size(); ++index) {
+    const ObRawExpr *key = stmt.get_order_item(index).expr_;
+    supported = nullptr != key &&
+        (key->is_column_ref_expr() || key->is_aggr_expr() || key->is_const_expr());
+  }
+  return supported;
+}
+
 class SemanticPlanLowering
 {
 public:
@@ -5483,6 +5494,10 @@ int ObSelectLogPlan::allocate_plan_top()
         LOG_TRACE("succeed to allocate subplan filter for subquery in select item",
                   K(candidates_.candidate_plans_.count()));
       }
+    }
+    // Keep demand above LIMIT/Top-N and potentially failing computed sort keys.
+    if (OB_SUCC(ret) && can_project_semantic_before_sort(*select_stmt) &&
+        OB_FAIL(candi_allocate_semantic())) {
     }
     // step. allocate 'order-by' if needed
     if (OB_SUCC(ret) && select_stmt->has_order_by() &&

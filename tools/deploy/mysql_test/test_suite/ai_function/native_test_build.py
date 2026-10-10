@@ -13,7 +13,25 @@ ROOT = Path(__file__).resolve().parents[5]
 MAIN_OBJECT = "/_observer_main_ob_main_0_objects/"
 
 
-def build_native_test(build_dir, output, source, *, wrapped=(), link_manifest=None, bazel=None):
+def compile_native_source(source, object_file, entry):
+    source = Path(source).resolve()
+    object_file = Path(object_file).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Native source does not exist: {source}")
+    original = entry.get("arguments") or shlex.split(entry["command"])
+    arguments = iter(original[1:])
+    compile_args = [original[0]]
+    for value in arguments:
+        if value in ("-o", "-MF", "-MT", "-MQ"):
+            next(arguments)
+        elif value not in ("-MD", "-MMD", "-MP") and not value.startswith("-frandom-seed="):
+            compile_args.append(str(source) if value == entry["file"] else value)
+    subprocess.run(compile_args + ["-pthread", "-o", str(object_file)],
+                   cwd=entry["directory"], check=True)
+
+
+def build_native_test(build_dir, output, source, *, wrapped=(), link_manifest=None, bazel=None,
+                      link_replacements=None, extra_link_args=()):
     source = Path(source).resolve()
     output = Path(output).resolve()
     if not source.is_file():
@@ -50,24 +68,23 @@ def build_native_test(build_dir, output, source, *, wrapped=(), link_manifest=No
     if action is None:
         raise RuntimeError("No cached seekdb Debug entry-point link action; complete the Debug build first")
 
-    original = entry.get("arguments") or shlex.split(entry["command"])
-    arguments = iter(original[1:])
-    compile_args = [original[0]]
-    for value in arguments:
-        if value in ("-o", "-MF", "-MT", "-MQ"):
-            next(arguments)
-        elif value not in ("-MD", "-MMD", "-MP") and not value.startswith("-frandom-seed="):
-            compile_args.append(str(source) if value == entry["file"] else value)
     object_file = output.with_suffix(".o")
-    subprocess.run(compile_args + ["-pthread", "-o", str(object_file)],
-                   cwd=directory, check=True)
+    compile_native_source(source, object_file, entry)
     link_args = list(action["arguments"])
+    for old_input, new_input in (link_replacements or {}).items():
+        if link_args.count(old_input) != 1:
+            raise RuntimeError(f"Expected exactly one cached link input to replace: {old_input}")
+        new_input = Path(new_input).resolve()
+        if not new_input.is_file():
+            raise FileNotFoundError(f"Replacement native object does not exist: {new_input}")
+        link_args[link_args.index(old_input)] = str(new_input)
     replacements = [index for index, value in enumerate(link_args) if MAIN_OBJECT in value]
     if len(replacements) != 1:
         raise RuntimeError("Expected exactly one seekdb entry-point object")
     link_args[replacements[0]] = str(object_file)
     link_args[link_args.index("-o") + 1] = str(output)
     link_args.extend(f"-Wl,--wrap={symbol}" for symbol in wrapped)
+    link_args.extend(extra_link_args)
     subprocess.run(link_args, cwd=directory, check=True)
     library_dirs = dict.fromkeys(str((directory / value).resolve().parent)
                                 for value in action["arguments"]

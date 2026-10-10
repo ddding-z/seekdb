@@ -2,13 +2,92 @@
 
 from collections import Counter
 from decimal import Decimal
+import json
 import sys
 
 import test_semantic_runtime as semantic
 from test_semantic_runtime import Reply, completion
+from test_runtime_contracts import sql_error
 
 
 class SemanticCompositionContracts(semantic.SemanticContracts):
+    def test_json_map_derived_group_materializes_without_replay(self):
+        prompts = [f"json-group-{index}" for index in range(35)]
+        self.load(prompts)
+        counts = Counter()
+        retained = []
+        for index, prompt in enumerate(prompts):
+            keep = index % 4 != 1
+            label = f"category-{index % 3}"
+            self.filter_reply(self.mock_a, prompt, keep)
+            self.mock_b.scenarios[prompt] = [Reply(body=completion(json.dumps({"label": label})))]
+            if keep:
+                retained.append(prompt)
+                counts[label] += 1
+        inner = self.statement(
+            "JSON_UNQUOTE(JSON_EXTRACT(AI_MAP('semantic_b', prompt), '$.label')) AS category",
+            "WHERE AI_FILTER('semantic_a', prompt)")
+        self.cursor.execute(
+            "SELECT category, COUNT(*) AS n FROM (" + inner + ") classified "
+            "GROUP BY category HAVING n >= 2 ORDER BY n DESC, category LIMIT 2")
+        expected = tuple(sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:2])
+        self.assertEqual(self.cursor.fetchall(), expected)
+        self.assert_counts(self.mock_a, prompts)
+        self.assert_counts(self.mock_b, retained)
+
+    def test_json_string_wrappers_wait_for_completed_map_values(self):
+        prompts = [f"json-wrapper-{index}" for index in range(35)]
+        self.load(prompts)
+        values = [{"label": f"class-{index % 3}", "items": [index, index + 1]}
+                  for index in range(len(prompts))]
+        for function in ("JSON_UNQUOTE(JSON_EXTRACT(%s, '$.label'))", "JSON_PRETTY(%s)"):
+            with self.subTest(function=function):
+                self.mock_a.reset()
+                for prompt, value in zip(prompts, values):
+                    self.mock_a.scenarios[prompt] = [Reply(body=completion(json.dumps(value)))]
+                expression = function % "AI_MAP('semantic_a', prompt)"
+                rows = self.select("id, " + expression)
+                actual = tuple((row[0], json.loads(row[1])) for row in rows) \
+                    if function.startswith("JSON_PRETTY") else rows
+                expected = tuple(enumerate(values)) if function.startswith("JSON_PRETTY") else \
+                    tuple((index, value["label"]) for index, value in enumerate(values))
+                self.assertEqual(actual, expected)
+                self.assert_counts(self.mock_a, prompts)
+        self.assertFalse(self.mock_b.requests)
+
+    def test_json_valid_does_not_complete_a_pending_map_as_false(self):
+        prompts = [f"json-valid-{index}" for index in range(35)]
+        self.load(prompts)
+        gate = self.fixtures.gate()
+        for index, prompt in enumerate(prompts):
+            value = json.dumps({"id": index}) if index % 2 == 0 else "invalid-json"
+            self.mock_a.scenarios[prompt] = [Reply(body=completion(value), gate=gate)]
+        pending = self.fixtures.start(lambda: self.select(
+            "id, JSON_VALID(AI_MAP('semantic_a', prompt))"))
+        semantic.wait_evidence(
+            self, self.mock_a, lambda: len(self.mock_a.requests) == 2 * semantic.BATCH_ROWS, pending,
+            message="JSON_VALID did not demand its asynchronous MAP argument")
+        semantic.assert_held(self, self.mock_a, [gate])
+        gate.set()
+        self.assertEqual(pending.result(timeout=10),
+                         tuple((index, int(index % 2 == 0)) for index in range(len(prompts))))
+        self.assert_counts(self.mock_a, prompts)
+
+    def test_json_valid_preserves_argument_errors_and_case_demand(self):
+        sql_error(self, 3141, lambda: self.cursor.execute(
+            "SELECT JSON_VALID(JSON_EXTRACT('{', '$.value'))"))
+        self.load([None])
+        statement = self.statement("JSON_VALID(AI_MAP('semantic_a', prompt))")
+        sql_error(self, 1210, lambda: self.cursor.execute(statement))
+        self.assertFalse(self.mock_a.requests)
+        self.assertEqual(self.select(
+            "CASE WHEN id = 0 THEN 7 ELSE JSON_VALID(AI_MAP('semantic_a', prompt)) END"), ((7,),))
+        self.assertFalse(self.mock_a.requests)
+        self.load(["json-valid-provider-error"])
+        self.mock_a.scenarios["json-valid-provider-error"] = [Reply(status=400)]
+        sql_error(self, 4216, lambda: self.cursor.execute(statement))
+        self.assert_counts(self.mock_a, ["json-valid-provider-error"])
+
     def test_filter_map_group_having_sort_limit(self):
         prompts = [f"group-{index}" for index in range(67)]
         self.load(prompts)

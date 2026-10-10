@@ -77,6 +77,7 @@ typedef enum ObItemType
   T_GEOMETRY    = 37,
   T_RESERVED_TYPE_38 = 38,
   T_COLLECTION  = 40,
+  T_FILE        = 43,
 
   T_TIMESTAMP_TZ = 46,
   T_TIMESTAMP_LTZ = 47,
@@ -920,6 +921,10 @@ typedef enum ObItemType
   T_FUN_SYS_AI_MAP = 2087,
   T_FUN_SYS_AI_FILTER = 2088,
   T_FUN_SYS_AI_JOIN = 2089,
+  T_FUN_SYS_TO_FILE = 2090,
+  T_FUN_SYS_FILE_URI = 2091,
+  T_FUN_SYS_FILE_META = 2092,
+  T_FUN_SYS_AI_INPUT = 2093,
   T_MAX_OP = 3000,
 
   //pseudo column, to mark the group iterator id

@@ -131,7 +131,15 @@ int ObExprArgCase::calc_result_typeN(ObExprResType &type,
     int64_t cond_type_count = param_num / 2;
     int64_t val_type_count = param_num / 2;
     ObExprResType tmp_res_type;
-    if (OB_FAIL(aggregate_result_type_for_case(
+    for (int64_t i = 0; OB_SUCC(ret) && i < cond_type_count; ++i) {
+      if (ObFileType == types_stack[i].get_type()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "whole-value FILE comparisons in CASE");
+        LOG_WARN("FILE cannot be compared by a simple CASE expression", K(ret));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(aggregate_result_type_for_case(
                   tmp_res_type,
                   types_stack,
                   cond_type_count,

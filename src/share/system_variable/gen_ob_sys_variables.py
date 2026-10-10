@@ -64,10 +64,10 @@ def parse_json(json_file_name):
   json_file = open(json_file_name,'r')
   all_the_vars = json_file.read( )
   json_Dict = json.loads(all_the_vars)
-  filtered_json = filter(lambda d: 'placeholder' not in d[1] or d[1]['placeholder'] is False, json_Dict.iteritems())
+  filtered_json = filter(lambda d: 'placeholder' not in d[1] or d[1]['placeholder'] is False, json_Dict.items())
   filtered_dict = dict(filtered_json)
-  list_sorted_by_name= sorted(filtered_dict.iteritems(), key=lambda d:d[0].lower())
-  list_sorted_by_id= sorted(filtered_dict.iteritems(), key=lambda d:d[1]['id'])
+  list_sorted_by_name= sorted(filtered_dict.items(), key=lambda d:d[0].lower())
+  list_sorted_by_id= sorted(filtered_dict.items(), key=lambda d:d[1]['id'])
   json_file.close()
   return (json_Dict, list_sorted_by_name, list_sorted_by_id)
 
@@ -219,6 +219,8 @@ def make_type_value(type):
   return type_dict[type.strip()]
 
 def make_cpp_file(pdir, cpp_file_name, sorted_list):
+  if os.path.exists(cpp_file_name):
+    os.chmod(cpp_file_name, stat.S_IRUSR + stat.S_IWUSR + stat.S_IRGRP + stat.S_IROTH)
   cpp_file =  open(cpp_file_name,'w')
   cpp_file.write(file_head_annotation)
   cpp_file.write("#define USING_LOG_PREFIX SHARE\n")
@@ -266,6 +268,12 @@ def make_cpp_file(pdir, cpp_file_name, sorted_list):
         out = "      ObSysVars[" + str(var_num) + "]." + str(attribute_key) + "_ = " + make_flags_value(attribute_value) + " ;\n"
       elif attribute_key == "data_type":
         out = "      ObSysVars[" + str(var_num) + "]." + str(attribute_key) + "_ = " + make_type_value(attribute_value) + " ;\n"
+      elif attribute_key == "enum_names":
+        # Preserve the existing Unicode-list metadata spelling across Python versions.
+        enum_names = "[" + ", ".join(
+          "u" + ascii(value) if sys.version_info[0] >= 3 else repr(value)
+          for value in attribute_value) + "]"
+        out = "      ObSysVars[" + str(var_num) + "]." + str(attribute_key) + "_ = \"" + enum_names + "\" ;\n"
       else:
         out = "      ObSysVars[" + str(var_num) + "]." + str(attribute_key) + "_ = \"" + str(attribute_value) + "\" ;\n"
       cpp_file.write(out)

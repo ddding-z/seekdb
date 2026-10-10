@@ -1125,6 +1125,11 @@ int ObExprOperator::aggregate_result_type_for_merge(
       } else if (ob_is_geometry(res_type)) {
         type.set_geometry();
         type.set_length((ObAccuracy::DDL_DEFAULT_ACCURACY[ObGeometryType]).get_length());
+      } else if (ObFileType == res_type) {
+        type.set_type(ObFileType);
+        type.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObFileType]);
+        type.set_collation_type(CS_TYPE_BINARY);
+        type.set_collation_level(CS_LEVEL_IMPLICIT);
       } else if (ob_is_collection_sql_type(res_type)) {
         if (OB_FAIL(aggregate_collection_sql_type(type_ctx, type, types, param_num))) {
         }

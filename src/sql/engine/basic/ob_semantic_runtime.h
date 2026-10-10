@@ -26,6 +26,7 @@ public:
   void fail(int ret);
   int failure() const { return failure_.load(); }
   bool task_available() const { return active_tasks_.load() < task_limit_; }
+  int64_t active_tasks() const { return active_tasks_.load(); }
   int64_t memory_used() const;
   int64_t memory_limit() const { return memory_limit_; }
   int64_t task_limit() const { return task_limit_; }
@@ -56,6 +57,8 @@ public:
   static bool can_resume(const void *state);
   SemanticQueryBudget &budget() { return *budget_; }
   const SemanticQueryBudget &budget() const { return *budget_; }
+  const std::shared_ptr<SemanticQueryBudget> &budget_handle() const { return budget_; }
+  int media_runtime(std::shared_ptr<class SemanticMediaRuntime> &runtime);
 private:
   struct Waiter
   {
@@ -67,6 +70,7 @@ private:
                          int64_t deadline);
   ObExecContext *ctx_;
   std::shared_ptr<SemanticQueryBudget> budget_;
+  std::shared_ptr<class SemanticMediaRuntime> media_;
   int64_t deadline_;
   bool registered_;
   std::mutex mutex_;

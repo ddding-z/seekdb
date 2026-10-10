@@ -1,4 +1,47 @@
 {
+  "ai_media_root": {
+    "id": 10756,
+    "name": "ai_media_root",
+    "default_value": "",
+    "base_value": "",
+    "data_type": "varchar",
+    "info": "Administrator-controlled global root for local AI media loading; an empty value disables reads independently of secure_file_priv",
+    "flags": "GLOBAL | NEED_SERIALIZE",
+    "publish_version": "1.0.0.0",
+    "info_cn": "",
+    "background_cn": "",
+    "ref_url": ""
+  },
+  "ai_media_max_bytes": {
+    "id": 10757,
+    "name": "ai_media_max_bytes",
+    "default_value": "2097152",
+    "base_value": "2097152",
+    "data_type": "int",
+    "info": "Maximum bytes per AI media file; provider request size limits still apply",
+    "flags": "GLOBAL | SESSION | NEED_SERIALIZE",
+    "min_val": "1",
+    "max_val": "67108864",
+    "publish_version": "1.0.0.0",
+    "info_cn": "",
+    "background_cn": "",
+    "ref_url": ""
+  },
+  "ai_media_parallel": {
+    "id": 10758,
+    "name": "ai_media_parallel",
+    "default_value": "4",
+    "base_value": "4",
+    "data_type": "int",
+    "info": "Maximum concurrent local AI media loads per query",
+    "flags": "GLOBAL | SESSION | NEED_SERIALIZE",
+    "min_val": "1",
+    "max_val": "64",
+    "publish_version": "1.0.0.0",
+    "info_cn": "",
+    "background_cn": "",
+    "ref_url": ""
+  },
   "ai_pipeline_slots": {
     "id": 10754,
     "name": "ai_pipeline_slots",

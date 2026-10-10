@@ -3772,6 +3772,13 @@ int ObAlterTableResolver::resolve_alter_column(const ParseNode &node)
           SQL_RESV_LOG(WARN, "COLLECTION can't set default value!", K(ret));
         } else if (OB_FAIL(resolve_default_value(default_node, resolve_res))) {
         }
+        if (OB_SUCC(ret) && ObFileType == alter_column_schema.get_data_type()
+            && (!resolve_res.is_literal_ || !default_value.is_null())) {
+          ret = OB_INVALID_DEFAULT;
+          LOG_USER_ERROR(OB_INVALID_DEFAULT, alter_column_schema.get_column_name_str().length(),
+                         alter_column_schema.get_column_name_str().ptr());
+          LOG_WARN("FILE columns only allow a literal NULL default", K(ret));
+        }
         if (OB_SUCC(ret) && !resolve_res.is_literal_) {
           if (OB_FAIL(ret)) {
           } else if (OB_ISNULL(session_info_)) {
@@ -4112,6 +4119,12 @@ int ObAlterTableResolver::check_modify_column_allowed(
   const ObAccuracy &origin_col_accuracy = origin_col_schema.get_accuracy();
   const ObAccuracy &alter_col_accuracy = alter_column_schema.get_accuracy();
 
+  if (origin_col_type != alter_col_type
+      && (ObFileType == origin_col_type || ObFileType == alter_col_type)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "ALTER COLUMN conversion to or from FILE; use TO_FILE and INSERT SELECT");
+    LOG_WARN("FILE column type conversion is not supported", K(ret), K(origin_col_type), K(alter_col_type));
+  }
   if (OB_SUCC(ret)) {
     if ((origin_col_type) != alter_col_type
          || (!origin_col_schema.is_autoincrement() && alter_column_schema.is_autoincrement())) {

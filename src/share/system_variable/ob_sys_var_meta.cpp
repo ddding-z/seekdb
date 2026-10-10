@@ -44,6 +44,9 @@ const char *ObSysVarMeta::SYS_VAR_NAMES_SORTED_BY_NAME[] = {
   "_show_ddl_in_compat_mode",
   "_windowfunc_optimization_settings",
   "activate_all_roles_on_login",
+  "ai_media_max_bytes",
+  "ai_media_parallel",
+  "ai_media_root",
   "ai_pipeline_memory_limit",
   "ai_pipeline_slots",
   "auto_generate_certs",
@@ -768,6 +771,9 @@ const ObSysVarClassType ObSysVarMeta::SYS_VAR_IDS_SORTED_BY_NAME[] = {
   SYS_VAR__SHOW_DDL_IN_COMPAT_MODE,
   SYS_VAR__WINDOWFUNC_OPTIMIZATION_SETTINGS,
   SYS_VAR_ACTIVATE_ALL_ROLES_ON_LOGIN,
+  SYS_VAR_AI_MEDIA_MAX_BYTES,
+  SYS_VAR_AI_MEDIA_PARALLEL,
+  SYS_VAR_AI_MEDIA_ROOT,
   SYS_VAR_AI_PIPELINE_MEMORY_LIMIT,
   SYS_VAR_AI_PIPELINE_SLOTS,
   SYS_VAR_AUTO_GENERATE_CERTS,
@@ -2195,7 +2201,10 @@ const char *ObSysVarMeta::SYS_VAR_NAMES_SORTED_BY_ID[] = {
   "_push_join_predicate",
   "ob_sparse_drop_ratio_search",
   "ai_pipeline_slots",
-  "ai_pipeline_memory_limit"
+  "ai_pipeline_memory_limit",
+  "ai_media_root",
+  "ai_media_max_bytes",
+  "ai_media_parallel"
 };
 
 bool ObSysVarMeta::sys_var_name_case_cmp(const char *name1, const ObString &name2)

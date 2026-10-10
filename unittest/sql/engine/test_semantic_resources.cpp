@@ -34,6 +34,7 @@
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/engine/ob_physical_plan_ctx.h"
+#include "sql/engine/sort/ob_sort_op.h"
 #include "sql/session/ob_sql_session_info.h"
 
 using namespace oceanbase::common;
@@ -760,6 +761,40 @@ void test_semantic_join_detection()
   require(!root.has_semantic_operator(), "restoring ordinary tree clears semantic detection");
 }
 
+void test_sort_suspension_capability()
+{
+  ObArenaAllocator allocator("SemanticTest");
+  ObSortSpec sort(allocator, PHY_SORT);
+  sort.max_batch_size_ = 16;
+  require(sort.supports_semantic_suspend(), "ordinary vectorized sort is resumable");
+  sort.max_batch_size_ = 0;
+  require(!sort.supports_semantic_suspend(), "scalar sorting must stay protected");
+  sort.max_batch_size_ = 16;
+  sort.prefix_pos_ = 1;
+  require(!sort.supports_semantic_suspend(), "prefix sorting must stay protected");
+  sort.prefix_pos_ = 0;
+  sort.prescan_enabled_ = true;
+  require(!sort.supports_semantic_suspend(), "prescan sorting must stay protected");
+  sort.prescan_enabled_ = false;
+  sort.is_local_merge_sort_ = true;
+  require(!sort.supports_semantic_suspend(), "local merge sorting must stay protected");
+  sort.is_local_merge_sort_ = false;
+  sort.part_cnt_ = 1;
+  require(!sort.supports_semantic_suspend(), "partition sorting must stay protected");
+  sort.part_cnt_ = 0;
+  ObExpr limit;
+  sort.topk_limit_expr_ = &limit;
+  require(!sort.supports_semantic_suspend(), "approximate Top-K must stay protected");
+  sort.topk_limit_expr_ = nullptr;
+  sort.is_fetch_with_ties_ = true;
+  require(!sort.supports_semantic_suspend(), "WITH TIES must stay protected");
+  sort.is_fetch_with_ties_ = false;
+  sort.pd_topn_filter_info_.enabled_ = true;
+  require(!sort.supports_semantic_suspend(), "Top-N filtering must stay protected");
+  sort.pd_topn_filter_info_.enabled_ = false;
+  require(sort.supports_semantic_suspend(), "restoring ordinary sort restores capability");
+}
+
 struct TestCase
 {
   const char *name_;
@@ -782,6 +817,7 @@ const TestCase TESTS[] = {
   {"suspension_scope_thread_isolation", test_suspension_scope_thread_isolation},
   {"semantic_join_bindings", test_semantic_join_bindings},
   {"semantic_join_detection", test_semantic_join_detection},
+  {"sort_suspension_capability", test_sort_suspension_capability},
 };
 } // namespace
 

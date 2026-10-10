@@ -234,6 +234,17 @@ struct ObDatumTCCmp<ObMySQLDateTC, ObMySQLDateTC> : public ObTCPayloadCmp<ObMySQ
 template <>
 struct ObDatumTCCmp<ObMySQLDateTimeTC, ObMySQLDateTimeTC> : public ObTCPayloadCmp<ObMySQLDateTimeTC> {};
 
+template <>
+struct ObDatumTCCmp<ObFileTC, ObFileTC> : public ObDefined<>
+{
+  inline static int cmp(const ObDatum &l, const ObDatum &r, int &cmp_ret)
+  {
+    const int cmp = l.get_string().compare(r.get_string());
+    cmp_ret = cmp < 0 ? -1 : cmp > 0 ? 1 : 0;
+    return OB_SUCCESS;
+  }
+};
+
 // special process for extend and null class type.
 
 // extend type vs any type is depend on extend type is min or max
@@ -265,6 +276,16 @@ struct ObDatumTCCmp<ObExtendTC, ObExtendTC> : public ObDefined<>
     cmp_ret = (ObObj::MIN_OBJECT_VALUE == *l.int_ && ObObj::MIN_OBJECT_VALUE == *r.int_)
               || (ObObj::MAX_OBJECT_VALUE == *l.int_ && ObObj::MAX_OBJECT_VALUE == *r.int_)
               ? 0 : (ObObj::MIN_OBJECT_VALUE == *l.int_ ? -1 : 1);
+    return OB_SUCCESS;
+  }
+};
+
+template <>
+struct ObDatumTCCmp<ObFileTC, ObExtendTC> : public ObDefined<>
+{
+  inline static int cmp(const ObDatum &, const ObDatum &r, int &cmp_ret)
+  {
+    cmp_ret = ObObj::MIN_OBJECT_VALUE == *r.int_ ? 1 : -1;
     return OB_SUCCESS;
   }
 };

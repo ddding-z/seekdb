@@ -216,7 +216,7 @@ int ObDDLResolver::get_part_str_with_type(
 // check whether the column is allowed to be selected as part of primary key.
 int ObDDLResolver::check_add_column_as_pk_allowed(const ObColumnSchemaV2 &column_schema) {
   int ret = OB_SUCCESS;
-  if (column_schema.is_key_forbid_lob()) {
+  if (column_schema.is_key_forbid_lob() || ObFileType == column_schema.get_data_type()) {
     ret = OB_ERR_WRONG_KEY_COLUMN;
     LOG_USER_ERROR(OB_ERR_WRONG_KEY_COLUMN, column_schema.get_column_name_str().length(), column_schema.get_column_name_str().ptr());
     SQL_RESV_LOG(WARN, "BLOB, TEXT column can't be primary key", K(ret), K(column_schema));
@@ -892,7 +892,7 @@ int ObDDLResolver::add_storing_column(const ObString &column_name,
         ret = OB_ERR_BAD_FIELD_ERROR;
         LOG_USER_ERROR(OB_ERR_BAD_FIELD_ERROR, column_name.length(), column_name.ptr(), table_name_.length(), table_name_.ptr());
       } else {
-        if (column_schema->is_key_forbid_lob()) {
+        if (column_schema->is_key_forbid_lob() || ObFileType == column_schema->get_data_type()) {
           ret = OB_ERR_WRONG_KEY_COLUMN;
           LOG_USER_ERROR(OB_ERR_WRONG_KEY_COLUMN, column_name.length(), column_name.ptr());
         } else if (ob_is_extend(column_schema->get_data_type())) {
@@ -1902,7 +1902,11 @@ int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
   }
   if (OB_SUCC(ret) && GEN_COLUMN_DEFINITION_NUM_CHILD == node->num_child_) {
     ParseNode *expr_node = NULL;
-    if (OB_ISNULL(expr_node = node->children_[3])) {
+    if (ObFileType == column.get_data_type()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "FILE generated columns");
+      LOG_WARN("FILE generated columns are not supported", K(ret), K(column));
+    } else if (OB_ISNULL(expr_node = node->children_[3])) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("expr_node is null");
     } else {
@@ -2036,6 +2040,12 @@ int ObDDLResolver::resolve_normal_column_attribute_constr_default(ObColumnSchema
     ret = OB_ERR_UNEXPECTED;
     SQL_RESV_LOG(WARN, "resolve default value failed", K(ret));
   } else if (OB_FAIL(resolve_default_value(attr_node, resolve_res))) {
+  } else if (ObFileType == column.get_data_type()
+             && (!resolve_res.is_literal_ || !default_value.is_null())) {
+    ret = OB_INVALID_DEFAULT;
+    LOG_USER_ERROR(OB_INVALID_DEFAULT, column.get_column_name_str().length(),
+                   column.get_column_name_str().ptr());
+    LOG_WARN("FILE columns only allow a literal NULL default", K(ret), K(column));
   } else if (!resolve_res.is_literal_) {
     // default value expression is not literal
     if (OB_ISNULL(session_info_)) {
@@ -2132,7 +2142,7 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
         resolve_stat.is_primary_key_ = true;
         // primary key should not be nullable
         column.set_nullable(false);
-        if (ob_is_collection_sql_type(column.get_data_type())) {
+        if (ob_is_collection_sql_type(column.get_data_type()) || ObFileType == column.get_data_type()) {
           ret = OB_ERR_WRONG_KEY_COLUMN;
           LOG_USER_ERROR(OB_ERR_WRONG_KEY_COLUMN, column.get_column_name_str().length(), column.get_column_name_str().ptr());
           SQL_RESV_LOG(WARN, "VECTOR, TEXT column can't be primary key", K(column), K(ret));
@@ -2157,7 +2167,7 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
       }
       case T_CONSTR_UNIQUE_KEY: {
         resolve_stat.is_unique_key_ = true;
-        if (ob_is_collection_sql_type(column.get_data_type())) {
+        if (ob_is_collection_sql_type(column.get_data_type()) || ObFileType == column.get_data_type()) {
           ret = OB_ERR_WRONG_KEY_COLUMN;
           LOG_USER_ERROR(OB_ERR_WRONG_KEY_COLUMN, column.get_column_name_str().length(), column.get_column_name_str().ptr());
           SQL_RESV_LOG(WARN, "VECTOR, TEXT column can't be unique key", K(column), K(ret));
@@ -2191,7 +2201,7 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
       }
       case T_CONSTR_AUTO_INCREMENT:
         if (ob_is_text_tc(column.get_data_type()) || ob_is_json_tc(column.get_data_type())
-            || ob_is_geometry_tc(column.get_data_type())) {
+            || ob_is_geometry_tc(column.get_data_type()) || ObFileType == column.get_data_type()) {
           ret = OB_ERR_COLUMN_SPEC;
           LOG_USER_ERROR(OB_ERR_COLUMN_SPEC, column.get_column_name_str().length(), column.get_column_name_str().ptr());
           SQL_RESV_LOG(WARN, "BLOB, TEXT column can't set autoincrement", K(column), K(default_value), K(ret));

@@ -7543,6 +7543,11 @@ ObCastEnumOrSetFunc OB_CAST_ENUM_OR_SET[ObMaxTC][2] =
     cast_not_support_enum_set,/*enum*/
     cast_not_support_enum_set,/*set*/
   },
+  {
+    /*ObFileTC -> enum_or_set*/
+    cast_not_support_enum_set,/*enum*/
+    cast_not_support_enum_set,/*set*/
+  },
 };
 
 ////////////////////////////////////////////////////////////
@@ -10321,6 +10326,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_identity,/*collection*/
     cast_identity,/*mysql date*/
     cast_identity,/*mysql datetime*/
+    cast_identity,/*file*/
   },
   {
     /*int -> XXX*/
@@ -10353,6 +10359,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     int_mdate,/*mysql date*/
     int_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*uint -> XXX*/
@@ -10385,6 +10392,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     uint_mdate,/*mysql date*/
     uint_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*float -> XXX*/
@@ -10417,6 +10425,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     float_mdate,/*mysql date*/
     float_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*double -> XXX*/
@@ -10449,6 +10458,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     double_mdate,/*mysql date*/
     double_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*number -> XXX*/
@@ -10481,6 +10491,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     number_mdate,/*mysql date*/
     number_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*datetime -> XXX*/
@@ -10513,6 +10524,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     datetime_mdate,/*mysql date*/
     datetime_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*date -> XXX*/
@@ -10545,6 +10557,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     date_mdate,/*mysql date*/
     date_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*time -> XXX*/
@@ -10577,6 +10590,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     time_mdate,/*mysql date*/
     time_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*year -> XXX*/
@@ -10609,6 +10623,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     year_mdate,/*mysql date*/
     year_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*string -> XXX*/
@@ -10641,6 +10656,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     ob_objcast_string_collection,/*collection*/
     string_mdate,/*mysql date*/
     string_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*extend -> XXX*/
@@ -10673,6 +10689,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     cast_not_support,/*mysql date*/
     cast_not_support,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*unknown -> XXX*/
@@ -10705,6 +10722,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     unknown_other,/*mysql date*/
     unknown_other,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*text -> XXX*/
@@ -10737,6 +10755,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     ob_objcast_string_collection,/*collection*/
     text_mdate,/*mysql date*/
     text_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*bit -> XXX*/
@@ -10769,6 +10788,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     bit_mdate,/*mysql date*/
     bit_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*enum -> XXX*/
@@ -10801,6 +10821,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     enumset_mdate,/*mysql date*/
     enumset_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*enumset_inner -> XXX*/
@@ -10833,6 +10854,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     enumset_inner_mdate,/*mysql date*/
     enumset_inner_datetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*otimestamp -> XXX*/
@@ -10865,6 +10887,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*collection*/
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*raw -> XXX*/
@@ -10897,6 +10920,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*collection*/
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*interval -> XXX*/
@@ -10929,6 +10953,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*collection*/
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*rowid -> XXX*/
@@ -10961,6 +10986,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*collection*/
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*lob -> XXX*/
@@ -10993,6 +11019,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     cast_not_support,/*mysql date*/
     cast_not_support,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*json -> XXX*/
@@ -11025,6 +11052,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     json_mdate,/*mysql date*/
     json_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*geometry -> XXX*/
@@ -11057,6 +11085,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     geometry_mdate,/*mysql date*/
     geometry_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*udt -> XXX*/
@@ -11089,6 +11118,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*collection*/
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*decimalint-> XXX*/
@@ -11121,6 +11151,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_support,/*collection*/
     decimalint_mdate,/*mysql date*/
     decimalint_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*collection-> xxx*/
@@ -11153,6 +11184,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*collection*/
     cast_not_support,/*mysql date*/
     cast_not_support,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*mysql date-> xxx*/
@@ -11185,6 +11217,7 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*collection*/
     cast_identity,/*mysql date*/
     mdate_mdatetime,/*mysql datetime*/
+    cast_not_support,/*file*/
   },
   {
     /*mysql datetime-> xxx*/
@@ -11217,6 +11250,40 @@ ObObjCastFunc OB_OBJ_CAST[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*collection*/
     mdatetime_mdate,/*mysql date*/
     cast_identity,/*mysql datetime*/
+    cast_not_support,/*file*/
+  },
+  {
+    /*file -> XXX*/
+    cast_not_support,/*null*/
+    cast_not_support,/*int*/
+    cast_not_support,/*uint*/
+    cast_not_support,/*float*/
+    cast_not_support,/*double*/
+    cast_not_support,/*number*/
+    cast_not_support,/*datetime*/
+    cast_not_support,/*date*/
+    cast_not_support,/*time*/
+    cast_not_support,/*year*/
+    cast_not_support,/*string*/
+    cast_not_support,/*extend*/
+    cast_not_support,/*unknown*/
+    cast_not_support,/*text*/
+    cast_not_support,/*bit*/
+    cast_not_support,/*enumset*/
+    cast_not_support,/*enumset inner*/
+    cast_not_support,/*otimestamp*/
+    cast_not_support,/*raw*/
+    cast_not_support,/*interval*/
+    cast_not_support,/*rowid*/
+    cast_not_support,/*lob*/
+    cast_not_support,/*json*/
+    cast_not_support,/*geometry*/
+    cast_not_support,/*udt*/
+    cast_not_support,/*decimal int*/
+    cast_not_support,/*collection*/
+    cast_not_support,/*mysql date*/
+    cast_not_support,/*mysql datetime*/
+    cast_identity,/*file*/
   },
 
 };
@@ -12339,6 +12406,8 @@ int ObObjCaster::is_cast_monotonic(ObObjType t1, ObObjType t2, bool &is_monotoni
   if (OB_UNLIKELY(ob_is_invalid_obj_tc(tc1) || ob_is_invalid_obj_tc(tc2))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected type", K(ret), K(t1), K(t2), K(tc1), K(tc2));
+  } else if (tc1 == ObFileTC || tc2 == ObFileTC) {
+    is_monotonic = tc1 == tc2;
   } else {
     is_monotonic = CAST_MONOTONIC[tc1][tc2];
   }
@@ -12358,6 +12427,8 @@ int ObObjCaster::is_order_consistent(
                   || ob_is_invalid_obj_tc(to_class))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected object type class", K(ret), K(from), K(to));
+  } else if (from_class == ObFileTC || to_class == ObFileTC) {
+    result = from_class == to_class;
   } else if (from.is_string_or_lob_locator_type()
              && to.is_string_or_lob_locator_type()) {
     ObCollationType result_type = CS_TYPE_INVALID;

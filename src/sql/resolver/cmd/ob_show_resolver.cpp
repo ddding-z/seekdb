@@ -2106,6 +2106,7 @@ int ObShowResolver::replace_where_clause(ParseNode* node, const ObShowResolverCo
       case T_NCHAR:
       case T_RAW:
       case T_JSON:
+      case T_FILE:
       case T_GEOMETRY:
       case T_IEEE754_NAN:
       case T_IEEE754_INFINITE: {

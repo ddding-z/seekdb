@@ -124,6 +124,35 @@ int ObRawExprDeduceType::visit(ObOpPseudoColumnRawExpr &)
   return OB_SUCCESS;
 }
 
+static bool has_file_type(const ObIExprResTypes &types)
+{
+  bool found = false;
+  for (int64_t i = 0; !found && i < types.count(); ++i) {
+    found = ObFileType == types.at(i).get_type();
+  }
+  return found;
+}
+
+static bool has_file_operand(const ObRawExpr &expr)
+{
+  bool found = false;
+  for (int64_t i = 0; !found && i < expr.get_param_count(); ++i) {
+    const ObRawExpr *param = expr.get_param_expr(i);
+    if (nullptr != param) {
+      found = ObFileType == param->get_data_type();
+      if (!found && T_OP_ROW == param->get_expr_type()) {
+        found = has_file_operand(*param);
+      } else if (!found && T_REF_QUERY == param->get_expr_type()) {
+        const auto &column_types = static_cast<const ObQueryRefRawExpr *>(param)->get_column_types();
+        for (int64_t j = 0; !found && j < column_types.count(); ++j) {
+          found = ObFileType == column_types.at(j).get_type();
+        }
+      }
+    }
+  }
+  return found;
+}
+
 int ObRawExprDeduceType::visit(ObQueryRefRawExpr &expr)
 {
   int ret = OB_SUCCESS;
@@ -272,7 +301,7 @@ int ObRawExprDeduceType::calc_result_type_with_const_arg(
         break;
       }  // end switch
     }
-    if (OB_FAIL(ret) && my_session_->is_varparams_sql_prepare()) {
+    if (OB_FAIL(ret) && !has_file_type(types) && my_session_->is_varparams_sql_prepare()) {
       // the ps prepare stage does not do type deduction, and directly gives a default type.
       result_type.set_null();
       ret = OB_SUCCESS;
@@ -299,6 +328,9 @@ int ObRawExprDeduceType::calc_result_type_with_const_arg(
 bool need_calc_json(ObItemType item_type)
 {
   bool bool_ret = false;
+  if (T_FUN_SYS_TO_FILE == item_type) {
+    bool_ret = true;
+  }
   if (T_FUN_SYS < item_type && item_type < T_FUN_SYS_END) {
     if ((T_FUN_SYS_JSON_OBJECT <= item_type && item_type <= T_FUN_JSON_OBJECTAGG)
       || (T_FUN_SYS_JSON_SCHEMA_VALID <= item_type && item_type <= T_FUN_SYS_JSON_APPEND)) {
@@ -306,6 +338,19 @@ bool need_calc_json(ObItemType item_type)
     }
   }
   return bool_ret; // json calc type set to long text in other sql functions
+}
+
+static bool is_file_param_allowed(const ObItemType type)
+{
+  return T_OP_IS == type || T_OP_IS_NOT == type
+      || T_OP_CASE == type || T_OP_ARG_CASE == type || T_OP_ROW == type
+      || T_OP_OUTPUT_PACK == type || T_FUN_SYS_CAST == type
+      || T_FUN_SYS_COALESCE == type || T_FUN_SYS_IFNULL == type || T_FUN_SYS_NVL == type
+      || T_FUN_SYS_ISNULL == type || T_FUN_SYS_ANY_VALUE == type
+      || T_FUN_COLUMN_CONV == type || T_FUN_SYS_VALUES == type || T_FUN_SYS_DEFAULT == type
+      || T_FUN_SYS_FILE_URI == type || T_FUN_SYS_FILE_META == type
+      || T_FUN_SYS_AI_INPUT == type
+      || T_FUN_SYS_AI_MAP == type || T_FUN_SYS_AI_FILTER == type || T_FUN_SYS_AI_JOIN == type;
 }
 
 bool need_reject_geometry_type(ObItemType item_type)
@@ -429,6 +474,14 @@ int ObRawExprDeduceType::calc_result_type(ObNonTerminalRawExpr &expr,
   } else if (OB_FAIL(ori_types.assign(types))) {
   } else {
     op->set_raw_expr(&expr);
+    for (int64_t i = 0; OB_SUCC(ret) && i < types.count(); ++i) {
+      if (ObFileType == types.at(i).get_type() && !is_file_param_allowed(expr.get_expr_type())) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "whole-value SQL operations on FILE; use FILE_URI or FILE_META");
+        LOG_WARN("FILE argument is not supported by this SQL operation",
+                 K(ret), K(expr.get_expr_type()), K(i));
+      }
+    }
     if (is_lob_param_conversion_exempt(expr.get_expr_type())) {
       // do nothing
     } else {
@@ -578,7 +631,7 @@ int ObRawExprDeduceType::calc_result_type(ObNonTerminalRawExpr &expr,
                                       OB_MAX_DECIMAL_POSSIBLE_PRECISION));
       }
     }
-    if (OB_FAIL(ret) && my_session_->is_varparams_sql_prepare()) {
+    if (OB_FAIL(ret) && !has_file_type(types) && my_session_->is_varparams_sql_prepare()) {
       // the ps prepare stage does not do type deduction, and directly gives a default type.
       result_type.set_null();
       ret = OB_SUCCESS;
@@ -599,6 +652,11 @@ int ObRawExprDeduceType::calc_result_type(ObNonTerminalRawExpr &expr,
         }
 
         if (OB_FAIL(ret)) {
+        } else if ((ObFileType == from && ObFileType != to)
+                   || (ObFileType == to && ObFileType != from && ObNullType != from)) {
+          ret = OB_ERR_INVALID_TYPE_FOR_OP;
+          LOG_USER_ERROR(OB_ERR_INVALID_TYPE_FOR_OP, ob_obj_type_str(from), ob_obj_type_str(to));
+          LOG_WARN("implicit FILE conversion is forbidden", K(ret), K(i), K(from), K(to));
         } else if (from != to && !cast_supported(from, from_cs_type, to, to_cs_type)
           && !my_session_->is_varparams_sql_prepare()) {
           ret = OB_ERR_INVALID_TYPE_FOR_OP;
@@ -720,7 +778,8 @@ int ObRawExprDeduceType::visit(ObOpRawExpr &expr)
     expr.set_data_type(ObNullType);
   // During the prepare phase, some boolean expressions do not undergo recursive type deduction. 
   // T_OP_EQ, T_OP_NSEQ, T_OP_LE, T_OP_LT, T_OP_GE, T_OP_GT, T_OP_NE.
-  } else if (my_session_->is_varparams_sql_prepare() && T_OP_EQ <= expr.get_expr_type() && expr.get_expr_type() <= T_OP_NE) {
+  } else if (my_session_->is_varparams_sql_prepare() && !has_file_operand(expr)
+             && T_OP_EQ <= expr.get_expr_type() && expr.get_expr_type() <= T_OP_NE) {
     ObRawExprResType result_type;
     result_type.set_tinyint();
     result_type.set_precision(DEFAULT_PRECISION_FOR_BOOL);
@@ -1322,7 +1381,32 @@ int ObRawExprDeduceType::visit(ObAggFunRawExpr &expr)
   ObScale scale_increment_recover = -2;
   int ret = OB_SUCCESS;
   ObExprResType result_type;
-  if (OB_FAIL(check_group_aggr_param(expr))) {
+  for (int64_t i = 0; OB_SUCC(ret) && i < expr.get_real_param_count(); ++i) {
+    const ObRawExpr *param = expr.get_param_expr(i);
+    if (OB_ISNULL(param)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("aggregate parameter is null", K(ret), K(i));
+    } else if (ObFileType == param->get_data_type()
+               && (T_FUN_COUNT != expr.get_expr_type() || expr.is_param_distinct())) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "FILE aggregation other than COUNT(file)");
+      LOG_WARN("FILE cannot be compared, aggregated or deduplicated",
+               K(ret), K(expr.get_expr_type()), K(expr.is_param_distinct()));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < expr.get_order_items().count(); ++i) {
+    const ObRawExpr *key = expr.get_order_items().at(i).expr_;
+    if (OB_ISNULL(key)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("aggregate order key is null", K(ret), K(i));
+    } else if (ObFileType == key->get_data_type()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "ordering by FILE");
+      LOG_WARN("FILE cannot be an aggregate order key", K(ret));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(check_group_aggr_param(expr))) {
   } else {
     bool need_add_cast = false;
     bool override_calc_meta = true;

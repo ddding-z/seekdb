@@ -2292,7 +2292,17 @@ DEFINE_CMP_FUNCS_JSON_EXTEND();
 DEFINE_CMP_FUNCS_MYSQL_DATE_MYSQL_DATE();
 DEFINE_CMP_FUNCS_MYSQL_DATETIME_MYSQL_DATETIME();
 
-#define DEFINE_CMP_FUNCS_ENTRY(tc1, tc2) \
+template <>
+inline int ObObjCmpFuncs::cmp_func<ObFileTC, ObFileTC>(
+    const ObObj &obj1, const ObObj &obj2, const ObCompareCtx &cmp_ctx)
+{
+  UNUSED(cmp_ctx);
+  OBJ_TYPE_CLASS_CHECK(obj1, ObFileTC);
+  OBJ_TYPE_CLASS_CHECK(obj2, ObFileTC);
+  return INT_TO_CR(obj1.get_file().compare(obj2.get_file()));
+}
+
+#define DEFINE_CMP_FUNCS_ENTRY(tc1, tc2)      \
 { \
   ObObjCmpFuncs::cmp_op_func<tc1, tc2, CO_EQ>, \
   ObObjCmpFuncs::cmp_op_func<tc1, tc2, CO_LE>, \
@@ -2461,6 +2471,7 @@ DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObDecimalIntTC, ObEnumSetTC, ObMaxTC, ObMaxTC)
 
 DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObUserDefinedSQLTC, ObUserDefinedSQLTC, ObMaxTC, ObMaxTC)
 DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObCollectionSQLTC, ObCollectionSQLTC, ObMaxTC, ObMaxTC)
+DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObFileTC, ObFileTC, ObMaxTC, ObMaxTC)
 DEFINE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObExtendTC)
 DEFINE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC)
 DEFINE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObExtendTC)
@@ -2499,6 +2510,7 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC+1][ObMaxTC+1][CO_MAX+1] =
     DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
     DEFINE_CMP_FUNCS_ENTRY(ObNullTC, ObMaxTC), // mysql date
     DEFINE_CMP_FUNCS_ENTRY(ObNullTC, ObMaxTC), // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY(ObNullTC, ObMaxTC), // file
     DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // int
@@ -2851,6 +2863,7 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC+1][ObMaxTC+1][CO_MAX+1] =
     DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
     DEFINE_CMP_FUNCS_ENTRY(ObExtendTC, ObMaxTC), // mysql date
     DEFINE_CMP_FUNCS_ENTRY(ObExtendTC, ObMaxTC), // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY(ObExtendTC, ObMaxTC), // file
     DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // unknown
@@ -3396,6 +3409,39 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC+1][ObMaxTC+1][CO_MAX+1] =
     DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
     DEFINE_CMP_FUNCS_ENTRY(ObMySQLDateTimeTC, ObMySQLDateTimeTC), // mysql datetime
     DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
+  },
+  { // file
+    DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // uint
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // float
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // double
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // number
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // time
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // year
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // string
+    DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObExtendTC),
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // unknown
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // text
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // bit
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // enumset
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // enumset inner
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // otimestamp
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // raw
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // interval
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // rowid
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // lob
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // json
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // geometry
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // udt
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY(ObFileTC, ObFileTC),
+    DEFINE_CMP_FUNCS_ENTRY_NULL,
   },
    { // ObMaxTC
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // null

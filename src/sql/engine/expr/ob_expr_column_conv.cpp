@@ -261,6 +261,15 @@ int ObExprColumnConv::calc_result_typeN(ObExprResType &type,
       LOG_WARN("fail to calc enum set result type", K(ret));
     }
 
+    if (OB_SUCC(ret)
+        && ((ObFileType == types[0].get_type()
+             && ObFileType != types[4].get_type() && ObNullType != types[4].get_type())
+            || (ObFileType == types[4].get_type() && ObFileType != types[0].get_type()))) {
+      ret = OB_ERR_INVALID_TYPE_FOR_OP;
+      LOG_USER_ERROR(OB_ERR_INVALID_TYPE_FOR_OP, ob_obj_type_str(types[4].get_type()),
+                     ob_obj_type_str(types[0].get_type()));
+      LOG_WARN("FILE column assignment requires FILE or NULL", K(ret), K(types[0]), K(types[4]));
+    }
     if (OB_SUCC(ret) &&
         OB_FAIL(ObCharset::check_valid_implicit_convert(types[4].get_collation_type(),
                                                         types[1].get_collation_type()))) {

@@ -52,6 +52,10 @@ int ObExprIsBase::calc_result_type2(ObExprResType &type,
     if (OB_ISNULL(const_param2)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("second child of is expr is null", K(ret), K(const_param2));
+    } else if (ObFileType == type1.get_type() && !const_param2->get_value().is_null()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "FILE truth-value tests; use IS NULL or IS NOT NULL");
+      LOG_WARN("FILE only supports IS NULL and IS NOT NULL", K(ret));
     } else if (ObDoubleType == const_param2->get_value().get_type()) {
         type1.set_calc_type(ObDoubleType);
         type1.set_calc_accuracy(type1.get_accuracy());

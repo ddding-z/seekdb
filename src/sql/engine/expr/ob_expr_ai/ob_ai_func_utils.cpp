@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_ai_func_utils.h"
+#include "sql/engine/basic/ob_semantic_media.h"
 #include "ob_ai_func_client.h"
 #include "common/json_type/ob_json_schema.h"
 #include "query/engine/expr/ob_ai_model_resolver.h"
@@ -177,6 +178,112 @@ int ObOpenAIUtils::ObOpenAIComplete::get_body(common::ObIAllocator &allocator,
     } else {
       body = body_obj;
     }
+  }
+  return ret;
+}
+
+int ObOpenAIUtils::ObOpenAIComplete::get_media_body(ObIAllocator &allocator, ObString &model,
+                                                   ObJsonArray &parts, ObJsonObject *config,
+                                                   ObJsonObject *&body)
+{
+  int ret = OB_SUCCESS;
+  ObJsonObject *request = nullptr;
+  ObJsonString *model_node = nullptr;
+  ObJsonArray *messages = nullptr;
+  ObJsonArray *content = nullptr;
+  ObJsonObject *message = nullptr;
+  ObJsonString *role = nullptr;
+  ObString role_name("user");
+  if (model.empty() || parts.element_count() == 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (nullptr != config && (nullptr != config->get_value("model") ||
+      nullptr != config->get_value("messages"))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "FILE input options must not override model or messages");
+  } else if (OB_FAIL(prepare_output_schema(allocator, config))) {
+  } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(allocator, request))) {
+  } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, model, model_node))) {
+  } else if (OB_FAIL(request->add("model", model_node))) {
+  } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, messages))) {
+  } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, content))) {
+  } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(allocator, message))) {
+  } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, role_name, role))) {
+  } else if (OB_FAIL(message->add("role", role))) {
+  } else if (OB_FAIL(message->add("content", content))) {
+  } else if (OB_FAIL(messages->append(message))) {
+  } else if (OB_FAIL(request->add("messages", messages))) {
+  }
+  for (uint64_t index = 0; OB_SUCC(ret) && index < parts.element_count(); ++index) {
+    ObJsonNode *part = parts.get_value(index);
+    ObJsonObject *block = nullptr;
+    ObJsonNode *kind = nullptr;
+    ObJsonNode *data = nullptr;
+    if (nullptr == part || part->json_type() != ObJsonNodeType::J_OBJECT) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      auto *object = static_cast<ObJsonObject *>(part);
+      kind = object->get_value("type");
+      data = object->get_value("data");
+      if (nullptr == kind || kind->json_type() != ObJsonNodeType::J_STRING ||
+          nullptr == data || data->json_type() != ObJsonNodeType::J_STRING) {
+        ret = OB_INVALID_ARGUMENT;
+      } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(allocator, block))) {
+      } else {
+        const ObString kind_name(kind->get_data_length(), kind->get_data());
+        ObString wire_kind;
+        if (kind_name == "text") {
+          wire_kind.assign_ptr("text", 4);
+          if (OB_FAIL(block->add("text", data))) {
+          }
+        } else if (kind_name == "image") {
+          wire_kind.assign_ptr("image_url", 9);
+          ObJsonNode *mime = object->get_value("mime_type");
+          ObJsonBuffer uri(&allocator);
+          ObJsonObject *image = nullptr;
+          ObJsonString *url = nullptr;
+          if (nullptr == mime || mime->json_type() != ObJsonNodeType::J_STRING) {
+            ret = OB_INVALID_ARGUMENT;
+          } else if (OB_FAIL(uri.append("data:"))) {
+          } else if (OB_FAIL(uri.append(mime->get_data(), mime->get_data_length()))) {
+          } else if (OB_FAIL(uri.append(";base64,"))) {
+          } else if (OB_FAIL(uri.append(data->get_data(), data->get_data_length()))) {
+          } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(allocator, image))) {
+          } else {
+            ObString data_uri;
+            if (OB_FAIL(ob_write_string(allocator, uri.string(), data_uri))) {
+            } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, data_uri, url))) {
+            } else if (OB_FAIL(image->add("url", url))) {
+            } else if (OB_FAIL(block->add("image_url", image))) {
+            }
+          }
+        } else if (kind_name == "audio") {
+          wire_kind.assign_ptr("input_audio", 11);
+          ObJsonNode *format = object->get_value("format");
+          ObJsonObject *audio = nullptr;
+          if (nullptr == format || format->json_type() != ObJsonNodeType::J_STRING) {
+            ret = OB_INVALID_ARGUMENT;
+          } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(allocator, audio))) {
+          } else if (OB_FAIL(audio->add("data", data))) {
+          } else if (OB_FAIL(audio->add("format", format))) {
+          } else if (OB_FAIL(block->add("input_audio", audio))) {
+          }
+        } else {
+          ret = OB_NOT_SUPPORTED;
+        }
+        ObJsonString *type = nullptr;
+        if (OB_SUCC(ret) && OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, wire_kind, type))) {
+        } else if (OB_SUCC(ret) && OB_FAIL(block->add("type", type))) {
+        } else if (OB_SUCC(ret) && OB_FAIL(content->append(block))) {
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(ObAIFuncJsonUtils::compact_json_object(allocator, config, request))) {
+  } else if (OB_SUCC(ret)) {
+    body = request;
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to construct FILE completion request", K(ret));
   }
   return ret;
 }
@@ -1570,6 +1677,7 @@ int ObAIFuncUtils::get_ai_func_info(ObIAllocator &allocator, const ObString &mod
 void ObAIFuncUtils::stop_async_scheduler()
 {
   ObAIFuncClient::stop_async_scheduler();
+  sql::SemanticMediaRuntime::stop_scheduler();
 }
 
 int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObString &result)
@@ -1629,7 +1737,8 @@ int ObAIFuncModel::call_completion_vector(ObArray<ObString> &prompts, ObJsonObje
 }
 
 int ObAIFuncModel::start_completion_batch(ObArray<ObString> &prompts, ObJsonObject *config,
-                                         AIFuncBatch &batch)
+                                         AIFuncBatch &batch,
+                                         const ObIArray<ObJsonArray *> *media_parts)
 {
   int ret = OB_SUCCESS;
   batch.cancel();
@@ -1641,7 +1750,8 @@ int ObAIFuncModel::start_completion_batch(ObArray<ObString> &prompts, ObJsonObje
   ObAIFuncClient &client = batch.client_;
   ObString unencrypted_access_key;
   ObString request_model_name = get_request_model_name();
-  if (&batch.allocator_ != allocator_ || prompts.empty()) {
+  if (&batch.allocator_ != allocator_ || prompts.empty() ||
+      (nullptr != media_parts && media_parts->count() != prompts.count())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (!is_completion_type()) {
     ret = OB_INVALID_ARGUMENT;
@@ -1654,7 +1764,15 @@ int ObAIFuncModel::start_completion_batch(ObArray<ObString> &prompts, ObJsonObje
     batch.provider_ = complete_provider;
     for (int64_t row = 0; OB_SUCC(ret) && row < prompts.count(); ++row) {
       ObString prompt = prompts.at(row);
-      if (OB_FAIL(complete_provider->get_body(*allocator_, request_model_name, prompt_str, prompt, config, body))) {
+      ObJsonArray *parts = nullptr == media_parts ? nullptr : media_parts->at(row);
+      if (nullptr != parts && !ObAIFuncUtils::ob_provider_check(
+          endpoint_info_.get_provider(), ObAIFuncProviderUtils::OPENAI)) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "FILE inputs currently require the openai provider");
+      } else if (nullptr != parts &&
+          OB_FAIL(complete_provider->get_media_body(*allocator_, request_model_name, *parts, config, body))) {
+      } else if (nullptr == parts &&
+          OB_FAIL(complete_provider->get_body(*allocator_, request_model_name, prompt_str, prompt, config, body))) {
       } else if (OB_FAIL(body_array.push_back(body))) {
       } else if (OB_FAIL(batch.input_counts_.push_back(1))) {
       }

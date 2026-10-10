@@ -1719,6 +1719,7 @@ public:
   void reset_sysvars() { memset(sysvar_array_, 0, sizeof(sysvar_array_)); }
   int64_t get_convert_size() const;
   int add_sysvar_schema(const share::schema::ObSysVarSchema &sysvar_schema);
+  int add_default_system_variable(ObSysVarClassType var_type);
   int load_default_system_variable();
   int64_t get_sysvar_count() const { return ObSysVarMeta::ALL_SYS_VARS_COUNT; }
   int64_t get_real_sysvar_count() const;

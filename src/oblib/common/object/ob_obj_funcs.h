@@ -24,6 +24,7 @@
 #include "common/json_type/ob_json_bin.h"
 #include "common/udt/ob_array_type.h"
 #include "common/object/ob_object.h"
+#include "common/object/file_ref.h"
 #include "lib/encode/ob_base64_encode.h"
 
 namespace oceanbase
@@ -1347,6 +1348,116 @@ static uint64_t varchar_murmurhash(const ObObj &obj, const ObCollationType cs_ty
 
 DEF_VARCHAR_FUNCS(ObVarcharType, varchar, ObString);
 DEF_VARCHAR_FUNCS(ObCharType, char, ObString);
+
+template <>
+inline int obj_print_plain_str<ObFileType>(const ObObj &obj, char *buffer, int64_t length,
+                                           int64_t &pos, const ObObjPrintParams &params)
+{
+  UNUSED(params);
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator;
+  ObString json;
+  if (OB_FAIL(FileRefCodec::to_json(allocator, obj.get_file(), json))) {
+  } else {
+    ret = databuff_printf(buffer, length, pos, "%.*s", json.length(), json.ptr());
+  }
+  return ret;
+}
+
+template <>
+inline int obj_print_str<ObFileType>(const ObObj &obj, char *buffer, int64_t length,
+                                     int64_t &pos, const ObObjPrintParams &params)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator;
+  ObString json;
+  if (OB_FAIL(FileRefCodec::to_json(allocator, obj.get_file(), json))) {
+  } else {
+    ObObj text;
+    text.set_varchar(json);
+    text.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+    text.set_collation_level(CS_LEVEL_COERCIBLE);
+    ret = obj_print_sql<ObVarcharType>(text, buffer, length, pos, params);
+  }
+  return ret;
+}
+
+template <>
+inline int obj_print_sql<ObFileType>(const ObObj &obj, char *buffer, int64_t length,
+                                     int64_t &pos, const ObObjPrintParams &params)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(databuff_printf(buffer, length, pos, "TO_FILE("))) {
+  } else if (OB_FAIL(obj_print_str<ObFileType>(obj, buffer, length, pos, params))) {
+  } else {
+    ret = databuff_printf(buffer, length, pos, ")");
+  }
+  return ret;
+}
+
+template <>
+inline int obj_print_json<ObFileType>(const ObObj &obj, char *buffer, int64_t length,
+                                      int64_t &pos, const ObObjPrintParams &params)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(databuff_printf(buffer, length, pos, "{\"FILE\":"))) {
+  } else if (OB_FAIL(obj_print_plain_str<ObFileType>(obj, buffer, length, pos, params))) {
+  } else {
+    ret = databuff_printf(buffer, length, pos, "}");
+  }
+  return ret;
+}
+
+DEF_STRING_CS_FUNCS(ObFileType);
+
+template <typename T, typename P>
+struct ObjHashCalculator<ObFileType, T, P>
+{
+  static int calc_hash_value(const P &value, const uint64_t seed, uint64_t &res)
+  {
+    const ObString bytes = value.get_string();
+    res = ObCharset::hash(CS_TYPE_BINARY, bytes.ptr(), bytes.length(), seed,
+                         false, T::is_varchar_hash ? T::hash : NULL);
+    return OB_SUCCESS;
+  }
+};
+
+template <>
+inline int obj_val_serialize<ObFileType>(const ObObj &obj, char *buf,
+                                        const int64_t buf_len, int64_t &pos)
+{
+  int ret = OB_SUCCESS;
+  const ObString bytes = obj.get_file();
+  FileRef ref;
+  if (OB_FAIL(FileRefCodec::decode(bytes, ref))) {
+  } else {
+    ret = bytes.serialize(buf, buf_len, pos);
+  }
+  return ret;
+}
+
+template <>
+inline int obj_val_deserialize<ObFileType>(ObObj &obj, const char *buf,
+                                          const int64_t data_len, int64_t &pos)
+{
+  int ret = OB_SUCCESS;
+  ObString bytes;
+  FileRef ref;
+  if (OB_FAIL(bytes.deserialize(buf, data_len, pos))) {
+  } else if (OB_FAIL(FileRefCodec::decode(bytes, ref))) {
+  } else {
+    const ObObjMeta meta = obj.get_meta();
+    obj.set_file(bytes);
+    obj.set_meta_type(meta);
+  }
+  return ret;
+}
+
+template <>
+inline int64_t obj_val_get_serialize_size<ObFileType>(const ObObj &obj)
+{
+  return obj.get_file().get_serialize_size();
+}
 
 #define DEF_ENUMSET_INNER_PRINT_FUNCS(OBJTYPE)                          \
   template <>                                                           \

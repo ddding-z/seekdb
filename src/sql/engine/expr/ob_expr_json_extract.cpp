@@ -128,7 +128,8 @@ int ObExprJsonExtract::eval_json_extract(const ObExpr &expr, ObEvalCtx &ctx, ObD
     }
   }
 
-  if (OB_UNLIKELY(OB_FAIL(ret))) {
+  if (ret == OB_EAGAIN) {
+  } else if (OB_UNLIKELY(OB_FAIL(ret))) {
     if (ret == OB_ERR_INVALID_TYPE_FOR_JSON) {
       LOG_USER_ERROR(OB_ERR_INVALID_TYPE_FOR_JSON, 1, "json_extract");
     } else if (ret == OB_ERR_INVALID_JSON_CHARSET) {

@@ -1,0 +1,32 @@
+load("//bazel:seekdb_cc_test.bzl", cc_test = "seekdb_cc_test")
+load(
+    "//bazel:defs.bzl",
+    "SEEKDB_OBLIB_COPTS",
+    "SEEKDB_OBLIB_LOCAL_DEFINES",
+    "seekdb_test_interface",
+    cc_library = "seekdb_cc_library",
+)
+
+package(default_visibility = ["//visibility:private"])
+
+seekdb_test_interface(
+    name = "file_ref_test_headers",
+    deps = ["//src/oblib:oblib_unit_test_internal_headers"],
+)
+
+cc_library(
+    name = "file_ref_test_source",
+    testonly = True,
+    srcs = ["test_file_ref.cpp"],
+    deps = [":file_ref_test_headers"],
+    copts = SEEKDB_OBLIB_COPTS,
+    local_defines = SEEKDB_OBLIB_LOCAL_DEFINES,
+    features = ["-layering_check"],
+)
+
+cc_test(
+    name = "test_file_ref",
+    deps = [
+        ":file_ref_test_source",
+    ],
+)

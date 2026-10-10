@@ -4956,6 +4956,7 @@ ObCollationLevel ObRawExprUtils::get_column_collation_level(const common::ObObjT
   if (ob_is_string_type(type)
       || ob_is_enumset_tc(type)
       || ob_is_json_tc(type)
+      || ObFileType == type
       || ob_is_geometry_tc(type)) {
     return CS_LEVEL_IMPLICIT;
   } else {
@@ -5099,6 +5100,7 @@ int ObRawExprUtils::is_expr_comparable(const ObRawExpr *expr, bool &can_be)
   } else if (ob_is_text_tc(expr->get_data_type())
             || ob_is_json_tc(expr->get_data_type())
             || ob_is_geometry_tc(expr->get_data_type())
+            || ObFileType == expr->get_data_type()
             || ob_is_extend(expr->get_data_type())) {
     can_be = false;
   }

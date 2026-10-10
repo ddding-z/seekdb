@@ -825,6 +825,7 @@ inline int ObDatum::from_obj(const ObObj &obj)
       case ObJsonType:
       case ObGeometryType:
       case ObUserDefinedSQLType:
+      case ObFileType:
       case ObCollectionSQLType: {
         obj2datum<OBJ_DATUM_STRING>(obj);
         break;
@@ -962,6 +963,7 @@ inline int ObDatum::to_obj(ObObj &obj, const ObObjMeta &meta) const
       case ObJsonType:
       case ObGeometryType:
       case ObUserDefinedSQLType:
+      case ObFileType:
       case ObCollectionSQLType: {
         datum2obj<OBJ_DATUM_STRING>(obj);
         break;

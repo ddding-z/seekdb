@@ -20,6 +20,7 @@
 #include <cstring>
 
 #include "common/ob_field.h"
+#include "common/object/file_ref.h"
 #include "common/json_type/ob_json_bin.h"
 #include "common/timezone/ob_time_convert.h"
 #include "lib/allocator/ob_allocator.h"
@@ -87,6 +88,7 @@ static const ObMySQLTypeMap type_maps_[ObMaxType] =
   {EMySQLFieldType::MYSQL_TYPE_STRING,     0, 0},   /* ObCollectionSQLType, will cast to string */
   {EMySQLFieldType::MYSQL_TYPE_DATE,      BINARY_FLAG, 0}, /* ObMySQLDateType */
   {EMySQLFieldType::MYSQL_TYPE_DATETIME,  BINARY_FLAG, 0}, /* ObMySQLDateTimeType */
+  {EMySQLFieldType::MYSQL_TYPE_JSON, BLOB_FLAG | BINARY_FLAG, 0}, /* ObFileType */
   /* ObMaxType */
 };
 
@@ -453,6 +455,15 @@ int ObSMUtils::build_cell_value(const ObObj &obj, MYSQL_PROTOCOL_TYPE type,
     case ObStringTC:
     case ObLobTC: {
       ret = set_borrowed_lenenc_bytes(obj.get_string(), out);
+      break;
+    }
+    case ObFileTC: {
+      ObString json;
+      if (OB_FAIL(FileRefCodec::to_json(scratch_allocator, obj.get_file(), json))) {
+        OB_LOG(WARN, "failed to export FILE reference", K(ret));
+      } else {
+        ret = set_borrowed_lenenc_bytes(json, out);
+      }
       break;
     }
     case ObJsonTC: {

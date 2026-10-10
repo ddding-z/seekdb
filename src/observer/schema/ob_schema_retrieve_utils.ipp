@@ -3234,7 +3234,7 @@ int ObSchemaRetrieveUtils::fill_mock_fk_parent_table_schema(T &result,
   return ret;
 }
 
-int ObSchemaRetrieveUtils::fill_sys_table_lob_tid(ObTableSchema &table)
+inline int ObSchemaRetrieveUtils::fill_sys_table_lob_tid(ObTableSchema &table)
 {
   int ret = OB_SUCCESS;
   const int64_t table_id = table.get_table_id();
@@ -3333,6 +3333,7 @@ int ObSchemaRetrieveUtils::fill_ai_model_schema(T &result,
 
 
   int64_t type = 0;
+  int64_t input_modalities = AiInputModality::TEXT;
 
   EXTRACT_INT_FIELD_TO_CLASS_MYSQL(result, model_id, schema, int64_t);
   EXTRACT_INT_FIELD_MYSQL(result, "is_deleted", is_deleted, bool);
@@ -3342,10 +3343,21 @@ int ObSchemaRetrieveUtils::fill_ai_model_schema(T &result,
     EXTRACT_INT_FIELD_MYSQL(result, "type", type, int64_t);
     EXTRACT_VARCHAR_FIELD_TO_CLASS_MYSQL(result, name, schema);
     EXTRACT_VARCHAR_FIELD_TO_CLASS_MYSQL(result, model_name, schema);
+    EXTRACT_INT_FIELD_MYSQL_WITH_DEFAULT_VALUE(
+        result, "input_modalities", input_modalities, int64_t,
+        false /* skip null error */, true /* skip missing legacy column */, AiInputModality::TEXT);
   }
 
   if (OB_SUCC(ret)) {
     schema.set_type(EndpointType::convert_type_from_int(type));
+    if (!is_deleted) {
+      if (!AiInputModality::is_valid(input_modalities, schema.get_type())) {
+        ret = OB_ERR_UNEXPECTED;
+        SHARE_SCHEMA_LOG(WARN, "invalid stored AI model input modalities", KR(ret), K(type), K(input_modalities));
+      } else {
+        schema.set_input_modalities(input_modalities);
+      }
+    }
   }
 
   return ret;

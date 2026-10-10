@@ -126,9 +126,9 @@ int ObExprJsonValid::eval_json_valid(const ObExpr &expr, ObEvalCtx &ctx, ObDatum
   ObExpr *arg = expr.args_[0];
 
   if (OB_FAIL(arg->eval(ctx, datum))) {
-    LOG_WARN("eval json arg failed", K(ret));
-    res.set_int(0);
-    ret = OB_SUCCESS;
+    if (ret != OB_EAGAIN) {
+      LOG_WARN("eval json arg failed", K(ret));
+    }
   } else {
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     

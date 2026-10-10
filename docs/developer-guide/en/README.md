@@ -35,6 +35,7 @@ Before you start developing a big feature, it's recommended to read these docume
 1. [Logging System](logging.md) - How logging works in OceanBase seekdb
 2. [Memory Management](memory.md) - Memory management strategies and best practices
 3. [Basic Data Structures](container.md) - Core data structures used in the codebase
+4. [AI model input modalities](ai-model-modalities.md) - Registration, capability persistence, and upgrade integration
 
 ### 4. Contribute to OceanBase seekdb
 

@@ -1,4 +1,4 @@
-static constexpr ObObjType RELATIONAL_RESULT_TYPE[ObMaxType][ObMaxType] =
+static constexpr ObObjType LEGACY_RELATIONAL_RESULT_TYPE[ObFileType][ObFileType] =
 {
   /*NullType*/
   {
@@ -2006,4 +2006,7 @@ static constexpr ObObjType RELATIONAL_RESULT_TYPE[ObMaxType][ObMaxType] =
 
 };
 
+static_assert(is_array_fully_initialized(LEGACY_RELATIONAL_RESULT_TYPE, ObFileType), "RELATIONAL_RESULT_TYPE is partially initlized");
+static constexpr auto FILE_RELATIONAL_RESULT_TYPE = sql::extend_file_type_map(LEGACY_RELATIONAL_RESULT_TYPE);
+static constexpr auto &RELATIONAL_RESULT_TYPE = FILE_RELATIONAL_RESULT_TYPE.values_;
 static_assert(is_array_fully_initialized(RELATIONAL_RESULT_TYPE, ObMaxType), "RELATIONAL_RESULT_TYPE is partially initlized");

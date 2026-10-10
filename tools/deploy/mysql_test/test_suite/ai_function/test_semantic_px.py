@@ -136,6 +136,34 @@ class SemanticPXContracts(semantic.SemanticContracts):
         gate.set()
         self.assert_map_rows(pending.result(timeout=20), self.mock_a)
 
+    def test_parallel_sorted_map_preserves_order_and_shares_admission(self):
+        pending, gate, _records = self.start_held_map(
+            statement=self.statement() + " ORDER BY prompt DESC")
+        gate.set()
+        rows = pending.result(timeout=20)
+        expected_order = sorted(range(ROWS), key=lambda index: self.prompts[index], reverse=True)
+        self.assertEqual([row[0] for row in rows], expected_order)
+        self.assert_map_rows(rows, self.mock_a)
+
+    def test_parallel_sorted_json_map_preserves_projection_and_admission(self):
+        statement = (
+            "SELECT /*+ PARALLEL(4) OPT_PARAM('rowsets_max_rows', 16) */ id, "
+            "JSON_UNQUOTE(JSON_EXTRACT(AI_MAP('semantic_a', prompt), '$.label')) "
+            "FROM semantic_px_inputs ORDER BY prompt DESC")
+
+        def configure(gate):
+            for index, prompt in enumerate(self.prompts):
+                self.mock_a.scenarios[prompt] = [Reply(
+                    body=completion(json.dumps({"label": f"json-result-{index}"})), gate=gate)]
+
+        pending, gate, _records = self.start_held_map(statement=statement, configure=configure)
+        gate.set()
+        expected_order = sorted(range(ROWS), key=lambda index: self.prompts[index], reverse=True)
+        self.assertEqual(pending.result(timeout=20),
+                         tuple((index, f"json-result-{index}") for index in expected_order))
+        self.assert_counts(self.mock_a, self.prompts)
+        self.assertFalse(self.mock_b.requests)
+
     def test_parallel_join_preserves_pairs_and_shares_admission(self):
         rule = "Keep even matching pairs."
         statement = (
@@ -232,6 +260,20 @@ class SemanticPXContracts(semantic.SemanticContracts):
         self.assert_counts(self.mock_a, self.prompts)
         self.assert_counts(self.mock_b, [answer(prompt) for prompt in self.prompts])
 
+    def test_parallel_sorted_nested_maps_preserve_dependencies_and_order(self):
+        statement = ("SELECT /*+ PARALLEL(4) OPT_PARAM('rowsets_max_rows', 16) */ "
+                     "id, AI_MAP('semantic_b', AI_MAP('semantic_a', prompt)) "
+                     "FROM semantic_px_inputs ORDER BY prompt DESC")
+        pending, gate, _records = self.start_held_map(statement=statement, admitted_rows=64)
+        self.assertEqual(self.mock_b.requests, [],
+                         "sorted dependent maps must wait for their own input results")
+        gate.set()
+        expected_order = sorted(range(ROWS), key=lambda index: self.prompts[index], reverse=True)
+        self.assertEqual(pending.result(timeout=20),
+                         tuple((index, answer(answer(self.prompts[index]))) for index in expected_order))
+        self.assert_counts(self.mock_a, self.prompts)
+        self.assert_counts(self.mock_b, [answer(prompt) for prompt in self.prompts])
+
     def test_parallel_having_alias_materializes_skipped_projection_without_replay(self):
         statement = ("SELECT /*+ PARALLEL(4) OPT_PARAM('rowsets_max_rows', 16) */ "
                      "id, AI_FILTER('semantic_a', prompt) AS b FROM semantic_px_inputs "
@@ -256,14 +298,35 @@ class SemanticPXContracts(semantic.SemanticContracts):
         pending.expect_sql_error(self, 1317, timeout=5)
         self.assert_recovery()
 
+    def test_sorted_qc_cancel_cleans_suspended_px_tasks_and_recovers(self):
+        pending, _gate, _records = self.start_held_map(
+            statement=self.statement() + " ORDER BY prompt DESC")
+        self.kill_query()
+        pending.expect_sql_error(self, 1317, timeout=5)
+        self.assert_recovery()
+
     def test_deadline_cleans_all_suspended_px_tasks_and_recovers(self):
         self.cursor.execute("SET ob_query_timeout=3000000")
         pending, _gate, _records = self.start_held_map()
         pending.expect_sql_error(self, 4012, timeout=5)
         self.assert_recovery()
 
+    def test_sorted_deadline_cleans_suspended_px_tasks_and_recovers(self):
+        self.cursor.execute("SET ob_query_timeout=3000000")
+        pending, _gate, _records = self.start_held_map(
+            statement=self.statement() + " ORDER BY prompt DESC")
+        pending.expect_sql_error(self, 4012, timeout=5)
+        self.assert_recovery()
+
     def test_provider_failure_cleans_suspended_px_tasks_and_recovers(self):
         pending, gate, _records = self.start_held_map(status=400)
+        gate.set()
+        pending.expect_sql_error(self, 4216, timeout=5)
+        self.assert_recovery()
+
+    def test_sorted_provider_failure_cleans_suspended_px_tasks_and_recovers(self):
+        pending, gate, _records = self.start_held_map(
+            status=400, statement=self.statement() + " ORDER BY prompt DESC")
         gate.set()
         pending.expect_sql_error(self, 4216, timeout=5)
         self.assert_recovery()

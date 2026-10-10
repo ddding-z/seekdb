@@ -1,4 +1,4 @@
-static constexpr ObObjType SUM_RESULT_TYPE[ObMaxType] =
+static constexpr ObObjType LEGACY_SUM_RESULT_TYPE[ObFileType] =
 {
     ObDoubleType,        /*NullType  */
     ObNumberType,        /*TinyIntType  */
@@ -45,4 +45,7 @@ static constexpr ObObjType SUM_RESULT_TYPE[ObMaxType] =
     ObNumberType,      /* ObMySQLDateTimeType */
 };
 
+static_assert(is_array_fully_initialized(LEGACY_SUM_RESULT_TYPE), "SUM_RESULT_TYPE is partially initlized");
+static constexpr auto FILE_SUM_RESULT_TYPE = sql::extend_file_type_map(LEGACY_SUM_RESULT_TYPE);
+static constexpr auto &SUM_RESULT_TYPE = FILE_SUM_RESULT_TYPE.values_;
 static_assert(is_array_fully_initialized(SUM_RESULT_TYPE), "SUM_RESULT_TYPE is partially initlized");

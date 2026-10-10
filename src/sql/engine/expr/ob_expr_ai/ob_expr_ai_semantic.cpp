@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_expr_ai_semantic.h"
 #include "ob_expr_ai_complete.h"
+#include "ob_expr_ai_input.h"
+#include "common/object/file_ref.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
 
 namespace oceanbase
@@ -28,7 +30,7 @@ namespace
 {
 thread_local ISemanticExprRuntime *semantic_expr_runtime = nullptr;
 
-int calc_semantic_input_type(ObExprResType &type, bool allow_json)
+int calc_semantic_input_type(ObExprResType &type, bool allow_json, bool allow_file = false)
 {
   int ret = OB_SUCCESS;
   if (type.get_type() == ObNullType) {
@@ -36,6 +38,7 @@ int calc_semantic_input_type(ObExprResType &type, bool allow_json)
     type.set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
   } else if (ob_is_string_type(type.get_type())) {
     type.set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+  } else if (allow_file && type.get_type() == ObFileType) {
   } else if (!allow_json || !ob_is_json(type.get_type())) {
     ret = OB_ERR_INVALID_TYPE_FOR_OP;
     LOG_WARN("invalid semantic input type", K(ret), K(type), K(allow_json));
@@ -59,10 +62,10 @@ int calc_semantic_result_type(ObExprResType &type, ObExprResType *types,
   } else {
     types[0].set_calc_type(ObVarcharType);
     types[0].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
-    if (OB_FAIL(calc_semantic_input_type(types[1], !is_join))) {
+    if (OB_FAIL(calc_semantic_input_type(types[1], !is_join, !is_join))) {
     }
     for (int64_t index = 2; OB_SUCC(ret) && index < required_args; ++index) {
-      ret = calc_semantic_input_type(types[index], true);
+      ret = calc_semantic_input_type(types[index], true, true);
     }
     if (OB_SUCC(ret) && param_num == required_args + 1) {
       const ObObjType input_type = types[required_args].get_type();
@@ -299,6 +302,53 @@ int prepare_semantic_join_input(const ObExpr &expr, ObEvalCtx &ctx, MultimodeAll
   return ret;
 }
 
+int append_semantic_argument(const ObExpr &expr, uint16_t index, ObEvalCtx &ctx,
+                             MultimodeAlloctor &allocator, SemanticInput &input,
+                             bool &ordered)
+{
+  int ret = OB_SUCCESS;
+  const ObExpr &argument = *expr.args_[index];
+  ObDatum *datum = nullptr;
+  ordered = false;
+  if (OB_FAIL(allocator.eval_arg(&argument, ctx, datum))) {
+  } else if (datum->is_null()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "demanded semantic inputs must not be SQL NULL");
+  } else if (argument.datum_meta_.type_ == ObFileType) {
+    FileRef reference;
+    const ObString encoded = datum->get_string();
+    if (OB_FAIL(FileRefCodec::decode(encoded, reference))) {
+    } else if (OB_FAIL(input.append(allocator, SemanticInputPart::FILE, encoded))) {
+    } else {
+      ordered = true;
+    }
+  } else if (argument.datum_meta_.type_ == ObJsonType) {
+    ObIJsonBase *document = nullptr;
+    bool is_null = false;
+    if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, allocator, index, document, is_null))) {
+    } else if (is_null || nullptr == document) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "demanded semantic inputs must not be SQL NULL");
+    } else if (OB_FAIL(SemanticInput::is_input_object(*document, ordered))) {
+    } else if (ordered) {
+      ordered = true;
+      ret = input.append_json(allocator, *document);
+    } else {
+      ObJsonBuffer buffer(&allocator);
+      if (OB_FAIL(append_compact_semantic_json(static_cast<ObJsonNode *>(document), buffer))) {
+      } else if (OB_FAIL(input.append(allocator, SemanticInputPart::TEXT, buffer.string()))) {
+      }
+    }
+  } else {
+    ObString text;
+    if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, allocator, *datum,
+        argument.datum_meta_, argument.obj_meta_.has_lob_header(), text))) {
+    } else if (OB_FAIL(input.append(allocator, SemanticInputPart::TEXT, text))) {
+    }
+  }
+  return ret;
+}
+
 int get_semantic_expr_runtime(const ObExpr &expr, ISemanticExprRuntime *&runtime)
 {
   int ret = OB_SUCCESS;
@@ -470,6 +520,110 @@ int SemanticExprUtils::prepare_input(const ObExpr &expr, ObEvalCtx &ctx,
     if (OB_SUCC(ret) && prepare_config && (expr.type_ == T_FUN_SYS_AI_FILTER || is_join) &&
         OB_FAIL(prepare_semantic_boolean_config(allocator, config, expr.type_))) {
     }
+  }
+  return ret;
+}
+
+int SemanticExprUtils::prepare_request_input(const ObExpr &expr, ObEvalCtx &ctx,
+                                             MultimodeAlloctor &allocator, ObString &model_id,
+                                             SemanticInput &input, ObJsonObject *&config,
+                                             bool prepare_config)
+{
+  int ret = OB_SUCCESS;
+  const bool is_join = expr.type_ == T_FUN_SYS_AI_JOIN;
+  const uint32_t required_args = is_join ? 4 : 2;
+  bool ordered = false;
+  config = nullptr;
+  if (!is_semantic(expr.type_) || expr.arg_cnt_ < required_args ||
+      expr.arg_cnt_ > required_args + 1 || nullptr == expr.args_) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  for (uint32_t index = 0; OB_SUCC(ret) && index < expr.arg_cnt_; ++index) {
+    if (nullptr == expr.args_[index]) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  }
+  if (OB_SUCC(ret) && is_join) {
+    SemanticInput left;
+    SemanticInput right;
+    bool left_ordered = false;
+    bool right_ordered = false;
+    if (OB_FAIL(append_semantic_argument(expr, 2, ctx, allocator, left, left_ordered))) {
+    } else if (OB_FAIL(append_semantic_argument(expr, 3, ctx, allocator, right, right_ordered))) {
+    } else if (left_ordered || right_ordered) {
+      ordered = true;
+      SemanticInput rule;
+      bool rule_ordered = false;
+      if (OB_FAIL(append_semantic_argument(expr, 1, ctx, allocator, rule, rule_ordered))) {
+      } else if (rule_ordered || rule.parts_.count() != 1) {
+        ret = OB_INVALID_ARGUMENT;
+      } else if (OB_FAIL(input.append(allocator, SemanticInputPart::TEXT,
+                                     ObString("AI_JOIN rule:\n")))) {
+      } else if (OB_FAIL(input.append(allocator, SemanticInputPart::TEXT, rule.parts_.at(0).value_))) {
+      } else if (OB_FAIL(input.append(allocator, SemanticInputPart::TEXT,
+                                     ObString("\nLEFT INPUT:\n")))) {
+      }
+      for (int64_t index = 0; OB_SUCC(ret) && index < left.parts_.count(); ++index) {
+        const auto &part = left.parts_.at(index);
+        ret = input.append(allocator, part.kind_, part.value_);
+      }
+      if (OB_SUCC(ret) && OB_FAIL(input.append(allocator, SemanticInputPart::TEXT,
+                                              ObString("\nRIGHT INPUT:\n")))) {
+      }
+      for (int64_t index = 0; OB_SUCC(ret) && index < right.parts_.count(); ++index) {
+        const auto &part = right.parts_.at(index);
+        ret = input.append(allocator, part.kind_, part.value_);
+      }
+    }
+  } else if (OB_SUCC(ret) && expr.args_[1]->datum_meta_.type_ == ObFileType) {
+    ret = append_semantic_argument(expr, 1, ctx, allocator, input, ordered);
+  } else if (OB_SUCC(ret) && expr.args_[1]->datum_meta_.type_ == ObJsonType) {
+    ObIJsonBase *document = nullptr;
+    bool is_null = false;
+    if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, allocator, 1, document, is_null))) {
+    } else if (!is_null && nullptr != document) {
+      if (OB_FAIL(SemanticInput::is_input_object(*document, ordered))) {
+      } else if (ordered) {
+        ret = input.append_json(allocator, *document);
+      }
+    }
+  }
+  if (OB_SUCC(ret) && !ordered) {
+    ObString prompt;
+    if (OB_FAIL(prepare_input(expr, ctx, allocator, model_id, prompt, config, prepare_config))) {
+    } else if (OB_FAIL(input.append(allocator, SemanticInputPart::TEXT, prompt))) {
+    }
+  } else if (OB_SUCC(ret)) {
+    ObDatum *model = nullptr;
+    ObString text;
+    if (OB_FAIL(allocator.eval_arg(expr.args_[0], ctx, model))) {
+    } else if (model->is_null()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "semantic model must not be SQL NULL");
+    } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, allocator, *model,
+        expr.args_[0]->datum_meta_, expr.args_[0]->obj_meta_.has_lob_header(), text))) {
+    } else if (text.empty()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "semantic model must not be empty");
+    } else if (OB_FAIL(ob_write_string(allocator, text, model_id))) {
+    }
+    if (OB_SUCC(ret) && prepare_config && expr.arg_cnt_ == required_args + 1) {
+      ObIJsonBase *options = nullptr;
+      bool is_null = false;
+      if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, allocator, required_args, options, is_null))) {
+      } else if (is_null || nullptr == options || options->json_type() != ObJsonNodeType::J_OBJECT) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "semantic options must be a JSON object");
+      } else {
+        config = static_cast<ObJsonObject *>(options);
+      }
+    }
+    if (OB_SUCC(ret) && prepare_config && (is_join || expr.type_ == T_FUN_SYS_AI_FILTER)) {
+      ret = prepare_semantic_boolean_config(allocator, config, expr.type_);
+    }
+  }
+  if (OB_FAIL(ret) && ret != OB_EAGAIN) {
+    LOG_WARN("failed to prepare semantic request input", K(ret), K(expr.type_));
   }
   return ret;
 }

@@ -788,6 +788,11 @@ DEF_DATUM_SPECIAL_HASH_FUNCS(ObDoubleType);
 DEF_DATUM_SPECIAL_HASH_FUNCS(ObUDoubleType);
 DEF_DATUM_SPECIAL_HASH_FUNCS(ObJsonType);
 DEF_DATUM_SPECIAL_HASH_FUNCS(ObGeometryType);
+template <typename T>
+struct DatumHashCalculator<ObFileType, T>
+    : public DatumStrHashCalculator<CS_TYPE_BINARY, false, T, false>
+{};
+
 extern ObDatumCmpFuncType NULLSAFE_JSON_CMP_FUNCS[2][2];
 extern ObDatumCmpFuncType NULLSAFE_STR_CMP_FUNCS[CS_TYPE_MAX][2][2];
 extern ObDatumCmpFuncType NULLSAFE_TEXT_CMP_FUNCS[CS_TYPE_MAX][2][2];

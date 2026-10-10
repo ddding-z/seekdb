@@ -5663,6 +5663,12 @@ int_type_i opt_int_length_i opt_unsigned_i opt_zerofill_i
   malloc_terminal_node($$, result->malloc_pool_, T_JSON);
   $$->int32_values_[0] = 0; /* length */
 }
+| FILEX
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_FILE);
+  $$->int32_values_[0] = 16384;
+  $$->sql_str_off_ = @1.first_column;
+}
 | GEOMETRY
 {
   malloc_terminal_node($$, result->malloc_pool_, T_GEOMETRY);

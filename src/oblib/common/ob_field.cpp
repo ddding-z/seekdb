@@ -19,6 +19,7 @@
 #include "ob_field.h"
 #include "common/timezone/ob_time_convert.h"
 #include "common/mysqlclient/ob_mysql_global.h"
+#include "common/object/file_ref.h"
 
 namespace oceanbase
 {
@@ -215,6 +216,9 @@ int ObField::get_field_mb_length(const ObObjType type,
   int ret = OB_SUCCESS;
   const ObObjTypeClass &tc = ob_obj_type_class(type);
   switch(tc) {
+    case ObFileTC:
+      length = FileRefCodec::MAX_REF_BYTES;
+      break;
     case ObIntTC:
     case ObUIntTC:
       if (OB_LIKELY(accuracy.get_precision() > 0)) {

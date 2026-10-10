@@ -4,6 +4,249 @@ Legacy baseline validation (2026-09-29): the Debug build, all **105 SQL contract
 
 For the current architecture, code map, maintenance invariants and handoff checklist, see the [Chinese maintenance handoff](../../../../../docs/developer-guide/zh/ai-function-runtime-handoff.md).
 
+## Native FILE SQL/DDL
+
+`FILE` is a native nullable SQL value containing an owned reference descriptor,
+not file contents or a JSON column alias. The keyword is context-sensitive and
+nonreserved; existing tables and columns named `file` remain valid.
+
+```sql
+CREATE TABLE file (id BIGINT PRIMARY KEY, file FILE DEFAULT NULL);
+INSERT INTO file VALUES (1, TO_FILE('/srv/seekdb-media/photo.png'));
+SELECT id, FILE_URI(file), FILE_META(file) FROM file ORDER BY id;
+```
+
+- `TO_FILE(path_or_json)` accepts an absolute local path, a local `file:///` URI,
+  JSON descriptor text, or native SQL JSON. SQL NULL produces NULL. Construction
+  validates and owns the descriptor without opening media or calling a model.
+- JSON descriptors require `format_version: 1` and `uri`; optional fields are
+  `mime_type`, `object_version`, and nonnegative `size_bytes`. Unsupported fields,
+  invalid field types, duplicate text fields, and invalid references error.
+  References are at most 16 KiB, URIs at most 4096 bytes; descriptor input
+  materialization is bounded at 128 KiB, including LOB-backed inputs.
+- `FILE_URI(file)` returns the URI as a UTF8 varchar; `FILE_META(file)` returns
+  native SQL JSON for descriptor interchange. Both preserve SQL NULL.
+- Projections, derived tables/CTEs, FILE/NULL CASE and COALESCE branches,
+  IFNULL/NVL, INSERT SELECT, and UNION ALL retain FILE typing. IS NULL,
+  IS NOT NULL, COUNT(file), and ANY_VALUE(file) are supported.
+- Whole FILE values cannot be implicitly converted to strings, compared,
+  concatenated, used in arithmetic, sorted/grouped/deduplicated, or aggregated
+  other than COUNT/ANY_VALUE. Use the explicit accessors for URI or JSON operations.
+  Sorting/grouping by other columns does not reject unrelated FILE payloads.
+- Semantic tuple lowering uses the internal `AI_INPUT` packer for typed text/FILE
+  parts. Its strict JSON envelope is a semantic-input transport format, not
+  FILE's stored representation or a new DDL type.
+- FILE primary/unique/index/partition keys, foreign keys and index storing
+  columns are rejected. Defaults are limited to literal NULL. Generated FILE
+  columns and FILE functions in generated expressions are deliberately disabled.
+  ALTER does not convert existing columns to or from FILE.
+
+Media loading is controlled independently of `secure_file_priv`:
+
+| Variable | Scope | Default | Bounds |
+| --- | --- | --- | --- |
+| `ai_media_root` | administrator-controlled GLOBAL only | empty (loading disabled) | varchar |
+| `ai_media_max_bytes` | GLOBAL / SESSION | 2097152 | 1 through 67108864 |
+| `ai_media_parallel` | GLOBAL / SESSION | 4 | 1 through 64 |
+
+The root is a global loading policy, not a user-overridable session directory.
+`SET GLOBAL ai_media_root` uses the existing ALTER SYSTEM privilege check;
+`SET SESSION ai_media_root` (including bare `SET`) is rejected. The root is never
+inferred from `secure_file_priv`, even when that setting is `/`.
+`ObBasicSessionInfo::get_global_sys_variable` reads a runtime global-schema
+snapshot; the ordinary session getter retains its session snapshot.
+The per-file and parallel settings follow query/PX session configuration. The
+per-file limit does not relax the existing 4 MiB serialized HTTP request,
+8 MiB response and 64 MiB client-batch limits or the configured query memory
+budget; base64 and intermediate copies consume additional memory.
+
+The focused native type-map regression compiles from existing Debug compile
+metadata without rebuilding observer. It checks all twelve SQL type maps,
+including FILE/NULL merges, rejection entries, and every pre-FILE entry:
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_file_sql_types.py
+```
+
+With a cached Debug link manifest, the optional parser mode regenerates the
+parser and checks twelve FILE DDL/identifier AST contracts. It links only cached
+parser/core libraries, not a new observer:
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_file_sql_types.py \
+  --parser --link-manifest /path/to/cached_debug_link_action.json
+```
+
+These focused checks do not substitute for the FILE live SQL/runtime contracts.
+
+### Ordered multimodal semantic inputs
+
+```sql
+CALL DBMS_AI_SERVICE.CREATE_AI_MODEL(
+  'vision_model',
+  '{"type":"completion","model_name":"vision","input_modalities":["text","image"]}'
+);
+-- Register its endpoint with CREATE_AI_MODEL_ENDPOINT and provider=openai.
+
+SET GLOBAL ai_media_root = '/data/animals';
+CREATE TABLE image_data (id BIGINT PRIMARY KEY, image FILE NOT NULL);
+INSERT INTO image_data VALUES (1, TO_FILE('/data/animals/zebra.png'));
+SELECT id FROM image_data
+WHERE AI_FILTER('vision_model', ('Does this image contain a zebra?', image));
+```
+
+A semantic input can be FILE directly, or a tuple whose first argument is text
+and whose remaining arguments are text/FILE, with at most 64 tuple parts. Text
+paths remain ordinary text; there is no filename-extension guessing. The
+internal AI_INPUT recipe and `$seekdb_ai_input` envelope are implementation
+details, not FILE's storage format or a stable public JSON API. MAP/FILTER keep
+their existing model/options positions. JOIN keeps its rule and left/right
+bindings, using explicit left/right labels for media blocks. Ordinary text/JSON
+JOIN calls retain their original JSON prompt.
+
+Model JSON accepts `input_modalities`, containing unique lowercase `text`,
+`image`, and/or `audio` values, with `text` required. Omission preserves the
+text-only default. Media declarations are allowed only for completion models.
+FILE requests currently require the explicit `openai` provider, rather than
+assuming every adapter sharing an OpenAI-like text protocol supports media.
+Images use `image_url` data URIs; audio uses `input_audio` with base64 data and a
+format. There is no automatic transcription or fallback from failed media loads
+to literal text or Boolean false. Declared modalities do not prove the remote
+model supports them or native strict Boolean schemas.
+
+File contents are resolved only when a semantic call is actually demanded.
+Media reads/encoding run outside SQL frames, using a query-shared bounded loader,
+in-flight deduplication and reusable buffers separately from HTTP task credits.
+Ready rows may dispatch while another row is still loading, including while an
+earlier subset's replies remain held. Each dispatch owns its body arena, client
+batch and row mapping. Completed dispatches release their buffers and byte
+charges; the logical wave retains its query task credit until all its queued
+and in-flight rows finish. Across its dispatches, in-flight rows cannot exceed
+the owned SQL batch size. Media readiness is not success: the completed task's
+result must be checked before publishing MIME/base64 blocks.
+Cancellation, deadline, rescan and normal server shutdown must drain owned work
+and balance shared byte accounting.
+
+Only absolute local paths / `file:///` under the configured root are supported.
+Arbitrary HTTP URLs, path escapes, symlinks and nonregular files are not allowed.
+Missing, corrupt, oversized, changed or metadata-inconsistent sources error.
+JPEG/PNG/WAV/MP3 checks are bounded structural/container validation, not full
+pixel or audio decoding; a provider can still reject structurally valid media.
+External files do not gain database MVCC; deleting a SQL reference does not
+delete media. No remote stage, signed URL, upload, implicit ASR or generic media
+decoder is implied. FILE data requires a server supporting the native type;
+these checks are not mixed-version/downgrade compatibility evidence.
+
+The [FILE runtime contracts](test_file_runtime.py) cover typed SQL/storage,
+persistence/reopen and loopback multimodal payloads. Native
+[ordered-input/provider-block checks](../../../../../unittest/sql/engine/test_semantic_input.cpp)
+exercise recipe bounds, role order and strict output validation. Synthetic
+fixtures do not prove real-model quality, full SemBench coverage or a speedup.
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_file_runtime.py --self-test
+python tools/deploy/mysql_test/test_suite/ai_function/test_file_runtime.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+python tools/deploy/mysql_test/test_suite/ai_function/test_file_native.py \
+  --build-dir build_debug --link-manifest /path/to/cached_debug_link_action.json
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_input.py \
+  --build-dir build_debug --link-manifest /path/to/cached_debug_link_action.json
+```
+
+### FILE persistence, upgrades and verification (2026-10-09)
+
+The normal FILE runner passed **68/68 live SQL contracts** and **27/27 fixture
+self-tests** against the final Debug binary. It covers native schema/wire
+types, DML and transactions, prepared reexecution, joins/CTEs/INSERT SELECT,
+restart, completed MINI/MAJOR compactions, all four media formats, ordered
+tuples, model capabilities, short-circuiting, media errors without HTTP,
+cross-batch and dependency overlap, cancellation/deadline recovery, and actual
+four-task PX execution. Both unordered and compound-key full-sort projections
+require four actual task IDs and multiple CPU thread IDs, not just EXPLAIN
+DOP=4. The sorted case also requires zero active PX worker slices while all
+model replies are held. Ordinary-key sort/group payload preservation has
+separate contracts. LIMIT discards missing-file sentinels without loading them;
+computed JSON sort errors precede projection FILE demand.
+
+[test_file_shutdown.py](test_file_shutdown.py) separately passed both coordinator
+and sorted-PX held-FILE shutdown contracts. Each case owns a new database,
+keeps the SQL client and all provider gates open through SIGUSR1, and requires
+exit zero within ten seconds without forced termination. Closing the client or
+releasing replies first is not accepted as shutdown evidence.
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_file_shutdown.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+```
+
+The minor persistence check explicitly freezes each FILE tablet with
+`ALTER SYSTEM MINOR FREEZE TABLET_ID=...` and waits for a new completed
+MINI/MINOR history record before restart. A successful server-wide freeze
+request alone is not evidence that this particular tablet was flushed,
+especially after a major/restart sequence. Neither compaction check was skipped.
+
+The optional old-catalog gate also passed using a pre-FILE binary to bootstrap
+its own directory, followed by two new-binary startups:
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_file_runtime.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb" \
+  --upgrade-binary /path/to/pre_FILE_seekdb \
+  --case test_old_catalog_upgrade_preserves_model_masks_and_is_idempotent
+```
+
+Schema fetch supplies logged, safe defaults only for the three newly introduced
+media variables when their catalog entries are absent; it does not silently
+default arbitrary missing variables or replace existing policies. Once system
+schemas are published, writable-primary startup persists the missing variables
+and their history in one transaction, refreshes, then initializes DDL/max-ID
+services and adds the two model columns before readiness. Internal column DDL
+uses an initialized UTC time-zone map and does not change table options. The
+old-catalog test checks stable column IDs/defaults, old models retaining mask
+1, new masks 3/5/7, and preservation of nondefault durable media policy/history
+on the second restart. A read-only startup must not run these migrations;
+primary write admission additionally requires durable media/model metadata.
+End-to-end activation of a fully replayed standby is not included in this
+local-only upgrade gate.
+
+The separate [read-only catalog runner](test_file_catalog_roles.py) passed two
+private contracts: legacy standby startup loads safe defaults without durable
+catalog writes, and current standby restart preserves nondefault media policy,
+model masks/history and native FILE values. Both reject ordinary writes.
+It requires explicit new/old binaries and never connects to an existing service:
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_file_catalog_roles.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb" \
+  --upgrade-binary /path/to/pre_FILE_seekdb
+```
+
+Native validation passed nine codec/object/compact-cell groups, the four
+storage/wire checks plus five encoded microblock formats, 29 asynchronous media
+groups, 12 ordered-input/provider groups, 13 model/default groups repeated three
+times (39 executions), all twelve type matrices including every pre-FILE entry,
+and twelve freshly regenerated parser contracts. The native helper's cached
+object checks are distinct from the successful strict-dependency Debug
+observer build. Five controlled dispatch scenarios also passed, including
+32 held distinct rows with two logical credits, the aggregate row cap, idle-wave
+quota failure, timeout cleanup and legacy text behavior. The codec additionally
+passes its standard repository Bazel test target:
+
+```bash
+python bazel.py --build-dir=build_debug test //unittest/oblib:test_file_ref -c dbg
+```
+
+Regeneration of the media system variables preserves all 6,251 pre-FILE
+generated field assignments; the larger textual diff is assignment ordering
+from the Python 3 generator, not changed old-variable values.
+
+The final binary also passed the existing 39 map/filter, 26 composition,
+45 join, nine actual-PX, and 105 legacy AI Function/SOLO SQL contracts; 140
+native resource/binding/discovery checks and the native collection runner
+passed. The two existing SQL shutdown runners exited normally with SIGUSR1
+and zero status. These are deterministic local contracts, not real-model,
+full-SemBench, TSan, mixed-version or performance certification.
+
 ## Semantic Join Baseline (2026-10-09)
 
 `AI_JOIN(model, rule, left_input, right_input[, options])` is a Boolean pair
@@ -161,6 +404,26 @@ never become SQL-visible fallback results. Projection materialization stays
 after LIMIT; sort/group consumers materialize their required expressions before
 the corresponding CPU operator.
 
+For an ORDER BY without LIMIT and with only column, already-materialized
+aggregate, or literal keys, semantic projection is allocated before ordering
+so a final gather does not serialize its model preparation on the coordinator.
+Computed keys retain their old evaluation boundary. PX task admission and the
+sort operator share the ordinary vectorized full-sort capability predicate.
+Prefix/local-merge/partition sorts, prescan, WITH TIES, approximate Top-K,
+Top-N filters, and runtime dump/spill restrictions remain protected.
+
+JSON_EXTRACT, JSON_UNQUOTE, and JSON_PRETTY preserve a pending semantic
+argument's OB_EAGAIN instead of reclassifying it as invalid JSON/datatype.
+JSON_VALID no longer turns pending or failed argument evaluation into a
+successful false result. Completed malformed JSON text still returns false;
+NULL contents keep their ordinary behavior. Derived JSON MAP/group/HAVING
+and held two-wave cases have exact result and request-count regressions.
+Four-format FILE-to-MAP-to-JSON projection and sorted JSON projection on
+four actual PX tasks are also covered. The complete composition/PX suites
+passed 30/15 cases, and the 105 legacy SQL contracts passed again.
+This argument-error correction is intentional, including ordinary nested SQL
+argument errors; a failed expression is not malformed JSON contents.
+
 CPU recipes derived from partial semantic values, including their conditional
 fallback branches, are not advertised as completed relational inputs. Consumers
 recompute them inside their semantic runtime, preserving already-completed
@@ -181,11 +444,13 @@ AI_MAP retains completion-style option passthrough rather than interpreting
 
 - Each operator retains at most `ai_pipeline_slots` input batches. All stages
   and PX contexts of the same execution share `ai_pipeline_memory_limit`.
-- Query-wide active **client-batch** admission is `ai_pipeline_slots` times the
+- Query-wide active **logical-wave** admission is `ai_pipeline_slots` times the
   number of distinct semantic calls in the plan, not that product times DOP.
-  A completion client-batch still contains independent per-row HTTP requests;
-  neither this bound nor the existing scheduler's 64-client limit is a count
-  of HTTP requests.
+  A wave can own multiple HTTP client-batches as subsets become ready; their
+  aggregate in-flight rows remain capped at the owned SQL batch size.
+  Each completion client-batch contains independent per-row HTTP requests.
+  The wave credit bound and the existing scheduler's 64-client limit are not
+  themselves counts of HTTP requests.
 - Owned inputs/results, prompts, static model/configuration, and HTTP buffers
   participate in logical accounting. Configuration is prepared once per
   submission wave; temporary expression/JSON allocation and allocator overhead
@@ -936,3 +1201,195 @@ The SQL run used the `constrained` selector and an isolated temporary database. 
 The direct probe issued one HTTP request with no retry. The SQL runner planned four requests; its existing per-request retry policy and the gateway's upstream attempts were not instrumented, so five logical calls must not be presented as a measured upstream request count. There was no retry-until-pass, model switch, token-budget increase or constraint downgrade.
 
 This establishes that the endpoint accepts this object/enum/integer Schema request and that seekdb can consume valid real-model results through single-row and batch SQL. It does not establish support for the entire local Schema subset, prove the exact remote concurrency, or prove token masking: the prompts also requested the same JSON format, and no decoding backend trace or constrained/unconstrained comparison was captured. The previous unconstrained dynamic-model fallback failure was not rerun or marked fixed.
+
+## Real provider contracts
+
+[test_semantic_live.py](test_semantic_live.py) is a separate, explicitly opt-in
+runner for the current AI_MAP / AI_FILTER / AI_JOIN and native FILE pipeline.
+It does not replace the deterministic regressions or the earlier legacy live
+runner. There is no default endpoint/model, existing-database mode, or remote
+permission: both `--endpoint` and `--model` are mandatory for provider traffic.
+Only HTTP(S) numeric loopback addresses and `localhost` are accepted;
+`localhost` is pinned to `127.0.0.1`. Credentials in URLs, query strings,
+fragments, arbitrary URL paths, redirects and non-loopback hosts are rejected.
+HTTP uses direct connections, not ambient proxies. HTTPS keeps certificate
+verification and the original TLS hostname.
+
+The parent must already have started an appropriate local OpenAI-compatible
+service. Parent-reported deployment on 2026-10-09: offline eager vLLM 0.22.1
+with **text-only Qwen3-4B-Instruct-2507**, base origin
+`http://127.0.0.1:18081`, served ID `seekdb-file-validation-4b`,
+`max_model_len=2048`, `max_num_seqs=8`, 512 MiB KV cache, and prefix cache off.
+Use that exact served ID, not an automatically chosen model or an unverified
+alias. Service lifecycle is external to this runner; it never starts or stops
+a model service. This temporary validation instance was stopped normally
+after the checks, with its API/engine processes, socket and GPU allocation
+reclaimed. The commands below require a caller-owned compatible service
+and do not imply that this port is still available:
+
+```bash
+# DB-free self-tests: only in-process fake loopback providers, no model service.
+/volume/xicksys/.venv/bin/python -B \
+  tools/deploy/mysql_test/test_suite/ai_function/test_semantic_live.py --self-test
+
+# Direct health/model/schema/answer checks, without starting SQL.
+/volume/xicksys/.venv/bin/python -B \
+  tools/deploy/mysql_test/test_suite/ai_function/test_semantic_live.py \
+  --endpoint http://127.0.0.1:18081 --model seekdb-file-validation-4b \
+  --preflight-only
+
+# Full text and composed relational contracts in a new private database.
+/volume/xicksys/.venv/bin/python -B \
+  tools/deploy/mysql_test/test_suite/ai_function/test_semantic_live.py \
+  --endpoint http://127.0.0.1:18081 --model seekdb-file-validation-4b \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+```
+
+The parent subsequently reported a successful unauthenticated direct strict
+Boolean probe: required Boolean `value`, `additionalProperties=false`,
+`temperature=0`, `max_tokens=32`, content `{ "value": true }`, and
+`finish_reason="stop"`. JSON whitespace is valid without stripping or repair.
+The runner uses that same Boolean schema and 32-token budget, but never
+substitutes the reported response for fresh observations. This positive
+probe alone does not establish the runner's real SQL results.
+
+Actual validation on 2026-10-09 subsequently passed all six text SQL cases
+against the same Qwen3-4B deployment: MAP, Boolean projection, WHERE filtering,
+duplicate-label INNER JOIN, derived filter/MAP/group/HAVING/sort/LIMIT, and
+JOIN/filter/MAP composition. Direct preflight and private SQL/relay cleanup
+also passed. The DB-free runner suite passed 65 cases. The first real run
+exposed the JSON pending-propagation bug described above; the unchanged
+composed-group oracle passed after fixing the engine, without casts,
+materialization workarounds, substituted responses, or relaxed schemas.
+These are small synthetic-label correctness contracts, not SemBench answer
+quality, multimodal quality, throughput, or speedup evidence.
+
+The separate local SemBench suite also gained an opt-in `semantic` mode while
+retaining its old default modes. Real Qwen3-4B comparisons passed for
+`ecomm_q1` and `ecomm_q5` at four input rows each, and `ecomm_q7` at two eligible
+products/four ordered candidate pairs. Each legacy/native variant completed;
+all three ordered final bag hashes matched. The pairwise query made exactly
+four provider calls per variant and retained its two self-pair outputs.
+The experiment's 69 DB-free contracts passed in its existing environment.
+These comparisons explicitly do not assert stage-answer/token equivalence
+or calculate speedups; they are not full SemBench coverage or quality evidence.
+
+The endpoint may be an origin, `/v1` base, or `/v1/chat/completions` URL.
+`--list-cases` is offline; repeat `--case NAME` to select SQL cases. Unknown
+or repeated cases fail instead of being skipped or generating extra traffic.
+Every live invocation preflights `/health`, `/v1/models`, exact response model
+identity, two label MAPs, positive/negative FILTERs and positive/negative JOINs
+with direct HTTP before database startup. These six inference probes use the
+same native `response_format` contracts as SQL, with `strict: true`;
+`Schema` is not an AI_MAP shorthand. The fixed inference options are
+`temperature=0`, `max_tokens=32`, and `stream=false`. `--timeout` bounds each
+HTTP transfer, including progressing headers/body (default 15 seconds, maximum
+60); SQL has a 60-second query budget. The text dataset has four left rows
+and two right rows: eight logical Cartesian JOIN candidates, including
+duplicate left labels and both matching/nonmatching pairs. Prompts are short
+synthetic labels, not private data or SemBench inputs; their character bounds
+are not a tokenizer/context-length or GPU-concurrency claim.
+No schema downgrade, whole-run retry, model substitution, Markdown stripping,
+truncation repair, or conversion of invalid output to false is performed.
+The [vLLM 0.22.1 message protocol](https://github.com/vllm-project/vllm/blob/v0.22.1/vllm/entrypoints/openai/chat_completion/protocol.py)
+defaults `tool_calls` to an empty list. Absent/null/empty-list tool metadata
+means no calls and is accepted; nonempty or wrongly typed tool metadata,
+refusals and function calls still error. This envelope compatibility does not
+relax the content schema or the mandatory `finish_reason="stop"`.
+
+Authentication is optional for an unauthenticated local service. When needed,
+pass **only the name** of an already populated credential environment variable
+via `--api-key-env NAME`; do not put its value on the command line or in a file.
+A synthetic loopback registration key is used inside the private database.
+The Python HTTP client uses the actual provider credential; it is not
+registered in SQL or written to the temporary database's endpoint metadata.
+Named but missing/empty/invalid credentials fail before any traffic.
+
+The runner reuses [test_file_runtime.py](test_file_runtime.py)'s
+`PrivateDatabase` UNIX-socket launcher, startup isolation and SIGUSR1 cleanup.
+It registers `provider=openai` explicitly. The text model omits
+`input_modalities`, verifies the catalog's text-only mask, and leaves the
+GLOBAL-only `ai_media_root` at its empty default. SQL covers label MAP,
+Boolean projection and filtering, duplicate-label INNER JOIN multiplicity,
+filter/MAP/group/HAVING/sort/LIMIT composition, and JOIN/filter/MAP composition.
+Oracles require exact ordered rows, types, labels, and Boolean values; they do
+not compare two generations or depend on optimizer request counts/order.
+
+### Opt-in image FILE contracts
+
+**No real image model is currently available in the parent-reported setup.**
+Qwen3.5-9B has only incomplete temporary shards; those are not a usable model.
+The Qwen3-4B text endpoint above must not be presented as multimodal. The
+following example is only for a future, separately available compatible
+vision service, not the current text deployment.
+
+Image traffic additionally requires `--image`, an explicit yes/no
+`--instruction`, and an independently supplied `--expect-image true|false`.
+Use a PNG/JPEG path or `synthetic-red`, a locally generated 128x128 red PNG:
+
+```bash
+/volume/xicksys/.venv/bin/python -B \
+  tools/deploy/mysql_test/test_suite/ai_function/test_semantic_live.py \
+  --endpoint http://127.0.0.1:8000/v1 --model YOUR_SERVED_VISION_MODEL_ID \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb" \
+  --image synthetic-red --instruction 'Is this image predominantly red?' \
+  --expect-image true
+```
+
+Custom images must be explicitly selected regular local files of at most
+2 MiB, with no symlink components. Only that file's bounded bytes are copied
+into a temporary private media root; the source file is not changed and its
+path is not a provider prompt. A direct image/schema/expected-answer probe
+runs before SQL. Selecting an image alone is not evidence of model capability:
+the probe must actually succeed. Only then is a separate completion model
+registered with `input_modalities=["text","image"]` and its catalog mask
+checked. No audio capability is declared. The root is set with administrator
+`SET GLOBAL` exclusively inside the new private database.
+
+Native FILE construction/URI/metadata and both `(text, FILE)` inputs and
+direct FILE JOIN inputs are exercised. Image MAP uses a native Boolean
+schema; FILTER projection preserves an explicitly guarded NULL row; WHERE
+and JOIN have exact expected result sets for either true or false. The JOIN
+matches the actual image answer against separate `"true"` / `"false"` rows.
+Missing/corrupt/nonboolean/truncated/refused output is always an error, never
+a rejected row, false answer, text-path fallback, or skip.
+
+### Failure evidence and limits
+
+A private loopback observation relay forwards each allowed SQL request body
+and each actual provider status/body unchanged, while independently checking
+its response and answer. It blocks unplanned prompts/media, changed models,
+or weakened schemas before forwarding. It never synthesizes a successful
+provider response. This also keeps real credentials out of SQL registration
+and preserves actual responses when SQL fails.
+
+Failures are labeled separately: `model-quality` (exit 3) for a well-formed
+but wrong answer, `provider-protocol` (exit 4) for HTTP/envelope/model/schema
+violations, `sql-integration` (exit 5) for SQL or row-shape/binding errors, and
+`private-runner-lifecycle` (exit 6) for private startup/cleanup failures.
+Invalid opt-in/safety inputs exit 2. An observed provider failure retains its
+category alongside a subsequent SQL error; correct upstream answers with
+incorrect SQL rows are not attributed to model quality. Failure messages
+identify the preflight/SQL phase and synthetic label or left/right pair,
+along with the observed and independently expected answers. FILE diagnostics
+use a generic question/pair label, not the user's private instruction/path.
+
+Failure diagnostics retain the latest 16 observations plus the first failed
+response, at most 2048 redacted characters per body and a 48 KiB observation
+output bound. Known credentials are redacted before truncation, including
+escaped/encoded forms; raw malformed bodies are shown as bounded escaped
+text, not replaced with invented results. Requests are capped at 4 MiB and
+responses at 8 MiB. Temporary media, registrations, relay and database are
+owned by this invocation and cleaned up; no model service is started/stopped,
+no weights are downloaded, and no user environment is modified.
+
+[test_semantic_live_selftest.py](test_semantic_live_selftest.py) tests CLI
+safety, direct preflight, strict JSON/Boolean/envelope parsing, transparent
+forwarding, credential redaction/bounds, image staging, registration, exact
+SQL oracles, failure attribution and cleanup without a database. Fake
+provider self-tests are not real-model validation. Passing this runner is a
+small integration/answer contract, **not SemBench quality, a performance
+benchmark, proof of multimodal support for an unselected model, or proof of
+GPU/service concurrency**. seekdb's existing per-request retries and service
+queuing can change attempt counts; cancellation cannot retract inference
+already accepted by the service.

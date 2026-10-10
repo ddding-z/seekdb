@@ -1731,6 +1731,10 @@ int ObCreateTableResolver::resolve_index_node(const ParseNode *node)
               if (OB_ISNULL(session_info_)) {
                 ret = OB_NOT_INIT;
                 LOG_WARN("session_info_ is null");
+              } else if (ObFileType == column_schema->get_data_type()) {
+                ret = OB_ERR_WRONG_KEY_COLUMN;
+                LOG_USER_ERROR(OB_ERR_WRONG_KEY_COLUMN, column_name.length(), column_name.ptr());
+                LOG_WARN("FILE cannot be used in an index", K(ret), K(column_name));
               }  else if (sort_item.prefix_len_ > column_schema->get_data_length()) {
                 ret = OB_WRONG_SUB_KEY;
                 SQL_RESV_LOG(WARN, "prefix length is longer than column length", K(sort_item), K(column_schema->get_data_length()), K(ret));

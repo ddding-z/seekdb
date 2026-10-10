@@ -28,13 +28,35 @@ namespace share
 namespace schema
 {
 
-OB_SERIALIZE_MEMBER(ObAiModelSchema,
-                    model_id_,
-                    name_,
-                    type_,
-                    model_name_,
-                    schema_version_,
-                    case_mode_);
+OB_DEF_SERIALIZE(ObAiModelSchema)
+{
+  int ret = OB_SUCCESS;
+  LST_DO_CODE(OB_UNIS_ENCODE,
+              model_id_, name_, type_, model_name_, schema_version_, case_mode_, input_modalities_);
+  return ret;
+}
+
+OB_DEF_DESERIALIZE(ObAiModelSchema)
+{
+  int ret = OB_SUCCESS;
+  // Older v1 payloads omit the appended modality mask.
+  input_modalities_ = AiInputModality::TEXT;
+  LST_DO_CODE(OB_UNIS_DECODE,
+              model_id_, name_, type_, model_name_, schema_version_, case_mode_, input_modalities_);
+  if (OB_SUCC(ret) && !AiInputModality::is_valid(input_modalities_, type_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid serialized AI model input modalities", K(ret), K_(input_modalities), K_(type));
+  }
+  return ret;
+}
+
+OB_DEF_SERIALIZE_SIZE(ObAiModelSchema)
+{
+  int64_t len = 0;
+  LST_DO_CODE(OB_UNIS_ADD_LEN,
+              model_id_, name_, type_, model_name_, schema_version_, case_mode_, input_modalities_);
+  return len;
+}
 
 int64_t ObAiModelSchema::get_convert_size() const
 {
@@ -51,12 +73,16 @@ int ObAiModelSchema::assign(const ObAiModelSchema &other)
   int ret = OB_SUCCESS;
   if (this != &other) {
     reset();
-    if (OB_FAIL(set_name(other.name_))) {
+    if (!AiInputModality::is_valid(other.input_modalities_, other.type_)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid AI model input modalities", K(ret), K(other));
+    } else if (OB_FAIL(set_name(other.name_))) {
     } else if (OB_FAIL(set_model_name(other.model_name_))) {
     } else {
       set_model_id(other.model_id_);
       set_type(other.type_);
       set_schema_version(other.schema_version_);
+      set_input_modalities(other.input_modalities_);
     }
   }
   return ret;
@@ -66,12 +92,16 @@ int ObAiModelSchema::assign(const ObAiServiceModelInfo &model_info)
 {
   int ret = OB_SUCCESS;
   reset();
-  if (OB_FAIL(set_name(model_info.get_name()))) {
+  if (!AiInputModality::is_valid(model_info.get_input_modalities(), model_info.get_type())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid AI model input modalities", K(ret), K(model_info));
+  } else if (OB_FAIL(set_name(model_info.get_name()))) {
   } else if (OB_FAIL(set_model_name(model_info.get_model_name()))) {
   } else {
     set_model_id(OB_INVALID_ID);
     set_schema_version(OB_INVALID_VERSION);
     set_type(model_info.get_type());
+    set_input_modalities(model_info.get_input_modalities());
   }
   return ret;
 }

@@ -19,6 +19,7 @@
 #include "common/cell/ob_cell_writer.h"
 #include "common/timezone/ob_time_convert.h"
 #include "common/object/ob_object.h"
+#include "common/object/file_ref.h"
 namespace oceanbase
 {
 namespace common
@@ -460,6 +461,15 @@ int ObCellWriter::append(uint64_t column_id, const ObObj &obj, ObObj *clone_obj)
       case ObCharType:
         ret = write_char(obj, ObCharType, obj.get_string(), clone_obj);
         break;
+      case ObFileType: {
+        FileRef ref;
+        if (OB_FAIL(FileRefCodec::decode(obj.get_file(), ref))) {
+          COMMON_LOG(WARN, "invalid FILE cell value", K(ret));
+        } else {
+          ret = write_char(obj, ObFileType, obj.get_file(), clone_obj);
+        }
+        break;
+      }
       case ObHexStringType:
         ret = write_binary(ObHexStringType, obj.get_hex_string(), clone_obj);
         break;

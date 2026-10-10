@@ -1767,6 +1767,7 @@ seekdb_semantic_unity_cc_library(
         _SHARE_RUNTIME_UNITY_GROUPS,
         {
             "ob_share_redolog_0": [":config"],
+            "ob_share_schema_2": [":rpc_message_types"],
         },
     ),
     implementation_deps = [

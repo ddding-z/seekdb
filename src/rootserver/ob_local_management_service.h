@@ -119,6 +119,7 @@ public:
   // add virtual make the following functions mockable
   virtual int start_service();
   int start_runtime_dependent_services();
+  int check_primary_catalog_ready();
   virtual int stop_service();
   virtual int stop();
   virtual void wait();
@@ -301,6 +302,8 @@ private:
   // create system table in mysql backend for debugging mode.
   int init_debug_database();
   int start_local_services_();
+  int upgrade_ai_media_system_variables_(const bool check_only = false);
+  int upgrade_ai_model_metadata_(const bool check_only = false);
   int refresh_schema(const bool fast_recover);
   int init_sequence_id();
   int start_timer_tasks();

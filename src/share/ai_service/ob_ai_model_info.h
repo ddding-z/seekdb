@@ -59,6 +59,30 @@ private:
   static const char *ENDPOINT_TYPE_STR[];
 };
 
+struct AiInputModality final
+{
+  enum : int64_t
+  {
+    TEXT = 1,
+    IMAGE = 2,
+    AUDIO = 4,
+    ALL = TEXT | IMAGE | AUDIO
+  };
+
+  static bool is_valid(const int64_t input_modalities)
+  {
+    return (input_modalities & TEXT) != 0 && (input_modalities & ~ALL) == 0;
+  }
+
+  static bool is_valid(const int64_t input_modalities, const EndpointType::TYPE type)
+  {
+    return is_valid(input_modalities)
+        && type > EndpointType::INVALID_TYPE
+        && type < EndpointType::MAX_TYPE
+        && (type == EndpointType::COMPLETION || input_modalities == TEXT);
+  }
+};
+
 class ObAiServiceModelInfo
 {
   OB_UNIS_VERSION(1);
@@ -71,6 +95,7 @@ public:
     name_.reset();
     type_ = EndpointType::MAX_TYPE;
     model_name_.reset();
+    input_modalities_ = AiInputModality::TEXT;
   }
 
   int parse_from_json_base(const ObString &name, const common::ObIJsonBase &params_jbase);
@@ -79,14 +104,20 @@ public:
   const ObString &get_name() const { return name_; }
   EndpointType::TYPE get_type() const { return type_; }
   const ObString &get_model_name() const { return model_name_; }
+  int64_t get_input_modalities() const { return input_modalities_; }
+  void set_input_modalities(const int64_t input_modalities) { input_modalities_ = input_modalities; }
 
   TO_STRING_KV(K_(name),
                K_(type),
-               K_(model_name));
+               K_(model_name),
+               K_(input_modalities));
+private:
+  int parse_input_modalities_(const common::ObIJsonBase &input_modalities);
 private:
   ObString name_;
   EndpointType::TYPE type_;
   ObString model_name_;
+  int64_t input_modalities_;
 };
 
 } // namespace share

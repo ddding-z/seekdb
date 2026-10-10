@@ -50,7 +50,20 @@ int ObExprPromotionUtil::get_nvl_type(ObExprResType &type, const ObExprResType &
                                       const ObExprResType &type2)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(get_calc_type(type, type1, type2, NVL_TYPE_PROMOTION))) {
+  if (ObFileType == type1.get_type() || ObFileType == type2.get_type()) {
+    if ((ObFileType != type1.get_type() && ObNullType != type1.get_type())
+        || (ObFileType != type2.get_type() && ObNullType != type2.get_type())) {
+      ret = OB_ERR_INVALID_TYPE_FOR_OP;
+      LOG_USER_ERROR(OB_ERR_INVALID_TYPE_FOR_OP, ob_obj_type_str(type1.get_type()),
+                     ob_obj_type_str(type2.get_type()));
+      LOG_WARN("FILE can only be coalesced with FILE or NULL", K(ret), K(type1), K(type2));
+    } else {
+      type.set_type(ObFileType);
+      type.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObFileType]);
+      type.set_collation_type(CS_TYPE_BINARY);
+      type.set_collation_level(CS_LEVEL_IMPLICIT);
+    }
+  } else if (OB_FAIL(get_calc_type(type, type1, type2, NVL_TYPE_PROMOTION))) {
   }
   return ret;
 }

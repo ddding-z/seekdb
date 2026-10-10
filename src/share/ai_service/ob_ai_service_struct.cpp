@@ -249,6 +249,10 @@ int ObAiServiceModelInfo::parse_from_json_base(const ObString &name, const commo
     } else {
       EXTRACT_JSON_ELEM_STR("model_name", model_name_)
       EXTRACT_JSON_ELEM_STR_WITH_PROCESS("type", type_str, type_ = EndpointType::str_to_endpoint_type(type_str))
+      if (elem.first.case_compare("input_modalities") == 0) {
+        if (OB_FAIL(parse_input_modalities_(*elem.second))) {
+        }
+      } else
       EXTRACT_JSON_ELEM_END()
     }
     iter.next();
@@ -260,6 +264,48 @@ int ObAiServiceModelInfo::parse_from_json_base(const ObString &name, const commo
   }
 
   LOG_TRACE("parse from json base", K(ret), K(params_jbase), K(params_jbase.json_type()), K(params_jbase.element_count()));
+  return ret;
+}
+
+int ObAiServiceModelInfo::parse_input_modalities_(const common::ObIJsonBase &input_modalities)
+{
+  int ret = OB_SUCCESS;
+  input_modalities_ = 0;
+  if (input_modalities.json_type() != ObJsonNodeType::J_ARRAY
+      || input_modalities.element_count() == 0
+      || input_modalities.element_count() > 3) {
+    ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+    LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("input_modalities"), "input_modalities");
+    LOG_WARN("input_modalities must be an array of one to three strings", K(ret), K(input_modalities));
+  } else {
+    for (uint64_t i = 0; OB_SUCC(ret) && i < input_modalities.element_count(); ++i) {
+      ObIJsonBase *element = nullptr;
+      if (OB_FAIL(input_modalities.get_array_element(i, element))) {
+        LOG_WARN("failed to get input modality", K(ret), K(i));
+      } else if (OB_ISNULL(element) || element->json_type() != ObJsonNodeType::J_STRING) {
+        ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+        LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("input_modalities"), "input_modalities");
+        LOG_WARN("input modality must be a string", K(ret), K(i), KP(element));
+      } else {
+        const ObString modality(element->get_data_length(), element->get_data());
+        int64_t modality_mask = 0;
+        if (modality == "text") {
+          modality_mask = AiInputModality::TEXT;
+        } else if (modality == "image") {
+          modality_mask = AiInputModality::IMAGE;
+        } else if (modality == "audio") {
+          modality_mask = AiInputModality::AUDIO;
+        }
+        if (modality_mask == 0 || (input_modalities_ & modality_mask) != 0) {
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+          LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("input_modalities"), "input_modalities");
+          LOG_WARN("unknown or duplicate input modality", K(ret), K(modality), K_(input_modalities));
+        } else {
+          input_modalities_ |= modality_mask;
+        }
+      }
+    }
+  }
   return ret;
 }
 
@@ -282,11 +328,41 @@ int ObAiServiceModelInfo::check_valid() const
     ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("type"), "type");
     LOG_WARN("model type is invalid", K(ret), K(*this), K(type_));
+  } else if (!AiInputModality::is_valid(input_modalities_, type_)) {
+    ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+    LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("input_modalities"), "input_modalities");
+    LOG_WARN("input modalities must include text and media require a completion model", K(ret), K(*this));
   }
   return ret;
 }
 
-OB_SERIALIZE_MEMBER(ObAiServiceModelInfo, name_, type_, model_name_);
+OB_DEF_SERIALIZE(ObAiServiceModelInfo)
+{
+  int ret = OB_SUCCESS;
+  LST_DO_CODE(OB_UNIS_ENCODE, name_, type_, model_name_, input_modalities_);
+  return ret;
+}
+
+OB_DEF_DESERIALIZE(ObAiServiceModelInfo)
+{
+  int ret = OB_SUCCESS;
+  // Older v1 payloads omit the appended modality mask.
+  input_modalities_ = AiInputModality::TEXT;
+  LST_DO_CODE(OB_UNIS_DECODE, name_, type_, model_name_, input_modalities_);
+  if (OB_SUCC(ret) && !AiInputModality::is_valid(input_modalities_, type_)) {
+    ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+    LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("input_modalities"), "input_modalities");
+    LOG_WARN("invalid serialized model input modalities", K(ret), K_(input_modalities), K_(type));
+  }
+  return ret;
+}
+
+OB_DEF_SERIALIZE_SIZE(ObAiServiceModelInfo)
+{
+  int64_t len = 0;
+  LST_DO_CODE(OB_UNIS_ADD_LEN, name_, type_, model_name_, input_modalities_);
+  return len;
+}
 
 } // namespace share
 } // namespace oceanbase

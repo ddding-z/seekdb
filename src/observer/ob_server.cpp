@@ -180,6 +180,11 @@ public:
     return ret;
   }
 
+  int check_primary_catalog_ready() override
+  {
+    return server_.local_management_service_.check_primary_catalog_ready();
+  }
+
   int start_timezone_manager() override
   {
     return server_.timezone_mgr_.start();

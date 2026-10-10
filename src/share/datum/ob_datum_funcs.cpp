@@ -240,7 +240,8 @@ bool ObDatumFuncs::is_null_aware_hash_type(const ObObjType type)
 {
   const ObObjTypeClass tc = OBJ_TYPE_TO_CLASS[type];
   return is_string_type(type) || is_json(type) || is_geometry(type) ||
-            (tc == ObUserDefinedSQLTC) || (tc == ObFloatTC) || (tc == ObDoubleTC);
+            (tc == ObUserDefinedSQLTC) || (tc == ObFloatTC) || (tc == ObDoubleTC)
+            || (tc == ObFileTC);
 }
 
 OB_SERIALIZE_MEMBER(ObCmpFunc, ser_cmp_func_);

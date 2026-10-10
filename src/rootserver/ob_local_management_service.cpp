@@ -54,6 +54,9 @@
 #include "pl_ddl/ob_pl_ddl_service.h"
 #include "parallel_ddl/ob_drop_table_helper.h" // ObDropTableHelper
 #include "rootserver/ob_ai_model_ddl_service.h"
+#include "rootserver/ob_ddl_operator.h"
+#include "share/schema/ob_ai_model_sql_service.h"
+#include "share/system_variable/ob_system_variable_init.h"
 #include "lib/utility/ob_print_utils.h"     // databuff_printf
 #include "share/ob_ex_rpc.h"
 
@@ -265,6 +268,22 @@ int ObLocalManagementService::start_runtime_dependent_services()
     if (OB_SUCC(ret) && debug_ && OB_FAIL(init_debug_database())) {
       FLOG_WARN("init_debug_database failed", KR(ret));
     }
+  }
+  return ret;
+}
+
+int ObLocalManagementService::check_primary_catalog_ready()
+{
+  int ret = OB_SUCCESS;
+  if (!inited_) {
+    ret = OB_NOT_INIT;
+    FLOG_WARN("local management services not initialized", KR(ret));
+  } else if (OB_FAIL(schema_service_->refresh_and_add_schema())) {
+    FLOG_WARN("failed to refresh catalog before primary write admission", KR(ret));
+  } else if (OB_FAIL(upgrade_ai_media_system_variables_(true /* check_only */))) {
+    FLOG_WARN("primary AI media catalog is not ready for write admission", KR(ret));
+  } else if (OB_FAIL(upgrade_ai_model_metadata_(true /* check_only */))) {
+    FLOG_WARN("primary catalog is not ready for write admission", KR(ret));
   }
   return ret;
 }
@@ -1955,6 +1974,13 @@ int ObLocalManagementService::start_local_services_()
     FLOG_INFO("success to refresh schema", K(load_frozen_status));
   }
 
+  if (OB_SUCC(ret)
+      && share::server_role() == ObServerRole::PRIMARY_ROLE
+      && share::server_is_write_enabled()
+      && OB_FAIL(upgrade_ai_media_system_variables_())) {
+    FLOG_WARN("AI media system variable upgrade failed", KR(ret));
+  }
+
   // start timer tasks
   if (FAILEDx(start_timer_tasks())) {
     FLOG_WARN("start timer tasks failed", KR(ret));
@@ -1978,6 +2004,10 @@ int ObLocalManagementService::start_local_services_()
     FLOG_INFO("success to start max id cache mgr");
   }
 
+  if (FAILEDx(upgrade_ai_model_metadata_())) {
+    FLOG_WARN("AI model metadata upgrade failed", KR(ret));
+  }
+
   if (OB_SUCC(ret)) {
     ObGlobalStatProxy global_proxy(sql_proxy_);
     if (OB_FAIL(global_proxy.get_baseline_schema_version(baseline_schema_version_))) {
@@ -1995,6 +2025,173 @@ int ObLocalManagementService::start_local_services_()
   FLOG_INFO("finish starting local services", KR(ret));
   return ret;
 }
+
+int ObLocalManagementService::upgrade_ai_media_system_variables_(const bool check_only)
+{
+  int ret = OB_SUCCESS;
+  ObTimeoutCtx timeout;
+  ObRefreshSchemaStatus schema_status;
+  int64_t schema_version = OB_INVALID_VERSION;
+  ObSysVariableSchema missing_variables;
+  const ObSysVarClassType variable_ids[] = {
+      SYS_VAR_AI_MEDIA_ROOT, SYS_VAR_AI_MEDIA_MAX_BYTES, SYS_VAR_AI_MEDIA_PARALLEL};
+  const char *variable_names[] = {
+      OB_SV_AI_MEDIA_ROOT, OB_SV_AI_MEDIA_MAX_BYTES, OB_SV_AI_MEDIA_PARALLEL};
+  bool present[ARRAYSIZEOF(variable_ids)] = {};
+
+  if (!check_only && (share::server_role() != ObServerRole::PRIMARY_ROLE
+      || !share::server_is_write_enabled())) {
+    ret = OB_STATE_NOT_MATCH;
+    FLOG_WARN("AI media system variables require a writable primary", KR(ret));
+  } else if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(timeout, GCONF._ob_ddl_timeout))) {
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, result) {
+      ObSqlString sql;
+      sqlclient::ObMySQLResult *rows = nullptr;
+      if (OB_FAIL(sql.assign_fmt(
+          "SELECT name FROM %s WHERE name IN ('%s','%s','%s')",
+          OB_ALL_SYS_VARIABLE_TNAME, variable_names[0], variable_names[1], variable_names[2]))) {
+      } else if (OB_FAIL(sql_proxy_.read(result, sql.ptr()))) {
+        FLOG_WARN("failed to read persisted AI media system variables", KR(ret));
+      } else if (OB_ISNULL(rows = result.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+        FLOG_WARN("AI media system variable result is null", KR(ret));
+      } else {
+        while (OB_SUCC(ret) && OB_SUCC(ret = rows->next())) {
+          ObString name;
+          bool found = false;
+          if (OB_FAIL(rows->get_varchar("name", name))) {
+            FLOG_WARN("failed to read AI media system variable name", KR(ret));
+          } else {
+            for (int64_t i = 0; !found && i < ARRAYSIZEOF(variable_ids); ++i) {
+              if (name.case_compare(variable_names[i]) == 0) {
+                found = true;
+                present[i] = true;
+              }
+            }
+            if (!found) {
+              ret = OB_ERR_UNEXPECTED;
+              FLOG_WARN("unexpected AI media system variable", KR(ret), K(name));
+            }
+          }
+        }
+        if (ret == OB_ITER_END) {
+          ret = OB_SUCCESS;
+        } else if (OB_FAIL(ret)) {
+          FLOG_WARN("failed to iterate AI media system variables", KR(ret));
+        }
+      }
+    }
+
+    for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(variable_ids); ++i) {
+      if (!present[i]) {
+        if (check_only) {
+          ret = OB_SCHEMA_EAGAIN;
+          FLOG_WARN("AI media system variables must be persisted before primary write admission",
+                    KR(ret), K(variable_ids[i]));
+        } else if (OB_FAIL(missing_variables.add_default_system_variable(variable_ids[i]))) {
+          FLOG_WARN("failed to initialize missing AI media system variable", KR(ret), K(variable_ids[i]));
+        }
+      }
+    }
+
+    if (OB_SUCC(ret) && missing_variables.get_real_sysvar_count() > 0) {
+      ObDDLSQLTransaction trans(schema_service_);
+      ObDDLOperator ddl_operator(*schema_service_, sql_proxy_);
+      if (OB_FAIL(schema_service_->get_schema_version_in_inner_table(
+          sql_proxy_, schema_status, schema_version))) {
+        FLOG_WARN("failed to read schema version before AI media upgrade", KR(ret));
+      } else if (OB_FAIL(trans.start(&sql_proxy_, schema_version))) {
+        FLOG_WARN("failed to start AI media system variable upgrade", KR(ret));
+      } else if (OB_FAIL(schema_service_->gen_new_schema_version(schema_version))) {
+        FLOG_WARN("failed to generate AI media system variable schema version", KR(ret));
+      } else if (OB_FAIL(ddl_operator.replace_sys_variable(
+          missing_variables, schema_version, trans, OB_DDL_ALTER_SYS_VAR))) {
+        FLOG_WARN("failed to persist AI media system variables and history", KR(ret));
+      }
+      if (trans.is_started()) {
+        const int end_ret = trans.end(OB_SUCC(ret));
+        if (end_ret != OB_SUCCESS) {
+          FLOG_WARN("failed to finish AI media system variable upgrade", KR(end_ret), KR(ret));
+          ret = OB_SUCC(ret) ? end_ret : ret;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && missing_variables.get_real_sysvar_count() > 0) {
+    FLOG_INFO("upgraded persisted AI media system variables",
+              "count", missing_variables.get_real_sysvar_count(), K(schema_version));
+    if (OB_FAIL(refresh_schema(false))) {
+      FLOG_WARN("failed to refresh persisted AI media system variables", KR(ret));
+    }
+  }
+  return ret;
+}
+
+int ObLocalManagementService::upgrade_ai_model_metadata_(const bool check_only)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t table_ids[] = {OB_ALL_AI_MODEL_TID, OB_ALL_AI_MODEL_HISTORY_TID};
+  const bool writable = !check_only
+      && share::server_role() == ObServerRole::PRIMARY_ROLE
+      && share::server_is_write_enabled();
+  for (uint64_t table_id : table_ids) {
+    ObTimeoutCtx timeout;
+    ObAlterTableArg arg;
+    ObAlterTableRes result;
+    bool needs_upgrade = false;
+    {
+      ObSchemaGetterGuard guard;
+      const ObTableSchema *table = nullptr;
+      if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(timeout, GCONF._ob_ddl_timeout))) {
+      } else if (OB_FAIL(ddl_service_.get_runtime_schema_guard_with_version_in_inner_table(guard))) {
+      } else if (OB_FAIL(guard.get_table_schema(table_id, table))) {
+      } else if (OB_ISNULL(table)) {
+        ret = OB_TABLE_NOT_EXIST;
+      } else if (OB_FAIL(ObAiModelSqlService::prepare_input_modalities_upgrade(*table, arg, needs_upgrade))) {
+      }
+    }
+    if (OB_SUCC(ret) && needs_upgrade && !writable) {
+      if (check_only) {
+        ret = OB_SCHEMA_EAGAIN;
+        FLOG_WARN("AI model catalog must be upgraded before primary write admission", KR(ret), K(table_id));
+      } else {
+        FLOG_INFO("deferred AI model catalog upgrade on a write-fenced server", K(table_id));
+      }
+    } else if (OB_SUCC(ret) && needs_upgrade) {
+      ObTZMapWrap tz_map_wrap;
+      arg.tz_info_wrap_.set_tz_info_offset(0);
+      if (OB_FAIL(OTTZ_MGR.get_timezone_map(tz_map_wrap))) {
+        FLOG_WARN("failed to initialize AI model upgrade time zone", KR(ret), K(table_id));
+      } else if (FALSE_IT(arg.set_tz_info_map(tz_map_wrap.get_tz_map()))) {
+      } else if (OB_FAIL(ddl_service_.alter_table(arg, result))) {
+      } else if (OB_FAIL(ddl_service_.refresh_schema())) {
+      } else {
+        ObSchemaGetterGuard guard;
+        const ObTableSchema *table = nullptr;
+        ObAlterTableArg verification;
+        bool still_missing = false;
+        if (OB_FAIL(ddl_service_.get_runtime_schema_guard_with_version_in_inner_table(guard))) {
+        } else if (OB_FAIL(guard.get_table_schema(table_id, table))) {
+        } else if (OB_ISNULL(table)) {
+          ret = OB_TABLE_NOT_EXIST;
+        } else if (OB_FAIL(ObAiModelSqlService::prepare_input_modalities_upgrade(
+            *table, verification, still_missing))) {
+        } else if (still_missing) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          FLOG_INFO("upgraded AI model input modalities", K(table_id));
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+      FLOG_WARN("failed to upgrade AI model input modalities", KR(ret), K(table_id));
+      break;
+    }
+  }
+  return ret;
+}
+
 int ObLocalManagementService::check_parallel_ddl_conflict(
     share::schema::ObSchemaGetterGuard &schema_guard,
     const obcall::ObDDLArg &arg)

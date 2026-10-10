@@ -1359,11 +1359,20 @@ int ObSchemaServiceSQLImpl::get_sys_variable_schema(
   }
 
   if (OB_SUCC(ret)) {
-    // To avoid -5044 error, mock missed system variable schema with default value by hardcoded schema.
     for (int64_t i = 0; OB_SUCC(ret) && i < ObSysVariables::get_amount(); i++) {
       ObSysVarClassType sys_var_id = ObSysVariables::get_sys_var_id(i);
       const ObSysVarSchema *sys_var = NULL;
-      if (OB_FAIL(sys_variable_schema.get_sysvar_schema(sys_var_id, sys_var))) {
+      if (nullptr == sys_variable_schema.get_sysvar_schema(i)
+          && (sys_var_id == SYS_VAR_AI_MEDIA_ROOT
+              || sys_var_id == SYS_VAR_AI_MEDIA_MAX_BYTES
+              || sys_var_id == SYS_VAR_AI_MEDIA_PARALLEL)) {
+        // Publish safe defaults so an old catalog can load before primary-only persistence.
+        if (OB_FAIL(sys_variable_schema.add_default_system_variable(sys_var_id))) {
+          LOG_WARN("failed to initialize missing AI media system variable", KR(ret), K(sys_var_id));
+        } else {
+          LOG_INFO("loaded default for unpersisted AI media system variable", K(sys_var_id));
+        }
+      } else if (OB_FAIL(sys_variable_schema.get_sysvar_schema(sys_var_id, sys_var))) {
       } else if (OB_ISNULL(sys_var)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("sys_var is null", KR(ret), K(sys_var_id),

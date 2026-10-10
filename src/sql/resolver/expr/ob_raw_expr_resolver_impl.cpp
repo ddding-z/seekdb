@@ -5410,7 +5410,37 @@ int ObRawExprResolverImpl::process_fun_sys_node(const ParseNode *node,
         LOG_WARN("failed to check param num", K(func_name), K(ret));
       }
     } else {
-      expr = func_expr;
+      const ObItemType type = func_expr->get_expr_type();
+      if (type == T_FUN_SYS_AI_MAP || type == T_FUN_SYS_AI_FILTER || type == T_FUN_SYS_AI_JOIN) {
+        const int64_t begin = type == T_FUN_SYS_AI_JOIN ? 2 : 1;
+        const int64_t end = type == T_FUN_SYS_AI_JOIN ? 4 : 2;
+        for (int64_t index = begin; OB_SUCC(ret) && index < end &&
+                                   index < func_expr->get_param_count(); ++index) {
+          ObRawExpr *argument = func_expr->get_param_expr(index);
+          if (nullptr != argument && argument->get_expr_type() == T_OP_ROW) {
+            ObSysFunRawExpr *input = nullptr;
+            if (OB_FAIL(ctx_.expr_factory_.create_raw_expr(T_FUN_SYS_AI_INPUT, input))) {
+            } else if (OB_ISNULL(input)) {
+              ret = OB_ERR_UNEXPECTED;
+            } else if (OB_FAIL(input->init_param_exprs(argument->get_param_count()))) {
+            } else {
+              input->set_func_name(ObString(N_AI_INPUT));
+              for (int64_t part = 0; OB_SUCC(ret) && part < argument->get_param_count(); ++part) {
+                if (OB_FAIL(input->add_param_expr(argument->get_param_expr(part)))) {
+                }
+              }
+              if (OB_SUCC(ret) && OB_FAIL(input->check_param_num())) {
+              } else if (OB_SUCC(ret) && OB_FAIL(input->extract_info())) {
+              } else if (OB_SUCC(ret)) {
+                func_expr->get_param_expr(index) = input;
+              }
+            }
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        expr = func_expr;
+      }
     }
   }
   return ret;

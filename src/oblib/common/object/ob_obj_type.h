@@ -85,6 +85,7 @@ enum ObObjType
   ObCollectionSQLType  = 40, // collection(varray and nested table) in SQL
   ObMySQLDateType      = 41, // date type which is compatible with MySQL.
   ObMySQLDateTimeType  = 42, // datetime type which is compatible with MySQL.
+  ObFileType          = 43, // versioned external file reference
   ObMaxType,                 // invalid type, or count of obj type
                             //
   ObTimestampLTZType  = 47, // timestamp with local time zone
@@ -200,6 +201,7 @@ static ObObjOType OBJ_TYPE_TO_O_TYPE[ObMaxType+1] = {
   ObOCollectionSqlType,      //ObCollectionSQLType = 40,
   ObONotSupport,             //ObMySQLDateType = 41,
   ObONotSupport,             //ObMySQLDateTimeType = 42,
+  ObONotSupport,             //ObFileType = 43,
   ObONotSupport              //ObMaxType,
 };
 
@@ -235,6 +237,7 @@ enum ObObjTypeClass
   ObCollectionSQLTC = 26, // collection type class in SQL
   ObMySQLDateTC     = 27, // mysql date type class
   ObMySQLDateTimeTC = 28, // mysql date time type class
+  ObFileTC         = 29, // external file reference type class
   ObMaxTC,
   // invalid type classes are below, only used as the result of XXXX_type_promotion()
   // to indicate that the two obj can't be promoted to the same type.
@@ -288,7 +291,8 @@ enum ObObjTypeClass
     (ObDecimalIntType, ObDecimalIntTC),        \
     (ObCollectionSQLType, ObCollectionSQLTC),  \
     (ObMySQLDateType, ObMySQLDateTC),          \
-    (ObMySQLDateTimeType, ObMySQLDateTimeTC)
+    (ObMySQLDateTimeType, ObMySQLDateTimeTC),   \
+    (ObFileType, ObFileTC)
 
 #define SELECT_SECOND(x, y) y
 #define SELECT_TC(arg) SELECT_SECOND arg
@@ -332,6 +336,7 @@ const ObObjType OBJ_DEFAULT_TYPE[ObActualMaxTC] =
   ObCollectionSQLType,  // collection type in sql
   ObMySQLDateType,     // mysql date
   ObMySQLDateTimeType, // mysql datetime
+  ObFileType,       // file reference
   ObMaxType,        // maxtype
   ObUInt64Type,     // int&uint
   ObMaxType,        // lefttype
@@ -1221,8 +1226,10 @@ OB_INLINE VecValueTypeClass get_vec_value_tc(const ObObjType type, const int16_t
     MAX_VEC_TC,               // invalid for ObDecimalIntType
     VEC_TC_COLLECTION,        // ObCollectionSQLType
     VEC_TC_MYSQL_DATE,        // reserved for ObMySQLDateType
-    VEC_TC_MYSQL_DATETIME     // reserved for ObMySQLDateTimeType
+    VEC_TC_MYSQL_DATETIME,    // reserved for ObMySQLDateTimeType
+    VEC_TC_STRING,            // ObFileType
   };
+  static_assert(ARRAYSIZEOF(maps) == ObMaxType, "new type needs a vector value mapping");
   VecValueTypeClass t = MAX_VEC_TC;
   if (type < 0 || type >= ObMaxType) {
     OB_ASSERT(false);
@@ -1367,6 +1374,7 @@ inline bool ob_is_bit_tc(ObObjType type) { return ObBitTC == ob_obj_type_class(t
 inline bool ob_is_raw_tc(ObObjType type) { return ObRawTC == ob_obj_type_class(type); }
 inline bool ob_is_interval_tc(ObObjType type) { return ObIntervalTC == ob_obj_type_class(type); }
 inline bool ob_is_json_tc(ObObjType type) { return ObJsonTC == ob_obj_type_class(type); }
+inline bool ob_is_file_tc(ObObjType type) { return ObFileTC == ob_obj_type_class(type); }
 inline bool ob_is_geometry_tc(ObObjType type) { return ObGeometryTC == ob_obj_type_class(type); }
 inline bool ob_is_decimal_int_tc(ObObjType type) { return ObDecimalIntTC == ob_obj_type_class(type); }
 inline bool is_lob(ObObjType type) { return ob_is_text_tc(type); }
@@ -1491,6 +1499,7 @@ inline bool ob_is_support_cmp_mem_str_type(ObObjType type, ObCollationType cs_ty
   return (ob_is_string_tc(type) || type == ObTinyTextType) && cs_type == CS_TYPE_UTF8MB4_BIN;
 }
 inline bool ob_is_json(const ObObjType type) { return ObJsonType == type; }
+inline bool ob_is_file(const ObObjType type) { return ObFileType == type; }
 inline bool ob_is_string_or_lob_type(ObObjType type) {
   return ob_is_string_tc(type) || ob_is_text_tc(type);
 }
@@ -1505,13 +1514,14 @@ inline bool ob_is_extend(const ObObjType type) { return ObExtendType == type; }
 inline bool ob_is_accuracy_length_valid_tc(ObObjType type) { return ob_is_string_type(type) ||
                                                              ob_is_enumset_tc(type) ||
                                                              ob_is_json_tc(type) ||
-                                                             ob_is_geometry_tc(type); }
+                                                             ob_is_geometry_tc(type) ||
+                                                             ob_is_file(type); }
 inline bool ob_is_string_or_enumset_tc(ObObjType type) { return ObStringTC == ob_obj_type_class(type) || ob_is_enumset_tc(type); }
 inline bool ob_is_large_text(ObObjType type) { return ObTextType <= type && ObLongTextType >= type; }
 inline bool ob_is_datetime(const ObObjType type) { return ObDateTimeType == type; }
 inline bool ob_is_mysql_datetime(const ObObjType type) { return ObMySQLDateTimeType == type; }
 inline bool ob_is_var_len_type(const ObObjType type) {
-  return ob_is_string_type(type);
+  return ob_is_string_type(type) || ob_is_file(type);
 }
 inline bool ob_is_collection_sql_type(const ObObjType type) { return ObCollectionSQLType == type; }
 inline bool is_lob_storage(const ObObjType type) { return ob_is_large_text(type)

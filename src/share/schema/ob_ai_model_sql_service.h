@@ -34,6 +34,7 @@
  {
  
  class ObCreateAiModelArg;
+ class ObAlterTableArg;
  
  }
  namespace share
@@ -43,6 +44,7 @@
  {
  
  class ObAiModelSchema;
+ class ObTableSchema;
  
  class ObAiModelSqlService final: public ObDDLSqlService
  {
@@ -61,6 +63,11 @@
                    const int64_t new_schema_version,
                    const ObString &ddl_stmt,
                    common::ObISQLClient &sql_client);
+
+ static int prepare_input_modalities_upgrade(
+     const ObTableSchema &table_schema,
+     obcall::ObAlterTableArg &arg,
+     bool &needs_upgrade);
  
  private:
    DISALLOW_COPY_AND_ASSIGN(ObAiModelSqlService);

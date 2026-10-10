@@ -5481,6 +5481,7 @@ int ObDMLResolver::resolve_order_clause(const ParseNode *order_by_node, bool is_
         ParseNode *sort_node = sort_list->children_[i];
         OrderItem order_item;
         if (OB_FAIL(resolve_order_item(*sort_node, order_item))) {
+        } else if (OB_FAIL(ObResolverUtils::check_file_key_expr(order_item.expr_, "ordering by FILE"))) {
         } else if (OB_FAIL(stmt->add_order_item(order_item))) {
         }
         if (OB_ERR_AGGREGATE_ORDER_FOR_UNION == ret) {

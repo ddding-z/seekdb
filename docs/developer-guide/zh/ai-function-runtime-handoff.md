@@ -1,6 +1,6 @@
 # AI Function、异步 Semantic Operators 与全局 SOLO 维护交接
 
-更新日期：2026-10-09。适用基线：`8dcadbc7c`，`feat(sql): add asynchronous semantic map and filter operators`；本轮在该基线上增加 semantic join 首版。
+更新日期：2026-10-09。适用基线：`da4ac3f56`，`feat(sql): add asynchronous semantic join operator`；本轮在该基线上增加原生 FILE 和多模态输入。
 
 本文面向接手实现、调试和回归测试的开发者，覆盖 AI Function 异步运行时及全阻塞 SOLO。这里的 SOLO 是数据库端的输入排列算法，不是推理服务端的 KV cache 实现。
 
@@ -17,7 +17,7 @@
 | AI_JOIN | INNER JOIN ON 的显式语义连接；普通 SQL 候选对生成加有界异步判断，不做近似候选裁剪 |
 | 语义 PX | 经校验的 reduce-transmit / semantic / GI / scan 路径保留任务状态并释放物理 worker；同一查询共享预算 |
 
-旧 AI Function 与 SOLO、AI_MAP / AI_FILTER 和可恢复 PX 实现已在基线提交中。本轮新增 AI_JOIN；下文保留旧路径的维护约束，不应把旧 SOLO 的单 worker 限制套到新接口上。
+旧 AI Function 与 SOLO、AI_MAP / AI_FILTER / AI_JOIN 和可恢复 PX 实现已在基线提交中。本轮新增 FILE；下文保留旧路径的维护约束，不应把旧 SOLO 的单 worker 限制套到新接口上。
 
 已有的 [RUNTIME_TESTS.md](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md) 是运行契约、测试入口和历史验收记录。本文解释当前架构、维护约束和排障路径；行为或测试变更时，两份文档应一起更新。外层工作区另有历史执行能力补齐计划，但它不是本仓库依赖，也不应被当作最新 SOLO 规范。
 
@@ -26,6 +26,7 @@
 | 提交 | 用途 |
 | --- | --- |
 | `8dcadbc7c` | 异步 AI_MAP / AI_FILTER 与可恢复 PX；semantic join 的实现基线 |
+| `da4ac3f56` | 异步 INNER AI_JOIN、候选合批和连接绑定；FILE 的实现基线 |
 | `0532d6e33` | 全局 SOLO 与相关验收 |
 | `5bfa9aaed` | 可恢复的多槽 AI 流水线与共享预算 |
 | `b30697580` | 共享后台网络调度线程 |
@@ -56,6 +57,15 @@ AI_MAP 返回 LONGTEXT；AI_FILTER 只接受模型返回的 `{"value": true}` �
 部分行，不能把“这个算子负责它”误当成“所有行都已经算完”。已算过的值随对应行
 传递，后面的阶段直接复用；没算过的值只在真正需要的位置补算。尤其是 SELECT
 投影要在 LIMIT 之后补算，不能先计算被丢弃行的模型请求或 prompt 参数。
+
+没有 LIMIT 且排序键只包含列、已物化聚合结果或常量时，语义投影先分配在
+ORDER BY 之前，避免最终 gather 把所有模型准备集中到 coordinator。计算型排序键
+仍保留原来的求值顺序：例如 JSON_EXTRACT 报错时不能先读取 SELECT 中的 FILE。
+这不是允许把模型请求下推到 LIMIT、WHERE/HAVING 或聚合输入之前。
+普通向量化 full sort 的收集阶段已支持恢复；PX 任务准入复用同一个 SortSpec
+能力判断，不能因为计划中存在 SORT 就禁用整个模型等待的 worker 释放。
+prefix/local-merge/partition sort、prescan、WITH TIES、近似 Top-K 和 Top-N filter
+仍受保护；强制 dump 或已经 spill 的运行时也不会借此扩大挂起边界。
 
 实现使用显式 shared/carried 元数据：只有声明过的语义结果可以携带内部
 “尚未请求”的 NULL 标记，正常 AI_MAP/AI_FILTER 结果不会是 SQL NULL。false 和
@@ -382,3 +392,132 @@ SOLO 覆盖全局跨批排列、末行非法零请求、条件前缀选列、JSO
 5. 租户公平和更精确的内存/服务端指标。当前实例逻辑总额不是租户配额，也不是严格 RSS 限制；HTTP 发送顺序不是服务端调度控制。
 
 建议接手者先用第 2 节确认路径，再构建并执行最小 SOLO 检查，随后根据修改范围运行完整验收。变更输入契约、预算或调度策略时，先添加能失败的对应测试，再改实现；交付时记录实际提交、运行命令、测试结果及未验证范围，不覆盖旧的历史证据。
+
+## 10. 原生 FILE 与多模态维护契约
+
+FILE 保存有类型的外部引用，不保存图片/音频内容，也不是 JSON 的别名。
+`TO_FILE(path_or_json)` 只做格式校验和词法规范化，不做文件 I/O；
+`FILE_URI(file)` 返回规范 URI，`FILE_META(file)` 返回版本化 JSON 元数据。
+这三个函数对 SQL NULL 返回 NULL。首版来源是绝对本地路径或 `file:///`，
+不包括 HTTP、stage、上传或临时签名 URL。外部文件不参与数据库 MVCC，
+删除引用也不会删除文件。
+
+```sql
+CREATE TABLE image_data (id BIGINT PRIMARY KEY, image FILE NOT NULL);
+INSERT INTO image_data VALUES (1, TO_FILE('/data/animals/zebra.png'));
+SELECT id FROM image_data
+WHERE AI_FILTER('vision_model', ('Does this image contain a zebra?', image));
+```
+
+模型通过现有 CREATE_AI_MODEL JSON 声明
+`"input_modalities":["text","image"]`，或增加 `"audio"`；没有该字段仍是纯文本。
+模态名称区分大小写，必须包含 text，不允许空数组、重复、未知值或非字符串。
+只有 completion 模型可声明媒体输入。声明不是数据库自动发现的模型能力，
+也不能证明 endpoint 真正支持相应输入与严格布尔 schema。
+
+读取需要管理员设置 GLOBAL-only 的 `ai_media_root`，默认空值禁止读取，
+普通会话不能扩大根目录。`ai_media_max_bytes` 默认每文件 2 MiB，
+`ai_media_parallel` 默认查询内四个加载准入，可按会话调整。
+引用构造/元数据投影不需要启用读取。越界、符号链接、非普通文件、缺失、
+损坏、超限、读取期间变化或元数据不匹配必须报错，不能降级为文字或 false。
+
+输入可以是 FILE，或最多 64 项的有序 tuple：首项文字，后续文字/FILE。
+普通字符串即使像路径也仍是文字。内部 AI_INPUT 把 tuple 降为临时 JSON 配方，
+`$seekdb_ai_input` 是内部保留标记；不能把它当作 FILE 的存储格式或公开稳定接口。
+配方保留次序，按需接回原生编码的 FILE 引用。NULL 错误在实际语义调用处报告，
+未选中的 CASE/AND/OR 分支不能因为加载媒体产生副作用。
+
+共享 media runtime 随查询预算存活，后台任务拥有读取/编码缓冲，不访问 SQL frame。
+文件准入和 logical-wave task credit 分开；前一个 HTTP 子批次仍被扣住时，
+同一 wave 中后来准备好的行也能继续提交。每个 Dispatch 拥有独立 body arena、
+client batch 和行位置映射；其结束只释放对应缓冲和字节计账，不能释放整个 wave
+的 credit 或清掉其余配方。所有 Dispatch 合计在途行数不超过已拥有的 SQL 批大小，
+完整 wave 结束后才释放输入 arena 和逻辑 credit。media ready 只表示完成，
+构造请求前还必须检查 result、MIME 和 base64，失败不能变成空图片请求。
+须先取消/排空网络任务，再释放 FILE handle；
+execution state 也须先释放 media runtime 再释放预算，否则 weak registry 和计账滞留。
+
+首版明确只支持 provider=openai：图片为 `image_url` data URI，音频为
+`input_audio` base64/format，不做 ASR。文本协议兼容不等于媒体兼容。
+AI_JOIN 以明确左右标签保持参数角色，旧文本/JSON JOIN prompt 不变。
+4 MiB 请求等原有限额仍按真实序列化报文检查，base64 和中间副本也需预算。
+
+FILE 整值不开放 key/index、比较、排序、GROUP/DISTINCT、算术或拼接；
+URI/META 投影才是普通 SQL 值。非键值传递、NULL、COUNT 和兼容 CASE/COALESCE
+保留类型。MySQL 协议以已有 wire type 输出 JSON 文本引用，不发送未知类型码
+或原生内部编码。FILE 数据要求支持该类型的服务端，不能把本轮检查当作旧二进制
+降级或混合版本滚动升级的证明。
+
+旧库升级有两层：schema fetch 只对缺少的三项新媒体变量提供明确记录的安全默认值，
+不能对任意缺失变量悄悄补默认，也不能覆盖已有 policy。系统表 schema 发布之后，
+可写 primary 才用一个事务持久化缺少的变量及 history 并刷新；不能在系统表可解析
+之前执行这段 SQL。随后初始化 DDL/max-ID 服务，使用初始化后的 UTC time-zone map
+只添加模型的 input_modalities 列，在确认两张表的列 ID/default 后才标记 ready。
+standby/write-fenced 启动不做本地 catalog 迁移；primary 提升及 committed retry
+在打开正常写入前检查持久化媒体变量和模型列，缺失则返回 OB_SCHEMA_EAGAIN，
+不能为迁移暂时打开写入。
+
+原生 FILE 首轮 Debug 构建上通过：64/64 FILE SQL、25/25 fixture、自建旧库到新库的
+实际升级及二次重启、9 组 codec、4 项 storage/wire 与 5 种 microblock 编码、
+29 组异步 loader、12 组输入/provider、13 组模型/default 重复 3 次、
+12 张类型矩阵和 12 项 parser AST。minor 验收使用定向 TABLET_ID freeze 并确认
+新的 MINI/MINOR 完成记录；major 同样确认完成后再重启，未把 freeze 命令成功
+或 skip 当作落盘证明。首轮多模态 PX 使用无最终排序的查询，要求四个真实 task
+和多个 CPU thread；DOP 标签本身不能证明 AI 调用分布在 PX worker。
+另通过 2 项只读 catalog 重启契约：旧 standby 不持久化缺失的媒体变量/模型列，
+新 standby 保留已有 policy、mask/history 与 FILE 值，普通写入仍被拒绝。
+codec 也通过仓库标准 Bazel test；5 项受控 Dispatch 场景再次通过。
+
+首轮同一 binary 的旧回归也通过：39 map/filter、26 composition、45 join、9 PX、
+105 旧 AI Function/SOLO、140 次 native 资源检查、native collection，以及两个
+正常 SIGUSR1 零退出码 shutdown。复制追平后的 standby activation 端到端仍不在
+本地升级验收范围内；未到达 catalog 检查的 timeout 不能算作提升 write-fence
+测试通过。
+
+后续增量 Debug 构建已通过 68/68 FILE SQL、27/27 fixture、39 map/filter、
+30 composition、45 join、15 项实际 PX、150 次 native 资源/SortSpec 能力检查
+和 native collection；105 项旧 AI Function/SOLO 也在该增量构建上重新通过。
+新排序用例保持 SQL 的复合键/字符串排序、完整 FILE
+值和精确请求计数；同时要求四个实际 task、多个 CPU thread、单任务默认
+32 个扣住的请求，以及扣住所有回复期间零活动 PX worker slice。嵌套任务仍按
+真实语义调用数共享预算，排序不能提前发送依赖任务。
+新增缺失文件哨兵验证 LIMIT 丢弃行不加载、计算型排序错误先于 FILE demand。
+取消、deadline、provider 错误后仍可在同一连接恢复。
+
+另新增 [held FILE 正常停机入口](../../../tools/deploy/mysql_test/test_suite/ai_function/test_file_shutdown.py)：
+coordinator 和带 full sort 的实际 PX 分别启动独立数据库，保持 SQL 客户端和
+媒体 HTTP gate 打开，直接 SIGUSR1，要求服务端在十秒内零退出码停止，SQL 客户端
+收到关闭错误；不能先断客户端、释放模型回复或强杀后声称正常停机通过。
+两种实际场景均已通过，不再仅借用纯文本 shutdown 或 native loader teardown
+作为 FILE SQL 停机证据。
+
+真实文本模型入口为
+[test_semantic_live.py](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_live.py)，
+只允许显式指定的 loopback endpoint/model，并使用新的私有数据库。
+vLLM 0.22.1 + Qwen3-4B-Instruct-2507 上已通过严格 schema 预检和六项实际
+MAP/FILTER/JOIN/关系组合 SQL；65 项 DB-free runner 检查也通过。
+这是小型合成标签的真实推理正确性证据，不是 SemBench 质量或速度报告。
+现有视觉 9B 权重不完整，四项 opt-in FILE 实模契约尚未运行。
+
+该联调发现 JSON_EXTRACT 会把等待中的 OB_EAGAIN 改成 JSON 错误，
+JSON_UNQUOTE/JSON_PRETTY 又改成 5874，JSON_VALID 则错误地提前返回 false。
+已修复这些等待状态的传播，JSON_VALID 的子表达式错误也不再变成成功的 false；
+已完成的非法 JSON 内容仍按原语义返回 false，CASE 未选中分支仍不求值。
+新增四项组合回归后完整 composition 为 30 项，105 项旧 SQL 再次通过；
+完整 PX 为 15 项，排序 JSON 投影验证了请求数、四个 task 和挂起时 worker 释放。
+四格式 FILE 输入经过 MAP 后再 JSON_EXTRACT/JSON_UNQUOTE 的投影也通过。
+
+本地 SemBench 实验已新增显式 opt-in 的 `semantic` 模式，旧默认模式、历史
+SQL 和历史结果未替换。真实 Qwen3-4B 上，ecomm_q1/ecomm_q5 各四行、
+ecomm_q7 两个合格商品形成四个有序候选对，legacy 与原生语义版本均完成，
+三项最终有序 bag/hash 一致。Q7 每个版本恰好四次模型调用，结果保留两个自匹配。
+69 项实验生成/比较/默认配置契约通过。这里不比较阶段答案/token 等价性，
+不计算加速比，也不能推广为完整 SemBench 的质量/性能报告。
+临时 vLLM 服务在验收后已正常零退出码停止，已确认它的 API/engine 进程退出、
+独占的回环端口关闭和 GPU 资源归还；没有留下需要用户手动关闭的测试服务。
+
+验证入口为 [FILE SQL/fixture 契约](../../../tools/deploy/mysql_test/test_suite/ai_function/test_file_runtime.py)
+、[codec/storage/loader runner](../../../tools/deploy/mysql_test/test_suite/ai_function/test_file_native.py)
+和 [有序输入原生契约](../../../unittest/sql/engine/test_semantic_input.cpp)。
+构建、持久化重开、实际 PX、取消/停机及旧语义回归需分别记录；
+mock 成功不等于真实模型质量、完整 SemBench 可运行性或加速已验证。

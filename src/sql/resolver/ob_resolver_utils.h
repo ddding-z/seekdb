@@ -391,6 +391,7 @@ public:
   static int resolve_str_charset_info(const ParseNode &type_node,
                                       common::ObDataType &data_type,
                                       const bool is_for_pl_type);
+  static int check_file_key_expr(const ObRawExpr *expr, const char *operation);
 
   static int resolve_timestamp_node(const bool is_set_null,
                                     const bool is_set_default,

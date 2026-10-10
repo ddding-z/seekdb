@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX COMMON
 #include "ob_accuracy.h"
 #include "common/number/ob_number_v2.h"
+#include "common/object/file_ref.h"
 
 namespace oceanbase
 {
@@ -69,6 +70,7 @@ const ObAccuracy ObAccuracy::DDL_DEFAULT_ACCURACY[ObMaxType] = {
   ObAccuracy(OB_MAX_LONGTEXT_LENGTH),     // collection type in sql
   ObAccuracy(10, 0),         // mysql date.
   ObAccuracy(19, 6),         // mysql datetime.
+  ObAccuracy(FileRefCodec::MAX_REF_BYTES), // file reference.
 };
 
 const ObAccuracy ObAccuracy::DDL_DEFAULT_ACCURACY2[1][ObMaxType] = {
@@ -116,6 +118,7 @@ const ObAccuracy ObAccuracy::DDL_DEFAULT_ACCURACY2[1][ObMaxType] = {
     ObAccuracy(OB_MAX_LONGTEXT_LENGTH),        // collection type in sql
     ObAccuracy(10, 0),         // mysql date.
     ObAccuracy(19, 6),         // mysql datetime.
+    ObAccuracy(FileRefCodec::MAX_REF_BYTES), // file reference.
   }
 };
 
@@ -163,6 +166,7 @@ const ObAccuracy ObAccuracy::MAX_ACCURACY[ObMaxType] = {
   ObAccuracy(OB_MAX_LONGTEXT_LENGTH),         // collection type in sql
   ObAccuracy(10, 0),         // mysql date.
   ObAccuracy(19, 6),         // mysql datetime.
+  ObAccuracy(FileRefCodec::MAX_REF_BYTES), // file reference.
 };
 
 const ObAccuracy ObAccuracy::MAX_ACCURACY2[1][ObMaxType] = {
@@ -210,6 +214,7 @@ const ObAccuracy ObAccuracy::MAX_ACCURACY2[1][ObMaxType] = {
     ObAccuracy(OB_MAX_LONGTEXT_LENGTH),  // collection type in sql
     ObAccuracy(10, 0),         // mysql date.
     ObAccuracy(19, 6),         // mysql datetime.
+    ObAccuracy(FileRefCodec::MAX_REF_BYTES), // file reference.
   }
 };
 
@@ -257,6 +262,7 @@ const ObAccuracy ObAccuracy::DML_DEFAULT_ACCURACY[ObMaxType] = {
   ObAccuracy(OB_MAX_LONGTEXT_LENGTH),         // collection type in sql
   ObAccuracy(0, 0),         // mysql date.
   ObAccuracy(0, 6),         // mysql datetime.
+  ObAccuracy(FileRefCodec::MAX_REF_BYTES), // file reference.
 };
 
 OB_SERIALIZE_MEMBER_SIMPLE(ObAccuracy, accuracy_);

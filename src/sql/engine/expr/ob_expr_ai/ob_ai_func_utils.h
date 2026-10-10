@@ -43,6 +43,9 @@ public:
                          common::ObString &content,
                          common::ObJsonObject *config,
                          common::ObJsonObject *&body) override;
+    int get_media_body(common::ObIAllocator &allocator, common::ObString &model,
+                       common::ObJsonArray &parts, common::ObJsonObject *config,
+                       common::ObJsonObject *&body) override;
     virtual int parse_output(common::ObIAllocator &allocator,
                              common::ObJsonObject *http_response,
                              common::ObIJsonBase *&result) override;
@@ -363,7 +366,8 @@ public:
    // completion
    int call_completion(ObString &prompt, ObJsonObject *config, ObString &result);
    int call_completion_vector(ObArray<ObString> &prompts, ObJsonObject *config, ObArray<ObString> &results);
-  int start_completion_batch(ObArray<ObString> &prompts, ObJsonObject *config, AIFuncBatch &batch);
+  int start_completion_batch(ObArray<ObString> &prompts, ObJsonObject *config, AIFuncBatch &batch,
+                             const ObIArray<ObJsonArray *> *media_parts = nullptr);
    // dense_embedding
    int call_dense_embedding(ObString &content, ObJsonObject *config, ObString &result);
    int call_dense_embedding_vector(ObArray<ObString> &contents, ObJsonObject *config, ObArray<ObString> &results);

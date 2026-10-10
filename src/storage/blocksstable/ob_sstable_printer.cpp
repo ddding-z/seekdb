@@ -99,6 +99,7 @@ static const char * OB_OBJ_TYPE_NAMES[ObMaxType] = {
     "ObEnumType", "ObSetType", "ObEnumInnerType", "ObSetInnerType",
     "ObJsonType", "ObGeometryType", "ObUserDefinedSQLType", "ObDecimalIntType",
     "ObCollectionSQLType", "ObMySQLDateType", "ObMySQLDateTimeType",
+    "ObFileType",
 };
 
 void ObSSTablePrinter::print_title(const char *title, const int64_t level)

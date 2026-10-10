@@ -61,7 +61,8 @@ public:
           && !name_.empty()
           && type_ != EndpointType::MAX_TYPE
           && !model_name_.empty()
-          && schema_version_ != OB_INVALID_VERSION;
+          && schema_version_ != OB_INVALID_VERSION
+          && AiInputModality::is_valid(input_modalities_, type_);
   }
 
   void reset()
@@ -72,6 +73,7 @@ public:
     model_name_.reset();
     schema_version_ = OB_INVALID_VERSION;
     case_mode_ = common::OB_NAME_CASE_INVALID;
+    input_modalities_ = AiInputModality::TEXT;
   }
 
   int assign(const ObAiModelSchema &other); 
@@ -83,6 +85,7 @@ public:
   OB_INLINE ObString get_name() const { return name_; }
   OB_INLINE EndpointType::TYPE get_type() const { return type_; }
   OB_INLINE ObString get_model_name() const { return model_name_; }
+  OB_INLINE int64_t get_input_modalities() const { return input_modalities_; }
   OB_INLINE int64_t get_schema_version() const { return schema_version_; }
   OB_INLINE common::ObNameCaseMode get_case_mode() const { return case_mode_; }
 
@@ -91,6 +94,7 @@ public:
   OB_INLINE int set_name(const ObString &name) { return deep_copy_str(name, name_); }
   OB_INLINE void set_type(const EndpointType::TYPE &type) { type_ = type; }
   OB_INLINE int set_model_name(const ObString &model_name) { return deep_copy_str(model_name, model_name_); }
+  OB_INLINE void set_input_modalities(const int64_t input_modalities) { input_modalities_ = input_modalities; }
   OB_INLINE void set_schema_version(const int64_t &schema_version) { schema_version_ = schema_version; }
   OB_INLINE void set_case_mode(const common::ObNameCaseMode &case_mode) { case_mode_ = case_mode; }
 
@@ -98,7 +102,8 @@ public:
                K_(name),
                K_(type),
                K_(model_name),
-               K_(schema_version));
+               K_(schema_version),
+               K_(input_modalities));
 
 private:
   uint64_t model_id_;
@@ -107,6 +112,7 @@ private:
   ObString model_name_;
   int64_t schema_version_;
   common::ObNameCaseMode case_mode_;
+  int64_t input_modalities_;
   DISALLOW_COPY_AND_ASSIGN(ObAiModelSchema);
 };
 

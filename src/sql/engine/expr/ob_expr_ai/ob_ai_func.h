@@ -37,7 +37,7 @@ struct ObAIFuncExprInfo : public ObIExprExtraInfo
 public:
   ObAIFuncExprInfo(common::ObIAllocator &alloc, ObExprOperatorType type)
       : ObIExprExtraInfo(alloc, type), 
-        name_(), type_(), model_()
+        name_(), type_(), model_(), input_modalities_(share::AiInputModality::TEXT)
   {
   }
   virtual ~ObAIFuncExprInfo() {}
@@ -46,6 +46,7 @@ public:
     name_.reset();
     type_ = share::EndpointType::MAX_TYPE;
     model_.reset();
+    input_modalities_ = share::AiInputModality::TEXT;
   }
   virtual int deep_copy(common::ObIAllocator &allocator,
                         const ObExprOperatorType type,
@@ -54,6 +55,7 @@ public:
   common::ObString name_;
   share::EndpointType::TYPE type_;
   common::ObString model_;
+  int64_t input_modalities_;
 };
 
 class ObAIFuncBase 
@@ -92,6 +94,20 @@ public:
                        common::ObString &content,
                        common::ObJsonObject *config,
                        common::ObJsonObject *&body) = 0;
+  virtual int get_media_body(common::ObIAllocator &allocator,
+                            common::ObString &model,
+                            common::ObJsonArray &parts,
+                            common::ObJsonObject *config,
+                            common::ObJsonObject *&body)
+  {
+    UNUSED(allocator);
+    UNUSED(model);
+    UNUSED(parts);
+    UNUSED(config);
+    UNUSED(body);
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "this provider does not support FILE inputs");
+    return OB_NOT_SUPPORTED;
+  }
   virtual int set_config_json_format(common::ObIAllocator &allocator, common::ObJsonObject *config) = 0;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncIComplete);

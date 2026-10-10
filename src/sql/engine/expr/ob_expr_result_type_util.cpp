@@ -17,29 +17,13 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "sql/engine/expr/ob_expr_result_type_util.h"
+#include "sql/engine/expr/ob_expr_type_map.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
 #include "src/sql/engine/ob_exec_context.h"
 
 namespace oceanbase
 {
 using namespace common;
-
-//Since ob use c++11, so we can not use loop or constains multiple return in constexpr function(which is supported in c++14)
-//So we use recursion and conditional assignment statement instead
-template <typename T, std::size_t row, std::size_t col>
-constexpr bool is_array_fully_initialized(const T (&arr)[row][col], int row_depth)
-{
-  return row_depth == 0 ?
-           true :
-           arr[row_depth - 1][col - 1] == T() ? false :
-                                                is_array_fully_initialized(arr, row_depth - 1);
-}
-
-template <typename T, std::size_t col>
-constexpr bool is_array_fully_initialized(const T (&arr)[col])
-{
-  return arr[col - 1] != T();
-}
 
 // following .map file depends on ns oceanbase::common;
 #include "sql/engine/expr/ob_expr_merge_result_type.map"
@@ -72,6 +56,9 @@ int ObExprResultTypeUtil::get_relational_cmp_type(ObObjType &type,
   if (OB_UNLIKELY(type1 >= ObMaxType || type2 >= ObMaxType)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("the wrong type", K(type1),K(type2),K(ret));
+  } else if (ObFileType == type1 || ObFileType == type2) {
+    ret = OB_ERR_INVALID_TYPE_FOR_OP;
+    LOG_WARN("whole FILE references cannot be compared", K(ret), K(type1), K(type2));
   } else {
     type = RELATIONAL_CMP_TYPE[type1][type2];
   }
@@ -86,6 +73,9 @@ int ObExprResultTypeUtil::get_relational_result_type(ObObjType &type,
   if (OB_UNLIKELY(type1 >= ObMaxType || type2 >= ObMaxType)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("the wrong type", K(type1),K(type2),K(ret));
+  } else if (ObFileType == type1 || ObFileType == type2) {
+    ret = OB_ERR_INVALID_TYPE_FOR_OP;
+    LOG_WARN("whole FILE references cannot be compared", K(ret), K(type1), K(type2));
   } else {
     type = RELATIONAL_RESULT_TYPE[type1][type2];
   }
@@ -101,6 +91,9 @@ int ObExprResultTypeUtil::get_relational_equal_type(ObObjType &type,
   if (OB_UNLIKELY(type1 >= ObMaxType || type1 < ObNullType || type2 < ObNullType || type2 >= ObMaxType)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("the wrong type", K(type1), K(type2), K(ret));
+  } else if (ObFileType == type1 || ObFileType == type2) {
+    ret = OB_ERR_INVALID_TYPE_FOR_OP;
+    LOG_WARN("whole FILE references cannot be compared", K(ret), K(type1), K(type2));
   } else {
     const ObObjType *equal_type_array = RELATIONAL_EQUAL_TYPE;
     type = equal_type_array[type1] == equal_type_array[type2] ? equal_type_array[type1] : ObMaxType;
@@ -117,6 +110,15 @@ int ObExprResultTypeUtil::get_merge_result_type(ObObjType &type,
   if (OB_UNLIKELY(type1 >= ObMaxType || type2 >= ObMaxType)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("the wrong type", K(type1),K(type2),K(ret));
+  } else if (ObFileType == type1 || ObFileType == type2) {
+    if ((ObFileType == type1 || ObNullType == type1)
+        && (ObFileType == type2 || ObNullType == type2)) {
+      type = ObFileType;
+    } else {
+      ret = OB_ERR_INVALID_TYPE_FOR_OP;
+      LOG_USER_ERROR(OB_ERR_INVALID_TYPE_FOR_OP, ob_obj_type_str(type1), ob_obj_type_str(type2));
+      LOG_WARN("FILE can only be merged with FILE or NULL", K(ret), K(type1), K(type2));
+    }
   } else {
     type = MERGE_RESULT_TYPE[type1][type2];
   }

@@ -741,6 +741,9 @@ namespace share
   static const char* const OB_SV_SPARSE_DROP_RATIO_SEARCH = "ob_sparse_drop_ratio_search";
   static const char* const OB_SV_AI_PIPELINE_SLOTS = "ai_pipeline_slots";
   static const char* const OB_SV_AI_PIPELINE_MEMORY_LIMIT = "ai_pipeline_memory_limit";
+  static const char* const OB_SV_AI_MEDIA_ROOT = "ai_media_root";
+  static const char* const OB_SV_AI_MEDIA_MAX_BYTES = "ai_media_max_bytes";
+  static const char* const OB_SV_AI_MEDIA_PARALLEL = "ai_media_parallel";
 
 }
 }

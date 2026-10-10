@@ -21,6 +21,7 @@
 #define memmem ob_memmem
 #endif
 #include "share/object/ob_decint_scale_util.h"
+#include "common/object/file_ref.h"
 #include "share/object/ob_obj_cast_util.h"
 #include "share/ob_lob_access_utils.h"
 #include "share/ob_json_access_utils.h"
@@ -12271,6 +12272,15 @@ int datum_accuracy_check(const ObExpr &expr,
                                    res_datum, warning);
         break;
       }
+      case ObFileTC: {
+        FileRef reference;
+        if (OB_FAIL(FileRefCodec::decode(in_datum.get_string(), reference))) {
+          LOG_WARN("invalid FILE column value", K(ret));
+        } else {
+          res_datum.set_datum(in_datum);
+        }
+        break;
+      }
 
       default: {
         res_datum.set_datum(in_datum);
@@ -12365,6 +12375,15 @@ int vector_accuracy_check(const ObExpr &expr,
       case ObMySQLDateTimeTC: {
         ret = mdatetime_scale_check(cast_mode, accuracy, type, idx, in_vec,
                                  out_vec, warning);
+        break;
+      }
+      case ObFileTC: {
+        FileRef reference;
+        if (OB_FAIL(FileRefCodec::decode(in_vec.get_string(idx), reference))) {
+          LOG_WARN("invalid FILE column vector value", K(ret), K(idx));
+        } else {
+          out_vec.set_payload_shallow(idx, in_vec.get_payload(idx), in_vec.get_length(idx));
+        }
         break;
       }
 
@@ -13507,7 +13526,12 @@ int ObDatumCast::check_can_cast(const ObObjType in_type,
     ((ObStringTC == in_tc || ObTextTC == in_tc || ObLobTC == in_tc) &&
     (ObStringTC == out_tc || ObTextTC == out_tc || ObLobTC == out_tc));
 
-  if (ObNullType == in_type || ObNullType == out_type) {
+  if ((ObFileType == in_type && ObFileType != out_type)
+      || (ObFileType == out_type && ObFileType != in_type && ObNullType != in_type)) {
+    ret = OB_ERR_INVALID_TYPE_FOR_OP;
+    LOG_USER_ERROR(OB_ERR_INVALID_TYPE_FOR_OP, ob_obj_type_str(in_type), ob_obj_type_str(out_type));
+    LOG_WARN("FILE conversion is forbidden", K(ret), K(in_type), K(out_type));
+  } else if (ObNullType == in_type || ObNullType == out_type) {
     // let null be ok
   } else {
   }
@@ -13563,6 +13587,8 @@ int ObDatumCast::is_trivial_cast(const ObObjType in_type,
   if (ObNullType == in_type) {
     // cast func of xxx(not_null)-> null is cast_not_expected() or cast_not_support()
     // cast func of null -> xxx is cast_eval_arg
+    is_trivial_cast = true;
+  } else if (ObFileType == in_type && ObFileType == out_type) {
     is_trivial_cast = true;
   } else if (may_be_trivial_cast) {
     if ((is_same_charset || CS_TYPE_BINARY == out_cs_type)) {
@@ -13663,7 +13689,9 @@ int ObDatumCast::choose_cast_function(const ObObjType in_type,
   if (OB_SUCC(ret)) {
     // TODO:@xiaofeng.lby, need to modify cast expr in batch mode
     // cast in batch mode will degrade into single row mode now
-    if (CM_IS_EXPLICIT_CAST(cast_mode)) {
+    if (ObFileType == out_type) {
+      rt_expr.eval_batch_func_ = expr_default_eval_batch_func;
+    } else if (CM_IS_EXPLICIT_CAST(cast_mode)) {
       rt_expr.eval_batch_func_ = ObBatchCast::get_explicit_cast_func(in_tc, out_tc);
     } else {
       rt_expr.eval_batch_func_ = ObBatchCast::get_implicit_cast_func(in_tc, out_tc);

@@ -379,6 +379,7 @@
 #include "sql/engine/expr/ob_expr_array_cardinality.h"
 #include "sql/engine/expr/ob_expr_tokenize.h"
 #include "sql/engine/expr/ob_expr_lock_func.h"
+#include "sql/engine/expr/ob_expr_file.h"
 #include "sql/engine/expr/ob_expr_decode_trace_id.h"
 #include "sql/engine/expr/ob_expr_topn_filter.h"
 #include "sql/engine/expr/ob_expr_get_path.h"
@@ -419,6 +420,7 @@
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_rerank.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_prompt.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_input.h"
 #include "sql/engine/expr/ob_expr_vector_similarity.h"
 #include "sql/engine/expr/ob_expr_lock_func.h"
 
@@ -1045,6 +1047,9 @@ void ObExprOperatorFactory::register_expr_operators()
     REG_OP(ObExprInnerInfoColsColumnTypePrinter);
     REG_OP(ObExprInnerInfoColsColumnKeyPrinter);
     REG_OP(ObExprVectorL2Squared);
+    REG_OP(ExprToFile);
+    REG_OP(ExprFileUri);
+    REG_OP(ExprFileMeta);
     REG_OP(ObExprAIComplete);
     REG_OP(ObExprAIEmbed);
     REG_OP(ObExprAIRerank);
@@ -1052,6 +1057,7 @@ void ObExprOperatorFactory::register_expr_operators()
     REG_OP(ExprAIMap);
     REG_OP(ExprAIFilter);
     REG_OP(ExprAIJoin);
+    REG_OP(ExprAIInput);
   }();
 }
 

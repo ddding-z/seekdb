@@ -5222,6 +5222,27 @@ public:
   inline virtual share::ObSysVarClassType get_type() const { return share::SYS_VAR_AI_PIPELINE_MEMORY_LIMIT; }
   inline virtual const common::ObObj &get_global_default_value() const { return share::ObSysVariables::get_default_value(720); }
 };
+class ObSysVarAiMediaRoot : public ObVarcharSysVar
+{
+public:
+  ObSysVarAiMediaRoot() : ObVarcharSysVar(NULL, NULL, NULL, NULL, NULL) {}
+  inline virtual share::ObSysVarClassType get_type() const { return share::SYS_VAR_AI_MEDIA_ROOT; }
+  inline virtual const common::ObObj &get_global_default_value() const { return share::ObSysVariables::get_default_value(721); }
+};
+class ObSysVarAiMediaMaxBytes : public ObIntSysVar
+{
+public:
+  ObSysVarAiMediaMaxBytes() : ObIntSysVar(NULL, NULL, NULL, NULL, NULL) {}
+  inline virtual share::ObSysVarClassType get_type() const { return share::SYS_VAR_AI_MEDIA_MAX_BYTES; }
+  inline virtual const common::ObObj &get_global_default_value() const { return share::ObSysVariables::get_default_value(722); }
+};
+class ObSysVarAiMediaParallel : public ObIntSysVar
+{
+public:
+  ObSysVarAiMediaParallel() : ObIntSysVar(NULL, NULL, NULL, NULL, NULL) {}
+  inline virtual share::ObSysVarClassType get_type() const { return share::SYS_VAR_AI_MEDIA_PARALLEL; }
+  inline virtual const common::ObObj &get_global_default_value() const { return share::ObSysVariables::get_default_value(723); }
+};
 
 
 class ObSysVarFactory

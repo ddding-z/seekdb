@@ -942,29 +942,39 @@ int ObSysVariableSchema::add_sysvar_schema(const ObSysVarSchema &sysvar_schema)
   return ret;
 }
 
+int ObSysVariableSchema::add_default_system_variable(ObSysVarClassType var_type)
+{
+  int ret = OB_SUCCESS;
+  int64_t index = OB_INVALID_INDEX;
+  ObSysVarSchema sysvar;
+  if (OB_FAIL(ObSysVarMeta::calc_sys_var_store_idx(var_type, index))) {
+  } else if (index < 0 || index >= ObSysVariables::get_amount()
+      || ObSysVariables::get_sys_var_id(index) != var_type) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid default system variable", K(ret), K(var_type), K(index));
+  } else {
+    const ObString value =
+        ObCharset::case_insensitive_equal(ObSysVariables::get_name(index), OB_SV_LOWER_CASE_TABLE_NAMES)
+        ? ObString::make_string("2") : ObSysVariables::get_value(index);
+    sysvar.set_data_type(ObSysVariables::get_type(index));
+    sysvar.set_flags(ObSysVariables::get_flags(index));
+    sysvar.set_schema_version(get_schema_version());
+    if (OB_FAIL(sysvar.set_name(ObSysVariables::get_name(index)))) {
+    } else if (OB_FAIL(sysvar.set_value(value))) {
+    } else if (OB_FAIL(sysvar.set_min_val(ObSysVariables::get_min(index)))) {
+    } else if (OB_FAIL(sysvar.set_max_val(ObSysVariables::get_max(index)))) {
+    } else if (OB_FAIL(sysvar.set_info(ObSysVariables::get_info(index)))) {
+    } else if (OB_FAIL(add_sysvar_schema(sysvar))) {
+    }
+  }
+  return ret;
+}
+
 int ObSysVariableSchema::load_default_system_variable()
 {
   int ret = OB_SUCCESS;
-  ObString value;
-  ObSysVarSchema sysvar;
   for (int64_t i = 0; OB_SUCC(ret) && i < ObSysVariables::get_amount(); ++i) {
-    sysvar.reset();
-    if (ObCharset::case_insensitive_equal(ObSysVariables::get_name(i), OB_SV_LOWER_CASE_TABLE_NAMES)) {
-      value = ObString::make_string("2");
-    } else {
-      value = ObSysVariables::get_value(i);
-    }
-    
-    sysvar.set_data_type(ObSysVariables::get_type(i));
-    sysvar.set_flags(ObSysVariables::get_flags(i));
-    sysvar.set_schema_version(get_schema_version());
-    if (OB_FAIL(sysvar.set_name(ObSysVariables::get_name(i)))) {
-    } else if (OB_FAIL(sysvar.set_value(value))) {
-    } else if (OB_FAIL(sysvar.set_min_val(ObSysVariables::get_min(i)))) {
-    } else if (OB_FAIL(sysvar.set_max_val(ObSysVariables::get_max(i)))) {
-    } else if (OB_FAIL(sysvar.set_info(ObSysVariables::get_info(i)))) {
-    } else if (OB_FAIL(add_sysvar_schema(sysvar))) {
-    }
+    ret = add_default_system_variable(ObSysVariables::get_sys_var_id(i));
   }
   return ret;
 }

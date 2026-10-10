@@ -16,7 +16,7 @@ Item_result item_cmp_type(Item_result a,Item_result b)
 }
 */
 
-static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
+static constexpr ObObjType LEGACY_RELATIONAL_CMP_TYPE[ObFileType][ObFileType] =
 {
   /*NullType*/
   {
@@ -2028,4 +2028,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
 
 };
 
+static_assert(is_array_fully_initialized(LEGACY_RELATIONAL_CMP_TYPE, ObFileType), "RELATIONAL_CMP_TYPE is partially initlized");
+static constexpr auto FILE_RELATIONAL_CMP_TYPE = sql::extend_file_type_map(LEGACY_RELATIONAL_CMP_TYPE);
+static constexpr auto &RELATIONAL_CMP_TYPE = FILE_RELATIONAL_CMP_TYPE.values_;
 static_assert(is_array_fully_initialized(RELATIONAL_CMP_TYPE, ObMaxType), "RELATIONAL_CMP_TYPE is partially initlized");

@@ -467,6 +467,7 @@ int ObSelectResolver::check_udt_set_query()
         if (OB_ISNULL(expr)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unexpected null", K(ret));
+        } else if (OB_FAIL(ObResolverUtils::check_file_key_expr(expr, "FILE set operations requiring deduplication"))) {
         } else if (expr->get_result_type().is_ext()) {
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("set operator for udt not supported", K(ret));
@@ -618,6 +619,20 @@ int ObSelectResolver::check_order_by()
   if (OB_ISNULL(select_stmt)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("select stmt is null", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_order_item_size(); ++i) {
+    OZ(ObResolverUtils::check_file_key_expr(select_stmt->get_order_item(i).expr_, "ordering by FILE"));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_group_expr_size(); ++i) {
+    OZ(ObResolverUtils::check_file_key_expr(select_stmt->get_group_exprs().at(i), "GROUP BY FILE"));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_rollup_expr_size(); ++i) {
+    OZ(ObResolverUtils::check_file_key_expr(select_stmt->get_rollup_exprs().at(i), "ROLLUP on FILE"));
+  }
+  if (OB_SUCC(ret) && select_stmt->is_distinct()) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_select_item_size(); ++i) {
+      OZ(ObResolverUtils::check_file_key_expr(select_stmt->get_select_item(i).expr_, "DISTINCT on FILE"));
+    }
   }
   return ret;
 }
@@ -2621,6 +2636,11 @@ int ObSelectResolver::resolve_group_by_sql_expr(const ParseNode *group_node,
   }
 
   if (OB_SUCC(ret)) {
+    if (OB_FAIL(ObResolverUtils::check_file_key_expr(expr, "GROUP BY FILE"))) {
+    }
+  }
+
+  if (OB_SUCC(ret)) {
     OrderItem order_item;
     order_item.expr_ = expr;
     if (group_sort_node->num_child_ == 2 &&
@@ -4173,7 +4193,8 @@ int ObSelectResolver::check_window_exprs()
       }
       for (int64_t j = 0; OB_SUCC(ret) && j < exprs.count(); ++j) {
         ObRawExpr *expr = exprs.at(j);
-        if (OB_UNLIKELY(expr->has_flag(CNT_WINDOW_FUNC))) {
+        if (OB_FAIL(ObResolverUtils::check_file_key_expr(expr, "FILE window partition, order or frame keys"))) {
+        } else if (OB_UNLIKELY(expr->has_flag(CNT_WINDOW_FUNC))) {
           ret = OB_ERR_INVALID_WINDOW_FUNC_USE;
           LOG_WARN("partition or sort or interval expr within window function nest window function not supported",
                    K(ret), K(*expr), K(j));

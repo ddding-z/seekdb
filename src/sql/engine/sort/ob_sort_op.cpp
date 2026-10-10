@@ -85,10 +85,7 @@ bool ObSortOp::supports_semantic_suspend() const
 {
   // Capability checks must not consume the force-dump tracepoint.
   const common::EventItem &force_dump_event = common::EventTable::EN_SORT_IMPL_FORCE_DO_DUMP.item_;
-  return is_vectorized() && MY_SPEC.prefix_pos_ == 0 && !MY_SPEC.prescan_enabled_
-      && !MY_SPEC.is_local_merge_sort_ && MY_SPEC.part_cnt_ == 0
-      && nullptr == MY_SPEC.topk_limit_expr_ && !MY_SPEC.is_fetch_with_ties_
-      && !MY_SPEC.enable_pd_topn_filter()
+  return MY_SPEC.supports_semantic_suspend()
       && ATOMIC_LOAD(&force_dump_event.error_code_) == 0
       && op_monitor_info_.otherstat_4_id_ != ObSqlMonitorStatIds::SORT_DUMP_DATA_TIME;
 }

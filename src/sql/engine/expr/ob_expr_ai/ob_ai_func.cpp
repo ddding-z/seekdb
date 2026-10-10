@@ -23,7 +23,7 @@ namespace oceanbase
 namespace common 
 {
 
-OB_SERIALIZE_MEMBER(ObAIFuncExprInfo, name_, type_, model_);
+OB_SERIALIZE_MEMBER(ObAIFuncExprInfo, name_, type_, model_, input_modalities_);
 int ObAIFuncExprInfo::deep_copy(common::ObIAllocator &allocator,
                                 const ObExprOperatorType type,
                                 ObIExprExtraInfo *&copied_info) const 
@@ -38,6 +38,7 @@ int ObAIFuncExprInfo::deep_copy(common::ObIAllocator &allocator,
     OZ(ob_write_string(allocator, name_, other->name_));
     OZ(ob_write_string(allocator, model_, other->model_));
     other->type_ = type_;
+    other->input_modalities_ = input_modalities_;
   }
   return ret;
 }
@@ -59,6 +60,7 @@ int ObAIFuncExprInfo::init(ObIAllocator &allocator, const ObString &model_id, sh
     OZ(ob_write_string(allocator, ai_model_schema->get_name(), name_));
     OZ(ob_write_string(allocator, ai_model_schema->get_model_name(), model_));
     type_ = ai_model_schema->get_type();
+    input_modalities_ = ai_model_schema->get_input_modalities();
   }
   return ret;
 }

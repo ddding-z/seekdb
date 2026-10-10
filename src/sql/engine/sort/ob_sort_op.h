@@ -44,6 +44,12 @@ public:
     K_(compress_type), K_(pd_topn_filter_info));
 
   inline bool enable_pd_topn_filter() const { return pd_topn_filter_info_.enabled_; }
+  bool supports_semantic_suspend() const
+  {
+    return max_batch_size_ > 0 && prefix_pos_ == 0 && !prescan_enabled_
+        && !is_local_merge_sort_ && part_cnt_ == 0 && nullptr == topk_limit_expr_
+        && !is_fetch_with_ties_ && !enable_pd_topn_filter();
+  }
 public:
   ObExpr *topn_expr_;
   ObExpr *topk_limit_expr_;
