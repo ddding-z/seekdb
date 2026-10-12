@@ -406,6 +406,8 @@ int ObRawExprInfoExtractor::visit(ObAggFunRawExpr &expr)
   if (OB_FAIL(clear_info(expr))) {
   } else if (OB_FAIL(pull_info(expr))) {
   } else if (OB_FAIL(expr.add_flag(IS_AGG))) {
+  } else if (expr.get_expr_type() == T_FUN_AI_AGG && OB_FAIL(expr.add_flag(IS_STATE_FUNC))) {
+    LOG_WARN("failed to add AI_AGG state function flag", K(ret));
   } else if (is_inner_added && OB_FAIL(expr.add_flag(IS_INNER_ADDED_EXPR))) {
     LOG_WARN("failed to add inner added expr flag", K(ret));
   } else { }

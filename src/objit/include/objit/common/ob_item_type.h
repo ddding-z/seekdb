@@ -924,6 +924,7 @@ typedef enum ObItemType
   T_FUN_SYS_FILE_URI = 2091,
   T_FUN_SYS_FILE_META = 2092,
   T_FUN_SYS_AI_INPUT = 2093,
+  T_FUN_AI_AGG = 2094,
   T_MAX_OP = 3000,
 
   //pseudo column, to mark the group iterator id
@@ -2370,6 +2371,7 @@ typedef enum ObOutlineType
 
 #define IS_FUN_STYLE(op) (((op) >= T_FUN_SYS && (op) < T_FUN_SYS_END) \
     || ((op) >= T_FUN_MAX && (op) <= T_FUN_APPROX_COUNT_DISTINCT_SYNOPSIS_MERGE) \
+    || T_FUN_AI_AGG == (op) \
     || T_OP_ABS == (op) \
     || T_OP_MOD == (op) \
     || T_OP_POW == (op) \
@@ -2417,6 +2419,7 @@ extern const char *get_type_name(int type);
                          (op) == T_FUN_SYS_ST_ASMVT || \
                          (op) == T_FUN_SUM_OPNSIZE ||\
                          (op) == T_FUNC_SYS_ARRAY_AGG ||\
+                         (op) == T_FUN_AI_AGG ||\
                          ((op) >= T_FUN_SYS_BIT_AND && (op) <= T_FUN_SYS_BIT_XOR) || \
                          (op) == T_FUN_INNER_PREFIX_MAX || \
                          (op) == T_FUN_INNER_PREFIX_MIN || \

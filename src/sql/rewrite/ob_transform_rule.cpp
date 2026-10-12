@@ -23,6 +23,7 @@
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/executor/ob_memory_tracker.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
 namespace oceanbase
 {
 namespace sql
@@ -706,6 +707,7 @@ int ObTransformRule::transform_self(common::ObIArray<ObParentDMLStmt> &parent_st
   stmt_cost_ = -1;
   int64_t src_hash_val_cnt = -1;
   bool need_trans = false;
+  bool has_semantic_aggregate = false;
   const ObQueryHint *query_hint = NULL;
   if (OB_ISNULL(stmt) || OB_ISNULL(ctx_) ||
       OB_ISNULL(query_hint = stmt->get_stmt_hint().query_hint_)) {
@@ -721,6 +723,12 @@ int ObTransformRule::transform_self(common::ObIArray<ObParentDMLStmt> &parent_st
     OPT_TRACE_TRANSFORM_SQL(stmt);
   }
   if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(SemanticExprUtils::statement_has_semantic_aggregate(
+      *stmt, has_semantic_aggregate))) {
+    LOG_WARN("failed to check semantic aggregate rewrite boundary", K(ret));
+  } else if (has_semantic_aggregate && transformer_type_ != PRE_PROCESS &&
+             transformer_type_ != POST_PROCESS) {
+    // Uniqueness and partial-aggregation rewrites cannot replace semantic group state.
   } else if (OB_FAIL(need_transform(parent_stmts, current_level, *stmt, need_trans))) {
   } else if (!need_trans) {
     // do nothing

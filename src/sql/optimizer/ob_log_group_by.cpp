@@ -43,7 +43,9 @@ int ObLogGroupBy::get_explain_name_internal(char *buf,
                                             int64_t &pos)
 {
   int ret = OB_SUCCESS;
-  if (SCALAR_AGGREGATE == algo_) {
+  if (has_semantic_aggregate()) {
+    return BUF_PRINTF("SEMANTIC AGG");
+  } else if (SCALAR_AGGREGATE == algo_) {
     ret = BUF_PRINTF("SCALAR ");
   } else if (HASH_AGGREGATE == algo_) {
     ret = BUF_PRINTF("HASH ");
@@ -57,6 +59,16 @@ int ObLogGroupBy::get_explain_name_internal(char *buf,
   }
 
   return ret;
+}
+
+bool ObLogGroupBy::has_semantic_aggregate() const
+{
+  bool present = false;
+  for (int64_t index = 0; !present && index < aggr_exprs_.count(); ++index) {
+    present = nullptr != aggr_exprs_.at(index) &&
+              aggr_exprs_.at(index)->get_expr_type() == T_FUN_AI_AGG;
+  }
+  return present;
 }
 
 int ObLogGroupBy::set_group_by_exprs(const common::ObIArray<ObRawExpr *> &group_by_exprs)

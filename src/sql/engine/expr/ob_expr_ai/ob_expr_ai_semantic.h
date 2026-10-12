@@ -29,6 +29,7 @@ class ObJsonObject;
 namespace sql
 {
 class SemanticInput;
+class ObDMLStmt;
 
 class ISemanticExprRuntime
 {
@@ -55,6 +56,8 @@ public:
   static bool is_semantic(ObItemType type);
   static int contains_semantic(const ObRawExpr *expr, bool &contains);
   static int contains_semantic_join(const ObRawExpr *expr, bool &contains);
+  static int contains_semantic_aggregate(const ObRawExpr *expr, bool &contains);
+  static int statement_has_semantic_aggregate(const ObDMLStmt &stmt, bool &contains);
   static int prepare_input(const ObExpr &expr, ObEvalCtx &ctx,
                            MultimodeAlloctor &allocator,
                            common::ObString &model_id, common::ObString &prompt,

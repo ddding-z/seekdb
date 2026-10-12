@@ -294,6 +294,7 @@ thread_local int64_t SemanticSuspendScope::blocked_depth_ = 0;
 SemanticSuspendScope::SemanticSuspendScope(ObPhyOperatorType type, bool opening, bool resumable)
     : blocked_(opening || (!resumable && type != PHY_SEMANTIC_MAP && type != PHY_SEMANTIC_FILTER &&
                             type != PHY_SEMANTIC_JOIN &&
+                            type != PHY_SEMANTIC_AGGREGATE &&
                             type != PHY_TABLE_SCAN))
 {
   if (blocked_) {

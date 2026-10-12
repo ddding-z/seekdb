@@ -22,6 +22,7 @@
 #include "sql/optimizer/ob_opt_cost_model_parameter.h"
 #include "sql/optimizer/stat/ob_opt_stat_manager.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
 
 using namespace oceanbase;
 using namespace sql;
@@ -769,6 +770,7 @@ int ObOptimizer::extract_opt_ctx_basic_flags(const ObDMLStmt &stmt, ObSQLSession
 int ObOptimizer::init_parallel_policy(ObDMLStmt &stmt, const ObSQLSessionInfo &session)
 {
   int ret = OB_SUCCESS;
+  bool has_semantic_aggregate = false;
   ctx_.set_parallel(ObGlobalHint::DEFAULT_PARALLEL);
   int64_t session_force_parallel_dop = ObGlobalHint::UNSET_PARALLEL;
   bool session_enable_auto_dop = false;
@@ -776,6 +778,12 @@ int ObOptimizer::init_parallel_policy(ObDMLStmt &stmt, const ObSQLSessionInfo &s
   if (OB_ISNULL(ctx_.get_query_ctx()) || OB_ISNULL(ctx_.get_exec_ctx())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("query ctx is nul", K(ret));
+  } else if (OB_FAIL(SemanticExprUtils::statement_has_semantic_aggregate(
+      stmt, has_semantic_aggregate))) {
+    LOG_WARN("failed to check semantic aggregate parallel boundary", K(ret));
+  } else if (has_semantic_aggregate) {
+    ctx_.set_parallel(1);
+    ctx_.set_parallel_rule(PXParallelRule::PL_UDF_DAS_FORCE_SERIALIZE);
   } else if (ctx_.get_exec_ctx()->is_force_gen_local_plan()) {
      ctx_.set_parallel_rule(PXParallelRule::PL_UDF_DAS_FORCE_SERIALIZE);
   } else if (ctx_.has_pl_udf()) {

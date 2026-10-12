@@ -176,6 +176,12 @@ REGISTER_OPERATOR(LogSemanticFilter, PHY_SEMANTIC_FILTER, SemanticFilterSpec, Se
 REGISTER_OPERATOR(LogSemanticJoin, PHY_SEMANTIC_JOIN, SemanticJoinSpec, SemanticJoinOp, NOINPUT,
                   VECTORIZED_OP);
 
+class ObLogGroupBy;
+class SemanticAggregateSpec;
+class SemanticAggregateOp;
+REGISTER_OPERATOR(ObLogGroupBy, PHY_SEMANTIC_AGGREGATE, SemanticAggregateSpec,
+                  SemanticAggregateOp, NOINPUT, VECTORIZED_OP);
+
 class ObMaterialSpec;
 class ObMaterialOp;
 class ObMaterialOpInput;

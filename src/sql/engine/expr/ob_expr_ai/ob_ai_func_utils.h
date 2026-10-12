@@ -367,7 +367,8 @@ public:
    int call_completion(ObString &prompt, ObJsonObject *config, ObString &result);
    int call_completion_vector(ObArray<ObString> &prompts, ObJsonObject *config, ObArray<ObString> &results);
   int start_completion_batch(ObArray<ObString> &prompts, ObJsonObject *config, AIFuncBatch &batch,
-                             const ObIArray<ObJsonArray *> *media_parts = nullptr);
+                             const ObIArray<ObJsonArray *> *media_parts = nullptr,
+                             const ObString *system_prompt = nullptr);
    // dense_embedding
    int call_dense_embedding(ObString &content, ObJsonObject *config, ObString &result);
    int call_dense_embedding_vector(ObArray<ObString> &contents, ObJsonObject *config, ObArray<ObString> &results);

@@ -4,6 +4,150 @@ Legacy baseline validation (2026-09-29): the Debug build, all **105 SQL contract
 
 For the current architecture, code map, maintenance invariants and handoff checklist, see the [Chinese maintenance handoff](../../../../../docs/developer-guide/zh/ai-function-runtime-handoff.md).
 
+## Native Semantic Aggregation (2026-10-12)
+
+`AI_AGG(model, input, instruction[, options])` is a native aggregate expression,
+not pointwise `AI_MAP` or a `GROUP_CONCAT` wrapper. Logical GROUP BY lowers to
+`SEMANTIC AGG`; its physical operator retains SQL hash/collation/NULL grouping
+and reuses the native aggregate processor for ordinary COUNT/SUM/AVG/MIN/MAX.
+Outputs are nullable UTF8MB4_BIN LONGTEXT.
+
+```sql
+SELECT department,
+       AI_AGG('summarizer', feedback,
+              'Summarize recurring concerns and preserve disagreements.',
+              '{"context_window":8192,"tokenizer":"byte_bpe",
+                "template_tokens":256,"max_output_tokens":512,
+                "max_partial_bytes":2048,
+                "provider_options":{"temperature":0}}') AS summary,
+       COUNT(*) AS row_count
+FROM feedbacks
+GROUP BY department;
+```
+
+### Reduction and scheduling contract
+
+- Non-NULL inputs, including empty strings and duplicates, each contribute once.
+  SQL NULL inputs are skipped. Empty scalar/all-NULL groups produce SQL NULL
+  without model calls; empty grouped input produces no rows. A successful empty
+  model string is a non-NULL result.
+- Small groups use one DIRECT request after sealing. Larger groups incrementally
+  EXTRACT relevant evidence, COMBINE adjacent notes in a fixed binary tree, then
+  FINALIZE the answer. EOF tails are folded deterministically. The tree is tied
+  to the input stream, not HTTP arrival/completion order; SQL without an ordering
+  guarantee does not acquire one from this operator.
+- Ready subtrees merge without a whole-layer barrier. Independent groups and
+  aggregates overlap; upstream/downstream MAP/FILTER stages share the same
+  execution registry and budget. A retained row/binding cursor prevents
+  backpressure retries from duplicating ordinary or semantic contributions.
+  Completion counting keeps whole-operator readiness checks constant-time.
+- The query credit limit is `ai_pipeline_slots * query semantic expression count`;
+  this aggregate stage also caps jobs at `ai_pipeline_slots * stage AI_AGG count`.
+  Group count does not multiply the concurrency limit.
+- This first implementation uses serial SQL policy and conservative rewrite
+  protection. It has no spill or distributed partial/final aggregation.
+  Safe ancestor paths use the shared worker continuation protocol; other paths
+  keep the stack while awaiting asynchronous HTTP, rather than invoking a
+  synchronous model fallback.
+
+### Explicit context and output contract
+
+The three-argument form binds, but execution currently requires fourth-argument
+options containing `context_window` and `tokenizer: "byte_bpe"`. There is no
+automatic model-context/tokenizer discovery. Complete serialized UTF-8 user
+prompt bytes are a conservative token upper bound for the caller-declared
+byte-BPE tokenizer:
+
+```text
+user_prompt_bytes <= context_window - template_tokens
+                     - max_output_tokens - system_prompt_bytes
+```
+
+Instruction, JSON escaping, phase and source-count framing are included.
+`template_tokens` defaults to 256; the caller must supply a valid upper bound for
+its provider chat framing. This is not a general exact-tokenizer implementation
+or a safety promise for incorrect tokenizer/framing declarations.
+The engine owns `max_tokens = max_output_tokens`.
+
+`max_partial_bytes` defaults to 1024 and applies to every output phase, including
+DIRECT/FINALIZE. `max_calls=4096` and `max_levels=32` bound each group/aggregate
+reduction graph; transport retries retain the same logical task. Unshrinkable
+notes or an oversized row/combine/finalize prompt fail rather than being
+truncated or silently discarded. Options text is capped at 64 KiB; unknown keys
+and invalid bounds are errors. Provider options only allow `temperature`,
+`top_p`, `top_k`, `seed`, `presence_penalty` and `frequency_penalty`, not request,
+streaming, output-format or token-budget overrides.
+
+Only static model/instruction/options, text/NULL input and OpenAI-compatible
+completion endpoints are supported. Direct FILE/JSON/ROW input, dynamic config,
+AI_AGG DISTINCT/ordered/window forms, ROLLUP, PX partial/final and external spill
+are rejected. Ordinary DISTINCT/ordered aggregates in the same dedicated
+aggregate stage are also protected, not silently implemented by the new path.
+
+AGG opts into plain-text, complete-response validation: exactly one choice,
+`finish_reason="stop"`, object message, absent/JSON-NULL refusal, and string
+content. Truncated, refused or malformed responses fail without semantic
+success-shaped defaults. Existing MAP/COMPLETE parsing retains its legacy
+behavior. Quota, deadline, cancellation and provider failures cancel remaining
+jobs and release registry/task/buffer ownership.
+
+Controllers, group metadata/key copies, held native aggregate arenas, frame
+metadata, request/response arenas and wire buffers are accounted in the shared
+logical memory budget. Some arenas are checked after allocation; this is not an
+RSS hard cap or a claim that all normal SQL allocations belong to this budget.
+
+### Test entrypoints
+
+```bash
+# Requires a current complete Debug build, compile metadata and Bazel toolchain.
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_aggregation.py \
+  --build-dir build_debug --repeat 3
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_aggregate.py \
+  --self-test
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_aggregate.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+```
+
+The native runner links current cached Debug objects, including the controller,
+instead of compiling another duplicate implementation. SQL tests create a new
+private unix-socket database and loopback endpoints; no GPU or real model is
+started. Repeat `--case` for targeted SQL cases. This suite opts into normal
+SIGUSR1 shutdown, requires exit status zero, enables warning-diagnosis logging,
+and checks semantic resource teardown; the legacy launcher default is unchanged.
+
+The mock supplies deterministic compact evidence and SQL source-count oracles.
+Tests verify complete source coverage, duplicate/NULL behavior, mixed native
+aggregates, grouping collation and LOB ownership, multi-aggregate backpressure,
+phase/context bounds, independent overlap, dependency-ready merging, reverse
+completion graph equality, strict provider envelopes, retry, abort and recovery.
+These checks do not establish real-model factual recall, answer quality, GPU
+overlap, optimal call count, prefix-cache gains or SemBench performance.
+
+### Validation: 2026-10-12
+
+| Validation | Result |
+| --- | --- |
+| Complete Debug seekdb build and refreshed compile metadata | PASS |
+| Native reduction controller | 12 cases repeated 3 times: 36 PASS |
+| Shared budget/scope/registry/completion resources | 15 cases repeated 3 times: 45 PASS |
+| New AI_AGG SQL/mock contracts | 27 PASS |
+| Controlled overlap/ready-subtree/reverse-completion repeat | 3 cases repeated 3 times: 9 PASS |
+| Aggregate protocol/oracle self-tests | 3 PASS |
+| Existing MAP/FILTER/native-aggregate composition regression subset | 5 PASS |
+| Existing MAP/FILTER/provider/cancellation/retry regression subset | 5 PASS |
+| AI_AGG private database normal shutdown | Exit 0, no semantic resource leak diagnostics |
+
+The SQL run includes 18 KiB plain-text output and out-of-row LOB grouping-key
+content equality, multiple hierarchical aggregates with skipped NULL inputs,
+many all-NULL groups before a ready group, dependency-ready merges while a leaf
+is held, and reversed completion without a different reduction graph.
+Retry scripts are per actual HTTP attempt, not per mock dictionary lookup.
+Warning-diagnosis logging is enabled for SQL and shutdown so resource-log checks
+are not silently suppressed by the default INFO threshold.
+No real model/GPU was started. Full historical FILE/PX/legacy suites, production
+model quality, arithmetic performed by a model and performance gains remain
+outside this validation record.
+
 ## Native FILE SQL/DDL
 
 `FILE` is a native nullable SQL value containing an owned reference descriptor,
@@ -540,8 +684,9 @@ passed nine cases repeated twenty times and ASan/UBSan; TSan could not initializ
 on this host and is not counted as a pass. SQL contract deadlines remain strict;
 only metadata bootstrap uses a separate 30-second setup timeout.
 These checks do not establish real-model quality, GPU utilization, or a SemBench speedup.
-Semantic cost-based optimization, approximate retrieval/cascades, and dedicated
-set-level semantic join/aggregation algorithms are not implemented here.
+Semantic cost-based optimization and approximate retrieval/cascades are not
+implemented here. The newer exact semantic-join and native aggregation paths
+are documented separately above; historical validation does not cover them.
 
 ## Global SOLO Prompt Reordering (2026-09-29)
 
@@ -1317,11 +1462,12 @@ not compare two generations or depend on optimizer request counts/order.
 
 ### Opt-in image FILE contracts
 
-**No real image model is currently available in the parent-reported setup.**
-Qwen3.5-9B has only incomplete temporary shards; those are not a usable model.
-The Qwen3-4B text endpoint above must not be presented as multimodal. The
-following example is only for a future, separately available compatible
-vision service, not the current text deployment.
+The 2026-10-09 setup had no usable real image model: Qwen3.5-9B had incomplete
+temporary shards, and Qwen3-4B was text-only. On 2026-10-10 a separate,
+fully verified Qwen2.5-VL-3B-Instruct checkpoint was used for the real image
+experiment below. This does not make the text endpoint multimodal. The
+following command requires an explicitly started compatible vision service;
+the experiment's temporary service has since been stopped.
 
 Image traffic additionally requires `--image`, an explicit yes/no
 `--instruction`, and an independently supplied `--expect-image true|false`.
@@ -1353,6 +1499,60 @@ and JOIN have exact expected result sets for either true or false. The JOIN
 matches the actual image answer against separate `"true"` / `"false"` rows.
 Missing/corrupt/nonboolean/truncated/refused output is always an error, never
 a rejected row, false answer, text-path fallback, or skip.
+
+### Real image experiment (2026-10-10)
+
+The local Qwen2.5-VL-3B-Instruct checkpoint at
+`/volume/models/data/Qwen2.5-VL-3B-Instruct` is complete. Its pinned official
+revision is `66285546d2b821cf421d4f5eb2576359d3770cd3`; all 14 file
+hashes/sizes, both safetensors shards and the 824-tensor index were verified,
+followed by an offline CPU processor check. The checkpoint's Qwen Research
+License permits non-commercial research/evaluation; commercial use requires
+separate authorization.
+
+Real inference used one RTX A6000 with existing vLLM 0.22.1, BF16, eager
+execution and FlashAttention. The temporary loopback endpoint was
+`http://127.0.0.1:18081/v1`, serving `seekdb-file-validation-vl3b`, with
+4096 context tokens, two sequences, an explicit 1 GiB KV allocation,
+two images/no video per prompt, processor pixel bounds 3136..262144, and
+both prefix caching and the multimodal processor cache disabled.
+A post-test GPU snapshot was 9,101 MiB used, **not a measured peak or a
+performance result**. Inference options remained `temperature=0`,
+`max_tokens=32`, `stream=false`; HTTP timeout was explicitly 60 seconds.
+The current Debug binary at commit `2ea8cd37c6ae744ffc6f2fad1a38f239219c3068`
+built successfully, and all 65 DB-free live-runner self-tests passed.
+
+The independently labeled input was a generated 128x128 all-red PNG.
+The question below is followed by the runner's unchanged strict JSON
+instruction; each invocation used a fresh private database when preflight
+allowed SQL to run.
+
+| Workload | Actual result |
+| --- | --- |
+| `Is this image predominantly red?`, expected true | Direct strict-schema image preflight and all six text/composition plus four FILE SQL cases passed. |
+| `Is this image predominantly blue?`, expected false | Direct preflight returned valid `{"value":true}`; exit 3, `model-quality`. No SQL was started for this workload. |
+| Separate `Does the image have a blue background?`, expected false | Direct preflight and FILE MAP/FILTER projection/WHERE passed. FILE-to-text-answer JOIN returned false for right answer `"false"` where a match required true; exit 3, `model-quality`. |
+| Separate red/blue image-image same-color comparison | The direct red/red pair passed, but red/blue returned true instead of false. Exit 3 before database startup; the four-pair FILE/FILE SQL oracle was **not exercised**. |
+
+A bounded native Transformers 5.10.2 BF16 greedy SDPA comparison on the
+same checkpoint, without vLLM or SQL or guided JSON decoding, reproduced
+the incorrect predominantly-blue and red/blue comparison answers.
+Freeform red recognition was correct; placing the image before the
+unchanged negative question also returned false in both backends.
+These are separate diagnostics, not replacements for failed oracles.
+They indicate checkpoint/prompt-layout sensitivity rather than evidence of
+a database transport bug. SQL's ordered `(text, FILE)` contract was not
+changed, expected answers were not relabeled, and strict schemas were not
+weakened. Schema validity alone cannot guarantee answer correctness.
+
+This is **partial real-model validation**, not all-positive/negative visual
+acceptance. No natural-image dataset, audio inference, complete multimodal
+SemBench, speedup, vector-candidate recall, or SOLO/prefix-cache benefit was
+measured. Logs and response reports were retained as session artifacts;
+generated media/private databases were cleaned up. The task-owned vLLM API
+was stopped with SIGTERM and exited zero, its engine exited, port 18081 was
+available again, and GPU use returned to 15 MiB with no compute processes.
+The downloaded checkpoint remains available offline.
 
 ### Failure evidence and limits
 

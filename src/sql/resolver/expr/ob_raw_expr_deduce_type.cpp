@@ -21,6 +21,7 @@
 #include "sql/engine/aggregate/ob_aggregate_processor.h"
 #include "sql/engine/expr/ob_expr_between.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_agg.h"
 #include "sql/parser/ob_parser.h"
 #include "rpc/obmysql/ob_mysql_util.h"
 
@@ -1381,6 +1382,9 @@ int ObRawExprDeduceType::visit(ObAggFunRawExpr &expr)
   ObScale scale_increment_recover = -2;
   int ret = OB_SUCCESS;
   ObExprResType result_type;
+  if (expr.get_expr_type() == T_FUN_AI_AGG) {
+    return set_ai_agg_result_type(expr, result_type);
+  }
   for (int64_t i = 0; OB_SUCC(ret) && i < expr.get_real_param_count(); ++i) {
     const ObRawExpr *param = expr.get_param_expr(i);
     if (OB_ISNULL(param)) {
@@ -2792,6 +2796,44 @@ int ObRawExprDeduceType::set_asmvt_result_type(ObAggFunRawExpr &expr,
     result_type.set_collation_level(CS_LEVEL_IMPLICIT);
     result_type.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObLongTextType]);
     expr.set_result_type(result_type);
+  }
+  return ret;
+}
+
+int ObRawExprDeduceType::set_ai_agg_result_type(ObAggFunRawExpr &expr,
+                                               ObExprResType &result_type)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObExprResType, ExprAIAgg::MAX_PARAM_COUNT> types;
+  ObExprTypeCtx type_ctx;
+  ObCastMode cast_mode = CM_NONE;
+  ExprAIAgg op(alloc_);
+  if (OB_ISNULL(my_session_) || OB_ISNULL(expr_factory_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("AI_AGG type deduction context is null", K(ret), K(my_session_), K(expr_factory_));
+  } else if (OB_FAIL(ExprAIAgg::check_arguments(expr))) {
+  } else if (OB_FAIL(check_group_aggr_param(expr))) {
+  } else {
+    ObSQLUtils::init_type_ctx(my_session_, type_ctx);
+    for (int64_t index = 0; OB_SUCC(ret) && index < expr.get_real_param_count(); ++index) {
+      if (OB_FAIL(push_back_types(expr.get_param_expr(index), types))) {
+      } else {
+        types.at(index).set_calc_meta(types.at(index).get_obj_meta());
+        types.at(index).set_calc_accuracy(types.at(index).get_accuracy());
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(op.calc_result_typeN(result_type, &types.at(0), types.count(), type_ctx))) {
+    } else if (OB_FAIL(ObSQLUtils::get_default_cast_mode(false, 0, my_session_, cast_mode))) {
+    } else {
+      for (int64_t index = 0; OB_SUCC(ret) && index < types.count(); ++index) {
+        if (OB_FAIL(try_add_cast_expr(expr, index, types.at(index), cast_mode))) {
+        }
+      }
+      if (OB_SUCC(ret)) {
+        expr.set_result_type(result_type);
+      }
+    }
   }
   return ret;
 }

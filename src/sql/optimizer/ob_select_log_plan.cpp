@@ -53,7 +53,12 @@ int ObSelectLogPlan::candi_allocate_group_by()
 {
   int ret = OB_SUCCESS;
   bool is_unique = false;
-  const ObSelectStmt *stmt = NULL;
+  const ObSelectStmt *stmt = get_stmt();
+  bool has_semantic_aggregate = false;
+  for (int64_t index = 0; nullptr != stmt && !has_semantic_aggregate &&
+       index < stmt->get_aggr_item_size(); ++index) {
+    has_semantic_aggregate = stmt->get_aggr_item(index)->get_expr_type() == T_FUN_AI_AGG;
+  }
   ObLogicalOperator *best_plan = NULL;
   ObSEArray<ObRawExpr*, 4> reduce_exprs;
   ObSEArray<ObRawExpr*, 4> group_by_exprs;
@@ -75,6 +80,31 @@ int ObSelectLogPlan::candi_allocate_group_by()
   } else if (OB_FAIL(ObOptimizerUtil::classify_subquery_exprs(stmt->get_having_exprs(),
                                                               having_subquery_exprs,
                                                               having_normal_exprs))) {
+  } else if (has_semantic_aggregate) {
+    if (stmt->has_rollup() || !having_subquery_exprs.empty()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_AGG with ROLLUP or HAVING subqueries");
+    } else {
+      ObSEArray<ObRawExpr *, 1> no_rollup;
+      for (int64_t index = 0; OB_SUCC(ret) &&
+           index < candidates_.candidate_plans_.count(); ++index) {
+        CandidatePlan candidate = candidates_.candidate_plans_.at(index);
+        ObLogicalOperator *top = candidate.plan_tree_;
+        const bool scalar = stmt->get_group_exprs().empty();
+        const double ndv = scalar ? 1.0 : std::max(1.0, top->get_card());
+        if (OB_FAIL(allocate_group_by_as_top(top,
+            scalar ? SCALAR_AGGREGATE : HASH_AGGREGATE,
+            stmt->get_group_exprs(), no_rollup, stmt->get_aggr_items(),
+            having_normal_exprs, ndv, top->get_card(), false, false, false, false))) {
+          LOG_WARN("failed to allocate semantic group boundary", K(ret));
+        } else {
+          static_cast<ObLogGroupBy *>(top)->set_group_by_outline_info(
+              DistAlgo::DIST_BASIC_METHOD, !scalar, false);
+          candidate.plan_tree_ = top;
+          ret = groupby_plans.push_back(candidate);
+        }
+      }
+    }
   } else if (stmt->is_scala_group_by()) {
     if (OB_FAIL(candi_allocate_scala_group_by(stmt->get_aggr_items(),
                                               having_normal_exprs,
@@ -4987,6 +5017,9 @@ bool semantic_plan_present(const ObLogicalOperator &node)
 {
   bool present = node.get_type() == LOG_SEMANTIC_MAP || node.get_type() == LOG_SEMANTIC_FILTER ||
                  node.get_type() == LOG_SEMANTIC_JOIN;
+  if (node.get_type() == LOG_GROUP_BY) {
+    present = static_cast<const ObLogGroupBy &>(node).has_semantic_aggregate();
+  }
   for (int64_t index = 0; !present && index < node.get_num_of_child(); ++index) {
     if (nullptr != node.get_child(index)) {
       present = semantic_plan_present(*node.get_child(index));
@@ -5022,6 +5055,10 @@ public:
         } else {
           node->set_child(index, child);
         }
+      }
+      if (OB_SUCC(ret) && node->get_type() == LOG_GROUP_BY &&
+          static_cast<ObLogGroupBy *>(node)->has_semantic_aggregate()) {
+        ret = add_var_to_array_no_dup(aggregate_stages_, static_cast<ObLogGroupBy *>(node));
       }
       if (OB_SUCC(ret) && (node->get_type() == LOG_SEMANTIC_MAP ||
                            node->get_type() == LOG_SEMANTIC_FILTER ||
@@ -5141,8 +5178,19 @@ public:
         ret = append_array_no_dup(calls, stage->semantic_exprs());
       }
     }
+    for (ObLogGroupBy *group : aggregate_stages_) {
+      for (int64_t index = 0; index < group->get_aggr_funcs().count(); ++index) {
+        ObRawExpr *aggregate = group->get_aggr_funcs().at(index);
+        if (OB_SUCC(ret) && aggregate->get_expr_type() == T_FUN_AI_AGG) {
+          ret = add_var_to_array_no_dup(calls, aggregate);
+        }
+      }
+    }
     for (LogSemantic *stage : stages_) {
       stage->set_query_task_count(calls.count());
+    }
+    for (ObLogGroupBy *group : aggregate_stages_) {
+      group->set_semantic_query_task_count(calls.count());
     }
     return ret;
   }
@@ -5274,6 +5322,7 @@ private:
   ObSelectLogPlan &plan_;
   ObSEArray<ObRawExpr *, 16> available_calls_;
   ObSEArray<LogSemantic *, 8> stages_;
+  ObSEArray<ObLogGroupBy *, 4> aggregate_stages_;
 };
 }
 

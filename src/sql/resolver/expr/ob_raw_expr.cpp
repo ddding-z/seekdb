@@ -62,6 +62,11 @@ int ObRawExprFactory::create_raw_expr<ObSysFunRawExpr>(ObItemType expr_type, ObS
 {
   int ret = OB_SUCCESS;
   switch (expr_type) {
+    case T_FUN_AI_AGG: {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("AI_AGG must use ObAggFunRawExpr", K(ret));
+      break;
+    }
     GENERATE_CASE(T_FUN_PL_COLLECTION_CONSTRUCT, ObCollectionConstructRawExpr);
     GENERATE_CASE(T_FUN_UDF, ObUDFRawExpr);
     GENERATE_CASE(T_FUN_PL_OBJECT_CONSTRUCT, ObObjectConstructRawExpr);
@@ -926,6 +931,7 @@ int ObRawExpr::is_const_inherit_expr(bool &is_const_inherit,
       || T_FUN_SYS_AI_MAP == type_
       || T_FUN_SYS_AI_FILTER == type_
       || T_FUN_SYS_AI_JOIN == type_
+      || T_FUN_AI_AGG == type_
       || T_OP_ASSIGN == type_
       || T_FUN_SYS_REMOVE_CONST == type_
       || T_FUN_SYS_WRAPPER_INNER == type_
@@ -1011,6 +1017,7 @@ int ObRawExpr::is_non_pure_sys_func_expr(bool &is_non_pure) const
         || T_FUN_SYS_AI_MAP == type_
         || T_FUN_SYS_AI_FILTER == type_
         || T_FUN_SYS_AI_JOIN == type_
+        || T_FUN_AI_AGG == type_
         || T_FUN_SYS_LAST_INSERT_ID == type_
         || T_FUN_SYS_ROW_COUNT == type_
         || T_FUN_SYS_FOUND_ROWS == type_

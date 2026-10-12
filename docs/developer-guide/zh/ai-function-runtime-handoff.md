@@ -1,6 +1,6 @@
 # AI Function、异步 Semantic Operators 与全局 SOLO 维护交接
 
-更新日期：2026-10-09。适用基线：`da4ac3f56`，`feat(sql): add asynchronous semantic join operator`；本轮在该基线上增加原生 FILE 和多模态输入。
+更新日期：2026-10-12。实现起点：`2ea8cd37c`，`feat(sql): add native FILE and multimodal semantic execution`。本文包含在该基线上新增的原生文本 AI_AGG；保留 2026-10-10 真实视觉模型的部分验收及质量边界。
 
 本文面向接手实现、调试和回归测试的开发者，覆盖 AI Function 异步运行时及全阻塞 SOLO。这里的 SOLO 是数据库端的输入排列算法，不是推理服务端的 KV cache 实现。
 
@@ -15,9 +15,10 @@
 | 全局 SOLO | 收齐当前 AI 阶段的全部输入，完成一次列重排和行重排后才提交模型请求 |
 | AI_MAP / AI_FILTER | 显式逻辑和物理算子；独立表达式并发、依赖感知的跨批推进、严格布尔过滤 |
 | AI_JOIN | INNER JOIN ON 的显式语义连接；普通 SQL 候选对生成加有界异步判断，不做近似候选裁剪 |
+| AI_AGG | 真正跨行的文本聚合；SQL 分组、小组一次调用、有界确定性归约及共享异步运行时 |
 | 语义 PX | 经校验的 reduce-transmit / semantic / GI / scan 路径保留任务状态并释放物理 worker；同一查询共享预算 |
 
-旧 AI Function 与 SOLO、AI_MAP / AI_FILTER / AI_JOIN 和可恢复 PX 实现已在基线提交中。本轮新增 FILE；下文保留旧路径的维护约束，不应把旧 SOLO 的单 worker 限制套到新接口上。
+旧 AI Function 与 SOLO、AI_MAP / AI_FILTER / AI_JOIN、可恢复 PX 及原生 FILE 实现均已提交；下文保留旧路径的维护约束，不应把旧 SOLO 的单 worker 限制套到新接口上。
 
 已有的 [RUNTIME_TESTS.md](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md) 是运行契约、测试入口和历史验收记录。本文解释当前架构、维护约束和排障路径；行为或测试变更时，两份文档应一起更新。外层工作区另有历史执行能力补齐计划，但它不是本仓库依赖，也不应被当作最新 SOLO 规范。
 
@@ -25,6 +26,7 @@
 
 | 提交 | 用途 |
 | --- | --- |
+| `2ea8cd37c` | 原生 FILE、多模态异步输入、排序/PX 和真实模型联调修复；当前实现基线 |
 | `8dcadbc7c` | 异步 AI_MAP / AI_FILTER 与可恢复 PX；semantic join 的实现基线 |
 | `da4ac3f56` | 异步 INNER AI_JOIN、候选合批和连接绑定；FILE 的实现基线 |
 | `0532d6e33` | 全局 SOLO 与相关验收 |
@@ -497,7 +499,8 @@ coordinator 和带 full sort 的实际 PX 分别启动独立数据库，保持 S
 vLLM 0.22.1 + Qwen3-4B-Instruct-2507 上已通过严格 schema 预检和六项实际
 MAP/FILTER/JOIN/关系组合 SQL；65 项 DB-free runner 检查也通过。
 这是小型合成标签的真实推理正确性证据，不是 SemBench 质量或速度报告。
-现有视觉 9B 权重不完整，四项 opt-in FILE 实模契约尚未运行。
+当时视觉 9B 权重不完整，四项 opt-in FILE 实模契约尚未运行；
+2026-10-10 的独立 Qwen2.5-VL-3B 实验见下文，不能混作该文本验收的一部分。
 
 该联调发现 JSON_EXTRACT 会把等待中的 OB_EAGAIN 改成 JSON 错误，
 JSON_UNQUOTE/JSON_PRETTY 又改成 5874，JSON_VALID 则错误地提前返回 false。
@@ -516,8 +519,148 @@ ecomm_q7 两个合格商品形成四个有序候选对，legacy 与原生语义�
 临时 vLLM 服务在验收后已正常零退出码停止，已确认它的 API/engine 进程退出、
 独占的回环端口关闭和 GPU 资源归还；没有留下需要用户手动关闭的测试服务。
 
+### 2026-10-10：真实视觉 FILE 实验与质量边界
+
+Qwen2.5-VL-3B-Instruct 已完整下载到本机
+`/volume/models/data/Qwen2.5-VL-3B-Instruct`。固定官方 revision
+`66285546d2b821cf421d4f5eb2576359d3770cd3`，14 项文件 hash/大小、
+两片 safetensors、824 项 tensor index 及离线 CPU processor 均通过校验。
+模型采用 Qwen Research License，仅用于非商业研究/评估；商用需另行授权。
+
+单张 RTX A6000 上使用现有 vLLM 0.22.1、BF16、eager、FlashAttention，
+context 4096、最多两个 sequence、显式 1 GiB KV、每请求最多两图/零视频、
+processor pixel 范围 3136..262144，关闭 prefix cache 和 multimodal processor cache。
+临时服务为 `http://127.0.0.1:18081/v1`，模型 ID
+`seekdb-file-validation-vl3b`；结束前显存快照为 9,101 MiB，不是峰值或吞吐测量。
+当前实现基线的 Debug 构建和 65 项 live runner 自测通过，生产代码未因实验改变。
+
+| 独立标注的实验 | 实际结果 |
+| --- | --- |
+| 128x128 红图，`Is this image predominantly red?`，期望 true | 直接严格 schema 预检、六项文本/关系组合 SQL 和四项 FILE SQL 全部通过。 |
+| 同图，`Is this image predominantly blue?`，期望 false | 直接预检回答 true，`model-quality`、退出码 3；该任务未进入 SQL。 |
+| 独立问题 `Does the image have a blue background?`，期望 false | 预检及 FILE MAP/FILTER 投影/WHERE 三项通过；FILE 与文字答案 JOIN 对 right=`"false"` 返回 false，而匹配应为 true，退出码 3。 |
+| 红/蓝双图是否同色 | 直接 red/red 通过，但 red/blue 错答 true；预检退出码 3，四有序候选对的 FILE/FILE SQL 验收未运行。 |
+
+另用同一份权重做 native Transformers 5.10.2、BF16、greedy SDPA 对照，
+不经过 vLLM、SQL 或 guided JSON decoding，复现了原负例和异色双图的错误。
+自由回答颜色为 red 正确；仅在独立诊断中把图片放到原负例问题之前，
+两种 backend 都能回答 false。该现象指向模型/提示布局敏感性，
+目前没有媒体传输或 SQL 实现错误的证据。没有把诊断成功覆盖失败、
+改写 SQL 的有序 `(text, FILE)` 输入、修改人工 ground truth 或放宽 schema；
+结构化输出正确不代表语义答案正确。
+
+结论仅是**真实视觉链路部分验收**，不是完整多模态质量通过。
+自然图像数据、audio、完整多模态 SemBench、加速比、向量候选召回和
+SOLO/prefix-cache 收益均未验证；历史 mock/PX 验收没有在本次完整重跑。
+实际响应、失败和 native 对照保存在会话实验记录中。
+私有数据库/媒体已清理，临时 vLLM API 通过 SIGTERM 零退出码停止，
+engine 退出、18081 端口释放、GPU 无 compute process 且显存回到 15 MiB；
+离线权重保留，不需要用户再手动关闭服务。
+详细边界见 [真实视觉实验记录](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md#real-image-experiment-2026-10-10)。
+
 验证入口为 [FILE SQL/fixture 契约](../../../tools/deploy/mysql_test/test_suite/ai_function/test_file_runtime.py)
 、[codec/storage/loader runner](../../../tools/deploy/mysql_test/test_suite/ai_function/test_file_native.py)
 和 [有序输入原生契约](../../../unittest/sql/engine/test_semantic_input.cpp)。
 构建、持久化重开、实际 PX、取消/停机及旧语义回归需分别记录；
 mock 成功不等于真实模型质量、完整 SemBench 可运行性或加速已验证。
+
+## 11. 原生文本 AI_AGG（2026-10-12）
+
+这不是把每行 AI_MAP 的结果拼起来，也不是用 GROUP_CONCAT 绕过普通聚合绑定。
+AI_AGG 是 `ObAggFunRawExpr`，由逻辑 GROUP BY 生成专用 `SEMANTIC AGG`
+物理算子。可以与 COUNT/SUM/AVG/MIN/MAX 同时计算，普通算术仍由 SQL
+聚合处理器完成，不让模型代替数据库做精确统计。
+
+```sql
+SELECT department,
+       AI_AGG('summarizer', feedback,
+              'Summarize recurring concerns and preserve disagreements.',
+              '{"context_window":8192,"tokenizer":"byte_bpe",
+                "template_tokens":256,"max_output_tokens":512,
+                "max_partial_bytes":2048,
+                "provider_options":{"temperature":0}}') AS summary,
+       COUNT(*) AS row_count
+FROM feedbacks
+GROUP BY department;
+```
+
+执行契约：
+
+- 输出为 nullable、UTF8MB4_BIN LONGTEXT；非 NULL 的空输入字符串也是一行。
+  SQL NULL 输入跳过，重复行保留。空 scalar 或全 NULL 组返回 SQL NULL；
+  空的分组输入返回零行。这些组不调用模型。模型成功返回空字符串时，
+  输出是 `''`，不是 SQL NULL。
+- 一个组的完整输入能放下时，seal 后只发一次 DIRECT 请求，直接返回答案。
+  大组扫描时按完整行形成 EXTRACT 请求；EXTRACT 整理相关证据，
+  COMBINE 合并相邻证据，FINALIZE 最后按用户 instruction 回答。
+  组内归约采用固定相邻二叉树和确定性的 EOF 尾部折叠，不由 HTTP 完成顺序
+  改变合并图。确定性针对同一输入流，不承诺无 ORDER BY SQL 的扫描顺序。
+- 依赖已经满足的子树立即合并，不等待整层的全部叶子。
+  不同组、不同聚合及上下游 MAP/FILTER 共享异步调度；
+  单个输入行的 group/binding 游标在等待和重试时保留，普通聚合不会重复累计。
+  ready 判断使用完成计数，避免大量组在每次 poll 时被从头遍历。
+- 分组使用 SQL hash/collation/NULL 比较和 owned key，而不是把键序列化后
+  按字节判断相等。不能把 `a` 和 `A` 在大小写不敏感分组中拆成两组。
+- 首版整个含 AI_AGG 的语句使用 serial 策略，保守阻止聚合消除、下推及大部分
+  rewrite；这不是语义成本优化器。SQL worker 仍可在安全的祖先路径上挂起；
+  不安全路径保留栈等待，不改成同步模型调用。
+
+### 显式上下文预算，不猜 tokenizer
+
+语法为 `AI_AGG(model, input, instruction[, options])`。首版执行需要第四参
+显式给出 `context_window` 和 `tokenizer: "byte_bpe"`；三参虽然可绑定，
+但不会从模型名猜配置，也不会无预算执行，而是零请求报错。
+只支持静态 model/instruction/options、文本或 SQL NULL 输入，
+以及 OpenAI-compatible completion endpoint。直接 FILE、JSON、ROW、
+动态配置、AI_AGG 的 DISTINCT/ORDER BY/window、ROLLUP、PX partial/final
+和 spill 尚不支持；同一专用聚合里的普通 DISTINCT/ordered aggregate
+也被保护性拒绝。
+
+预算按**完整序列化 user prompt 的 UTF-8 bytes**作为所声明 byte-BPE
+tokenizer 的保守 token 上界，不使用“字符数除以四”：
+
+```text
+user_prompt_bytes <= context_window - template_tokens
+                     - max_output_tokens - system_prompt_bytes
+```
+
+`template_tokens` 默认 256，但调用者负责给出实际 chat framing 的安全上界。
+引擎会设置 provider 的 `max_tokens`，并计入 instruction、JSON escaping、
+phase 和 source_count 的 framing。这不是接入了通用精确 tokenizer，
+也不是保证错误的调用者 tokenizer/framing 声明仍能安全运行。
+单个输入行、COMBINE 或 FINALIZE 的完整 prompt 放不下都显式报错，
+不截断材料或忽略证据。
+
+`max_partial_bytes` 默认 1024，限制**所有阶段输出**，包括 DIRECT/FINALIZE。
+`max_calls` 默认 4096、`max_levels` 默认 32，按每个组的每个 AI_AGG 控制归约图；
+transport retry 仍使用共享 client 的策略，不另生成一个归约节点。
+`provider_options` 仅放行 temperature/top_p/top_k/seed/presence_penalty/
+frequency_penalty，不能覆盖 model/messages/stream/n/stop/response_format/
+max_tokens。options 文本最多 64 KiB，未知键和无效预算拒绝。
+
+全查询的 task credit 为 `ai_pipeline_slots × 全查询语义表达式数`，
+该聚合 stage 的并发上限为 `ai_pipeline_slots × 本 stage 的 AI_AGG 数`，
+不是按组无限乘开。group/controller/keys、普通聚合的 held arena、
+frame、请求及响应 arena 和 wire buffer 纳入逻辑预算；
+部分 allocator 在分配后校验，不宣称 RSS 硬上限，也没有外存退路。
+
+只有恰好一个 choice、`finish_reason="stop"`、无非 NULL refusal、
+string content 的完整响应才成功。截断、拒绝、非法 envelope、quota、
+deadline 和取消都失败并清理任务，不能返回部分成功或把错误当 NULL。
+这项严格 plain-text 解析是 AGG opt-in，旧 MAP/COMPLETE 的接口没有借此改变。
+
+实现入口为 [SQL binding](../../../src/sql/engine/expr/ob_expr_ai/ob_expr_ai_agg.cpp)、
+[归约控制器](../../../src/sql/engine/basic/ob_semantic_aggregation.cpp)、
+[物理聚合算子](../../../src/sql/engine/aggregate/ob_semantic_aggregate_op.cpp)
+和 [SQL/mock 契约](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_aggregate.py)。
+具体命令及本轮验收证据见
+[Native Semantic Aggregation](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md#native-semantic-aggregation-2026-10-12)。
+真实模型的事实保留、质量、GPU 利用率和 SemBench 性能仍需单独评估；
+source_count 是 SQL 可信元数据，不是模型答案质量的证明。
+
+本轮已通过 Debug 构建、27 项 AI_AGG SQL/mock 契约、12 项归约原生契约
+重复三轮（36 次）、15 项共享资源原生契约重复三轮（45 次）和 3 项 fixture
+self-test。另跑通 5 项既有语义组合及 5 项 MAP/FILTER 运行时回归。
+3 项受控并发/子树推进/逆序完成测试另重复三轮，9 次全部通过。
+AI_AGG 私有数据库正常停机退出码为零，未发现语义资源泄漏日志。
+没有启动 GPU 或真实模型服务，也没有完整重跑历史 FILE/PX/legacy suites。

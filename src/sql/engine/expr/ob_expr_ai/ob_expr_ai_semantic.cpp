@@ -20,6 +20,7 @@
 #include "ob_expr_ai_input.h"
 #include "common/object/file_ref.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
+#include "sql/resolver/dml/ob_select_stmt.h"
 
 namespace oceanbase
 {
@@ -456,6 +457,35 @@ int SemanticExprUtils::contains_semantic(const ObRawExpr *expr, bool &contains)
 int SemanticExprUtils::contains_semantic_join(const ObRawExpr *expr, bool &contains)
 {
   return contains_semantic(expr, T_FUN_SYS_AI_JOIN, contains);
+}
+
+int SemanticExprUtils::contains_semantic_aggregate(const ObRawExpr *expr, bool &contains)
+{
+  return contains_semantic(expr, T_FUN_AI_AGG, contains);
+}
+
+int SemanticExprUtils::statement_has_semantic_aggregate(const ObDMLStmt &stmt, bool &contains)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObRawExpr *, 16> expressions;
+  ObSEArray<ObSelectStmt *, 4> children;
+  contains = false;
+  if (OB_FAIL(stmt.get_relation_exprs(expressions))) {
+  } else {
+    for (int64_t index = 0; OB_SUCC(ret) && !contains && index < expressions.count(); ++index) {
+      ret = contains_semantic_aggregate(expressions.at(index), contains);
+    }
+  }
+  if (OB_SUCC(ret) && !contains && OB_FAIL(stmt.get_child_stmts(children))) {
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && !contains && index < children.count(); ++index) {
+    if (OB_ISNULL(children.at(index))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      ret = SMART_CALL(statement_has_semantic_aggregate(*children.at(index), contains));
+    }
+  }
+  return ret;
 }
 
 int SemanticExprUtils::contains_semantic(const ObRawExpr *expr, ObItemType type, bool &contains)

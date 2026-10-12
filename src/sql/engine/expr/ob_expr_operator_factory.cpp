@@ -419,6 +419,7 @@
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_embed.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_rerank.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_prompt.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_agg.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_input.h"
 #include "sql/engine/expr/ob_expr_vector_similarity.h"
@@ -1058,6 +1059,7 @@ void ObExprOperatorFactory::register_expr_operators()
     REG_OP(ExprAIFilter);
     REG_OP(ExprAIJoin);
     REG_OP(ExprAIInput);
+    REG_OP(ExprAIAgg);
   }();
 }
 

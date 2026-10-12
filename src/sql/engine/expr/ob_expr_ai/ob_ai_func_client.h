@@ -135,7 +135,8 @@ class AIFuncBatch
 {
 public:
   explicit AIFuncBatch(ObIAllocator &allocator)
-      : allocator_(allocator), provider_(nullptr), batched_response_(false), nonblocking_admission_(false) {}
+      : allocator_(allocator), provider_(nullptr), batched_response_(false),
+        nonblocking_admission_(false), complete_text_output_(false) {}
   int poll(bool &finished, int64_t wait_ms = 0) { return client_.poll_batch(finished, wait_ms); }
   bool is_ready() const { return client_.is_async_ready(); }
   bool is_waiting_for_admission() const { return client_.is_waiting_for_admission(); }
@@ -153,12 +154,14 @@ public:
     client_.set_shared_buffer_usage(bytes, limit);
   }
   void set_max_parallel(int64_t count) { client_.set_max_parallel(count); }
+  void require_complete_text_output() { complete_text_output_ = true; }
 private:
   friend class ObAIFuncModel;
   ObIAllocator &allocator_;
   ObAIFuncBase *provider_;
   bool batched_response_;
   bool nonblocking_admission_;
+  bool complete_text_output_;
   ObArray<int64_t> input_counts_;
   ObAIFuncClient client_;
   DISALLOW_COPY_AND_ASSIGN(AIFuncBatch);

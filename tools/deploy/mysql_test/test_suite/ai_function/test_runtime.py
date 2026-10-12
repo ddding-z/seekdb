@@ -1,12 +1,15 @@
 """Offline AI_COMPLETE regression: python test_runtime.py --binary /path/to/seekdb."""
 
 import argparse
+from collections import deque
 from collections import Counter
 import json
 import os
 from pathlib import Path
 import resource
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -255,7 +258,8 @@ def run_checks(connection, server, socket):
         print("PASS query cancellation aborts the active batch", flush=True)
 
 
-def main(checks=run_checks, *, live=False, server_env=None, sql_timeout=40, description=__doc__):
+def main(checks=run_checks, *, live=False, server_env=None, sql_timeout=40, description=__doc__,
+         normal_shutdown=False):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--binary", required=True)
     if live:
@@ -277,9 +281,11 @@ def main(checks=run_checks, *, live=False, server_env=None, sql_timeout=40, desc
                 process = subprocess.Popen([options.binary, "--nodaemon", "--base-dir", directory,
                     "--parameter", "mysql_port_mode=disabled", "--parameter", "enable_rpc_service=false",
                     "--parameter", "memory_budget=2G", "--parameter", "datafile_size=1G",
-                    "--parameter", "datafile_maxsize=4G", "--parameter", "log_disk_size=2G"],
+                    "--parameter", "datafile_maxsize=4G", "--parameter", "log_disk_size=2G",
+                    *(["--parameter", "log_level=WDIAG"] if normal_shutdown else [])],
                     stdout=log, stderr=subprocess.STDOUT, env=environment)
                 connection = None
+                checks_completed = False
                 try:
                     socket = str(base / "run/sql.sock")
                     deadline = time.monotonic() + 180
@@ -295,15 +301,41 @@ def main(checks=run_checks, *, live=False, server_env=None, sql_timeout=40, desc
                         log.seek(0)
                         raise RuntimeError("test server failed to start: " + log.read()[-4000:])
                     checks(connection, server, socket)
+                    checks_completed = True
                 finally:
                     if connection is not None:
                         connection.close()
-                    process.terminate()
+                    if process.poll() is None:
+                        process.send_signal(signal.SIGUSR1) if normal_shutdown else process.terminate()
                     try:
                         process.wait(timeout=30)
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
+                    if normal_shutdown and not checks_completed:
+                        diagnostics = deque(maxlen=24)
+                        for log_file in (base / "log").rglob("*"):
+                            if not log_file.is_file():
+                                continue
+                            with log_file.open(errors="replace") as engine_log:
+                                for line in engine_log:
+                                    if any(f"] {level} " in line for level in (
+                                            "WARN", "ERROR", "WDIAG", "EDIAG")) and (
+                                            "[SQL" in line or "semantic" in line.lower()
+                                            or "-4016" in line):
+                                        diagnostics.append(line.rstrip()[:2000])
+                        if diagnostics:
+                            print("Private AI contract engine diagnostics:", file=sys.stderr)
+                            print("\n".join(diagnostics), file=sys.stderr)
+                if normal_shutdown:
+                    if process.returncode != 0:
+                        raise RuntimeError(f"database normal shutdown returned {process.returncode}")
+                    for log_file in (base / "log").glob("*.log"):
+                        with log_file.open(errors="replace") as engine_log:
+                            for line in engine_log:
+                                if "semantic query resources remain at destruction" in line:
+                                    raise AssertionError("normal shutdown leaked semantic query resources")
+                    print("PASS normal database shutdown and semantic resource cleanup", flush=True)
                 usage = resource.getrusage(resource.RUSAGE_CHILDREN)
                 print(f"Database process including bootstrap: cpu={usage.ru_utime + usage.ru_stime:.2f}s "
                       f"peak_rss={usage.ru_maxrss}KiB", flush=True)

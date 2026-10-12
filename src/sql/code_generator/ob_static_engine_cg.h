@@ -94,6 +94,7 @@ class ObSubPlanFilterSpec;
 class ObLogSubPlanScan;
 class ObSubPlanScanSpec;
 class ObGroupBySpec;
+class SemanticAggregateSpec;
 class ObScalarAggregateSpec;
 class ObMergeGroupBySpec;
 class ObHashGroupBySpec;
@@ -309,6 +310,7 @@ private:
   int generate_spec(ObLogGroupBy &op, ObScalarAggregateSpec &spec, const bool in_root_job);
   int generate_spec(ObLogGroupBy &op, ObMergeGroupBySpec &spec, const bool in_root_job);
   int generate_spec(ObLogGroupBy &op, ObHashGroupBySpec &spec, const bool in_root_job);
+  int generate_spec(ObLogGroupBy &op, SemanticAggregateSpec &spec, const bool in_root_job);
   int generate_dist_aggr_distinct_columns(ObLogGroupBy &op, ObHashGroupBySpec &spec);
   int generate_dist_aggr_group(ObLogGroupBy &op, ObGroupBySpec &spec);
 

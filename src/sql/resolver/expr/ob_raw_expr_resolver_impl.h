@@ -90,6 +90,7 @@ private:
   int process_case_node(const ParseNode *node, ObRawExpr *&expr);
   int process_sub_query_node(const ParseNode *node, ObRawExpr *&expr);
   int process_agg_node(const ParseNode *node, ObRawExpr *&expr);
+  int process_ai_agg_node(const ParseNode *node, ObRawExpr *&expr);
   int process_group_aggr_node(const ParseNode *node, ObRawExpr *&expr);
   int process_sort_list_node(const ParseNode *node, ObAggFunRawExpr *parent_agg_expr);
   int process_timestamp_node(const ParseNode *node, common::ObString &err_info, ObRawExpr *&expr);

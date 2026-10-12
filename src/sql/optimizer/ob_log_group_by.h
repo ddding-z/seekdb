@@ -96,7 +96,8 @@ public:
         use_part_sort_(false),
         gby_dop_(ObGlobalHint::UNSET_PARALLEL),
         is_pushdown_scalar_aggr_(false),
-        hash_rollup_info_()
+        hash_rollup_info_(),
+        semantic_query_task_count_(1)
   {}
   virtual ~ObLogGroupBy()
   {}
@@ -135,6 +136,9 @@ public:
   int set_rollup_exprs(const common::ObIArray<ObRawExpr *> &rollup_exprs);
   int set_aggr_exprs(const common::ObIArray<ObAggFunRawExpr *> &aggr_exprs);
   ObSelectLogPlan *get_plan() { return static_cast<ObSelectLogPlan *>(my_plan_); }
+  bool has_semantic_aggregate() const;
+  int64_t semantic_query_task_count() const { return semantic_query_task_count_; }
+  void set_semantic_query_task_count(int64_t count) { semantic_query_task_count_ = count; }
   virtual int get_op_exprs(ObIArray<ObRawExpr*> &all_exprs) override;
   virtual int is_my_fixed_expr(const ObRawExpr *expr, bool &is_fixed) override;
   virtual uint64_t hash(uint64_t seed) const override;
@@ -253,6 +257,7 @@ private:
   // end use print outline
   bool is_pushdown_scalar_aggr_;
   ObHashRollupInfo *hash_rollup_info_;
+  int64_t semantic_query_task_count_;
 };
 } // end of namespace sql
 } // end of namespace oceanbase

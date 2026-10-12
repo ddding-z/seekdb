@@ -1738,7 +1738,8 @@ int ObAIFuncModel::call_completion_vector(ObArray<ObString> &prompts, ObJsonObje
 
 int ObAIFuncModel::start_completion_batch(ObArray<ObString> &prompts, ObJsonObject *config,
                                          AIFuncBatch &batch,
-                                         const ObIArray<ObJsonArray *> *media_parts)
+                                         const ObIArray<ObJsonArray *> *media_parts,
+                                         const ObString *system_prompt)
 {
   int ret = OB_SUCCESS;
   batch.cancel();
@@ -1747,6 +1748,9 @@ int ObAIFuncModel::start_completion_batch(ObArray<ObString> &prompts, ObJsonObje
   ObArray<ObJsonObject *> body_array;
   ObAIFuncIComplete *complete_provider = nullptr;
   ObString prompt_str;
+  if (nullptr != system_prompt) {
+    prompt_str = *system_prompt;
+  }
   ObAIFuncClient &client = batch.client_;
   ObString unencrypted_access_key;
   ObString request_model_name = get_request_model_name();
@@ -1996,8 +2000,13 @@ int AIFuncBatch::get_results(ObArray<ObString> &results)
   const auto append_result = [&](ObIJsonBase *value) -> int {
     int ret = OB_SUCCESS;
     ObString result;
-    if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(allocator_, value, result))) {
-    } else if (OB_FAIL(results.push_back(result))) {
+    if (complete_text_output_ && value->json_type() != ObJsonNodeType::J_STRING) {
+      ret = OB_INVALID_DATA;
+    } else if (complete_text_output_) {
+      result.assign_ptr(value->get_data(), value->get_data_length());
+    } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(allocator_, value, result))) {
+    }
+    if (OB_SUCC(ret) && OB_FAIL(results.push_back(result))) {
     }
     return ret;
   };
@@ -2010,7 +2019,29 @@ int AIFuncBatch::get_results(ObArray<ObString> &results)
     } else {
       for (int64_t request = 0; OB_SUCC(ret) && request < responses.count(); ++request) {
         ObIJsonBase *result_base = nullptr;
-        if (OB_FAIL(provider_->parse_output(allocator_, responses.at(request), result_base))) {
+        if (complete_text_output_) {
+          ObJsonNode *choices = responses.at(request)->get_value("choices");
+          ObJsonNode *choice = nullptr;
+          ObJsonNode *finish = nullptr;
+          ObJsonNode *message = nullptr;
+          ObJsonNode *refusal = nullptr;
+          if (nullptr == choices || choices->json_type() != ObJsonNodeType::J_ARRAY ||
+              choices->element_count() != 1 ||
+              nullptr == (choice = choices->get_value(0)) ||
+              choice->json_type() != ObJsonNodeType::J_OBJECT ||
+              nullptr == (finish = static_cast<ObJsonObject *>(choice)->get_value("finish_reason")) ||
+              finish->json_type() != ObJsonNodeType::J_STRING ||
+              ObString(finish->get_data_length(), finish->get_data()) != "stop" ||
+              nullptr == (message = static_cast<ObJsonObject *>(choice)->get_value("message")) ||
+              message->json_type() != ObJsonNodeType::J_OBJECT) {
+            ret = OB_INVALID_DATA;
+          } else if (nullptr != (refusal = static_cast<ObJsonObject *>(message)->get_value("refusal")) &&
+                     refusal->json_type() != ObJsonNodeType::J_NULL) {
+            ret = OB_INVALID_DATA;
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(provider_->parse_output(allocator_, responses.at(request), result_base))) {
         } else if (OB_ISNULL(result_base)) {
           ret = OB_INVALID_DATA;
         } else if (!batched_response_) {

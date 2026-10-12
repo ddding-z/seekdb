@@ -1095,6 +1095,7 @@
 #define N_AI_FILTER                         "ai_filter"
 #define N_AI_JOIN                           "ai_join"
 #define N_AI_INPUT                          "ai_input"
+#define N_AI_AGG                            "ai_agg"
 #define N_TO_FILE                           "to_file"
 #define N_FILE_URI                          "file_uri"
 #define N_FILE_META                         "file_meta"

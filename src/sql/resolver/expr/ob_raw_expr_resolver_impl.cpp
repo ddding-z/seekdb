@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "ob_raw_expr_resolver_impl.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_agg.h"
 #include "lib/json/ob_json_print_utils.h"
 #include "sql/pl/ob_pl_resolver.h"
 #include "sql/resolver/dml/ob_inlist_resolver.h"
@@ -3769,6 +3770,77 @@ int ObRawExprResolverImpl::process_agg_node(const ParseNode *node, ObRawExpr *&e
   return ret;
 }
 
+int ObRawExprResolverImpl::process_ai_agg_node(const ParseNode *node, ObRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  ObAggFunRawExpr *agg_expr = nullptr;
+  const ParseNode *arguments = node->num_child_ > 1 ? node->children_[1] : nullptr;
+  const int64_t param_num = nullptr == arguments ? 0 : arguments->num_child_;
+  bool added_parent_flag = false;
+  if (ctx_.parents_expr_info_.has_member(IS_AGG)) {
+    ret = OB_ERR_INVALID_GROUP_FUNC_USE;
+    LOG_USER_ERROR(OB_ERR_INVALID_GROUP_FUNC_USE);
+    LOG_WARN("AI_AGG cannot be nested inside an aggregate", K(ret));
+  } else if (ctx_.parents_expr_info_.has_member(IS_WINDOW_FUNC)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_AGG in a window function");
+    LOG_WARN("AI_AGG cannot be used in a window function", K(ret));
+  } else if (node->num_child_ > 2 && nullptr != node->children_[2] &&
+             node->children_[2]->type_ == T_DISTINCT) {
+    ret = OB_DISTINCT_NOT_ALLOWED;
+    LOG_USER_ERROR(OB_DISTINCT_NOT_ALLOWED);
+    LOG_WARN("AI_AGG does not support DISTINCT", K(ret));
+  } else if (nullptr != arguments &&
+             (arguments->type_ != T_EXPR_LIST || OB_ISNULL(arguments->children_))) {
+    ret = OB_ERR_PARSER_SYNTAX;
+    LOG_WARN("invalid AI_AGG argument list", K(ret), K(arguments));
+  } else if (OB_FAIL(ExprAIAgg::check_param_count(param_num))) {
+  } else if (OB_ISNULL(ctx_.aggr_exprs_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("aggregate expression array is null", K(ret));
+  } else if (OB_FAIL(ctx_.expr_factory_.create_raw_expr(T_FUN_AI_AGG, agg_expr))) {
+  } else if (OB_ISNULL(agg_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("AI_AGG aggregate expression is null", K(ret));
+  } else if (OB_FAIL(ctx_.parents_expr_info_.add_member(IS_AGG))) {
+    LOG_WARN("failed to add aggregate parent flag", K(ret));
+  } else {
+    added_parent_flag = true;
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && index < param_num; ++index) {
+    ObRawExpr *argument = nullptr;
+    if (OB_ISNULL(arguments->children_[index])) {
+      ret = OB_ERR_PARSER_SYNTAX;
+      LOG_WARN("AI_AGG parse argument is null", K(ret), K(index));
+    } else if (OB_FAIL(SMART_CALL(recursive_resolve(arguments->children_[index], argument)))) {
+    } else if (OB_ISNULL(argument)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("AI_AGG resolved argument is null", K(ret), K(index));
+    } else if (OB_FAIL(argument->extract_info())) {
+    } else if (OB_FAIL(agg_expr->add_real_param_expr(argument))) {
+    }
+  }
+  if (added_parent_flag) {
+    const int cleanup_ret = ctx_.parents_expr_info_.del_member(IS_AGG);
+    if (cleanup_ret != OB_SUCCESS) {
+      LOG_WARN("failed to restore aggregate parent flag", K(cleanup_ret));
+      if (OB_SUCC(ret)) {
+        ret = cleanup_ret;
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(ExprAIAgg::check_arguments(*agg_expr))) {
+  } else if (OB_FAIL(agg_expr->get_relation_ids().add_member(0))) {
+    LOG_WARN("failed to add aggregate relation id", K(ret));
+  } else if (OB_FAIL(ctx_.aggr_exprs_->push_back(agg_expr))) {
+    LOG_WARN("failed to register AI_AGG aggregate", K(ret));
+  } else {
+    expr = agg_expr;
+  }
+  return ret;
+}
+
 int ObRawExprResolverImpl::process_group_aggr_node(const ParseNode *node, ObRawExpr *&expr)
 {
   int ret = OB_SUCCESS;
@@ -5288,6 +5360,9 @@ int ObRawExprResolverImpl::process_fun_sys_node(const ParseNode *node,
   } else if (OB_UNLIKELY(1 > node->num_child_) || OB_ISNULL(node->children_) || OB_ISNULL(node->children_[0])) {
     ret = OB_ERR_PARSER_SYNTAX;
     LOG_WARN("invalid node children for fun_sys node", K(ret), "node", SJ(ObParserResultPrintWrapper(*node)));
+  } else if (T_FUN_AI_AGG == ObExprOperatorFactory::get_type_by_name(
+                 ObString(node->children_[0]->str_len_, node->children_[0]->str_value_))) {
+    return process_ai_agg_node(node, expr);
   } else if (OB_FAIL(ctx_.expr_factory_.create_raw_expr(T_FUN_SYS, func_expr))) {
   } else if (OB_ISNULL(func_expr)) {
     ret = OB_ERR_UNEXPECTED;

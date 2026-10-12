@@ -79,6 +79,7 @@
 #include "sql/engine/expr/ob_expr_subquery_ref.h"
 #include "sql/engine/aggregate/ob_merge_groupby_op.h"
 #include "sql/engine/aggregate/ob_hash_groupby_op.h"
+#include "sql/engine/aggregate/ob_semantic_aggregate_op.h"
 #include "sql/engine/join/ob_merge_join_op.h"
 #include "sql/engine/basic/ob_topk_op.h"
 #include "sql/engine/dml/ob_table_delete_op.h"
@@ -3478,6 +3479,58 @@ int ObStaticEngineCG::generate_spec(ObLogGroupBy &op, ObScalarAggregateSpec &spe
   return ret;
 }
 
+int ObStaticEngineCG::generate_spec(ObLogGroupBy &op, SemanticAggregateSpec &spec,
+    const bool in_root_job)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(in_root_job);
+  spec.query_task_count_ = op.semantic_query_task_count();
+  if (!op.has_semantic_aggregate() || op.is_push_down() ||
+      !op.get_rollup_exprs().empty() || op.get_parallel() != 1 ||
+      op.get_aggr_stage() != ObThreeStageAggrStage::NONE_STAGE) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "distributed, partial or rollup AI_AGG");
+  } else if (OB_FAIL(fill_aggr_infos(op, spec))) {
+  } else if (OB_FAIL(generate_rt_exprs(op.get_group_by_exprs(), spec.group_exprs_))) {
+  } else if (OB_FAIL(spec.cmp_funcs_.init(spec.group_exprs_.count()))) {
+  } else {
+    int64_t semantic_count = 0;
+    for (int64_t index = 0; index < spec.aggr_infos_.count(); ++index) {
+      semantic_count += spec.aggr_infos_.at(index).get_expr_type() == T_FUN_AI_AGG;
+    }
+    if (OB_FAIL(spec.ordinary_aggr_infos_.prepare_allocate(
+        spec.aggr_infos_.count() - semantic_count))) {
+    } else if (OB_FAIL(spec.semantic_aggr_infos_.prepare_allocate(semantic_count))) {
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && index < spec.group_exprs_.count(); ++index) {
+      ObExpr &expr = *spec.group_exprs_.at(index);
+      ObCmpFunc comparator;
+      comparator.cmp_func_ = expr.basic_funcs_->null_last_cmp_;
+      if (OB_ISNULL(comparator.cmp_func_)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        ret = spec.cmp_funcs_.push_back(comparator);
+      }
+    }
+    int64_t semantic_index = 0;
+    int64_t ordinary_index = 0;
+    for (int64_t index = 0; OB_SUCC(ret) && index < spec.aggr_infos_.count(); ++index) {
+      const ObAggrInfo &source = spec.aggr_infos_.at(index);
+      if (source.has_distinct_ || source.has_order_by_) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "DISTINCT or ordered aggregates with AI_AGG");
+      } else {
+        ObAggrInfo &destination = source.get_expr_type() == T_FUN_AI_AGG
+            ? spec.semantic_aggr_infos_.at(semantic_index++)
+            : spec.ordinary_aggr_infos_.at(ordinary_index++);
+        destination.set_allocator(&phy_plan_->get_allocator());
+        ret = destination.assign(source);
+      }
+    }
+  }
+  return ret;
+}
+
 int ObStaticEngineCG::generate_spec(ObLogGroupBy &op, ObMergeGroupBySpec &spec,
     const bool in_root_job)
 {
@@ -6239,6 +6292,10 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
     }
     case log_op_def::LOG_GROUP_BY: {
       auto &op = static_cast<ObLogGroupBy&>(log_op);
+      if (op.has_semantic_aggregate()) {
+        type = PHY_SEMANTIC_AGGREGATE;
+        break;
+      }
       switch (op.get_algo()) {
         case MERGE_AGGREGATE:
           type = PHY_MERGE_GROUP_BY;

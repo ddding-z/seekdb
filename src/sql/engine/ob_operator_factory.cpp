@@ -23,6 +23,7 @@
 #include "sql/engine/basic/ob_ai_func_op.h"
 #include "sql/optimizer/ob_log_semantic.h"
 #include "sql/engine/basic/ob_semantic_op.h"
+#include "sql/engine/aggregate/ob_semantic_aggregate_op.h"
 #include "sql/optimizer/ob_log_group_by.h"
 #include "sql/optimizer/ob_log_sort.h"
 #include "sql/optimizer/ob_log_limit.h"
