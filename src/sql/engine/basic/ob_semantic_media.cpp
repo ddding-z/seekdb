@@ -30,6 +30,7 @@
 #include <climits>
 #include <cstdio>
 #include <cstring>
+#include <curl/curl.h>
 #include <fcntl.h>
 #include <new>
 #include <sys/stat.h>
@@ -45,8 +46,8 @@ using namespace common;
 
 namespace
 {
-constexpr int64_t MAX_DESCRIPTOR_BYTES = 16 * 1024;
-constexpr int64_t MAX_URI_BYTES = 4096;
+constexpr int64_t MAX_DESCRIPTOR_BYTES = FileRefCodec::MAX_REF_BYTES;
+constexpr int64_t MAX_URI_BYTES = FileRefCodec::MAX_URI_BYTES;
 constexpr int64_t MAX_SOURCE_BYTES = (INT32_MAX / 4) * 3LL;
 constexpr int64_t READ_CHUNK_BYTES = 64 * 1024;
 constexpr int64_t ENCODE_CHUNK_BYTES = 48 * 1024;
@@ -58,6 +59,8 @@ constexpr int64_t MAX_QUERY_RUNTIMES = 1024;
 constexpr int64_t ALLOCATION_OVERHEAD = 128;
 constexpr int64_t REGISTRY_OVERHEAD = 256;
 constexpr int64_t HASH_WORK_BYTES = 4096;
+constexpr int64_t REMOTE_REQUEST_BYTES = 8192;
+constexpr int64_t MAX_REMOTE_HEADER_BYTES = 32 * 1024;
 
 struct MediaRegistry
 {
@@ -1045,9 +1048,439 @@ private:
   std::atomic<bool> stopping_;
 };
 
+class SemanticRemoteMediaScheduler final : public lib::Threads
+{
+public:
+  static constexpr int64_t ACTIVE_CAPACITY = 64;
+  using Job = SemanticMediaScheduler::Job;
+
+  SemanticRemoteMediaScheduler()
+      : lib::Threads(1), jobs_{}, requests_{}, head_(0), count_(0),
+        started_(false), stopping_(false) {}
+  ~SemanticRemoteMediaScheduler() override { shutdown(); }
+
+  static SemanticRemoteMediaScheduler &instance()
+  {
+    static SemanticRemoteMediaScheduler scheduler;
+    return scheduler;
+  }
+
+  int ensure_started()
+  {
+    int ret = OB_SUCCESS;
+    if (stopping_.load()) {
+      ret = OB_CANCELED;
+    } else if (!started_.load()) {
+      std::unique_lock<std::mutex> lifecycle(lifecycle_mutex_, std::try_to_lock);
+      if (!lifecycle.owns_lock()) {
+        ret = stopping_.load() ? OB_CANCELED : OB_EAGAIN;
+      } else if (stopping_.load()) {
+        ret = OB_CANCELED;
+      } else if (!started_.load()) {
+        const curl_version_info_data *version = curl_version_info(CURLVERSION_NOW);
+        if (nullptr == version || (version->features & CURL_VERSION_ASYNCHDNS) == 0) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("remote media requires curl asynchronous DNS", K(ret));
+        } else {
+          ret = start();
+          if (ret == OB_ALLOCATE_MEMORY_FAILED) {
+            ret = OB_SIZE_OVERFLOW;
+          }
+          started_.store(OB_SUCC(ret));
+          if (OB_FAIL(ret)) {
+            LOG_WARN("start remote media executor failed", K(ret));
+          }
+        }
+      }
+    }
+    return ret;
+  }
+
+  int submit(SemanticMediaRuntime &runtime, const std::shared_ptr<SemanticMediaTask> &task)
+  {
+    int ret = OB_SUCCESS;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_.load()) {
+      ret = OB_CANCELED;
+    } else if (count_ == jobs_.size()) {
+      ret = OB_EAGAIN;
+    } else {
+      jobs_[(head_ + count_) % jobs_.size()] = Job{&runtime, task};
+      ++count_;
+      changed_.notify_one();
+    }
+    return ret;
+  }
+
+  bool can_submit() const
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return stopping_.load() || count_ < jobs_.size();
+  }
+
+  bool stopping() const { return stopping_.load(); }
+  void wake() { changed_.notify_one(); }
+
+  void shutdown()
+  {
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    stopping_.store(true);
+    stop();
+    changed_.notify_all();
+    wait();
+  }
+
+private:
+  struct Request
+  {
+    Job job_;
+    CURL *handle_ = nullptr;
+    char url_[MAX_URI_BYTES + 1] = {};
+    int ret_ = OB_SUCCESS;
+    long http_code_ = 0;
+    int64_t expected_size_ = -1;
+    int64_t header_bytes_ = 0;
+    int64_t charged_bytes_ = 0;
+    bool attached_ = false;
+    bool fetched_ = false;
+  };
+
+  static int http_error(long code)
+  {
+    return code == 404 ? OB_FILE_NOT_EXIST
+        : code == 401 || code == 403 || (code >= 300 && code < 400) ? OB_OP_NOT_ALLOW
+        : code == 200 ? OB_SUCCESS : OB_IO_ERROR;
+  }
+
+  static size_t write_callback(char *data, size_t size, size_t count, void *context)
+  {
+    auto &request = *static_cast<Request *>(context);
+    int ret = request.job_.runtime_->status();
+    if (OB_SUCC(ret) && request.http_code_ != 200) {
+      ret = http_error(request.http_code_);
+    }
+    if (OB_SUCC(ret) && (size > INT64_MAX || count > INT64_MAX ||
+        (size > 0 && count > static_cast<size_t>(INT64_MAX) / size))) {
+      ret = OB_SIZE_OVERFLOW;
+    }
+    if (OB_SUCC(ret)) {
+      ret = request.job_.runtime_->append_remote_data(*request.job_.task_, data, size * count);
+    }
+    if (OB_FAIL(ret)) {
+      request.ret_ = ret;
+    }
+    return OB_SUCC(ret) ? size * count : 0;
+  }
+
+  static size_t header_callback(char *data, size_t size, size_t count, void *context)
+  {
+    auto &request = *static_cast<Request *>(context);
+    int ret = request.job_.runtime_->status();
+    if (OB_SUCC(ret) && (size > MAX_REMOTE_HEADER_BYTES || count > MAX_REMOTE_HEADER_BYTES ||
+        (size > 0 && count > static_cast<size_t>(MAX_REMOTE_HEADER_BYTES) / size))) {
+      ret = OB_SIZE_OVERFLOW;
+    }
+    const int64_t length = OB_SUCC(ret) ? size * count : 0;
+    if (OB_SUCC(ret) && request.header_bytes_ > MAX_REMOTE_HEADER_BYTES - length) {
+      ret = OB_SIZE_OVERFLOW;
+    }
+    if (OB_SUCC(ret)) {
+      request.header_bytes_ += length;
+      if (length >= 5 && std::memcmp(data, "HTTP/", 5) == 0) {
+        int64_t offset = 5;
+        while (offset < length && data[offset] != ' ') {
+          ++offset;
+        }
+        if (offset + 4 >= length || data[offset + 1] < '0' || data[offset + 1] > '9'
+            || data[offset + 2] < '0' || data[offset + 2] > '9'
+            || data[offset + 3] < '0' || data[offset + 3] > '9') {
+          ret = OB_INVALID_DATA;
+        } else {
+          request.http_code_ = (data[offset + 1] - '0') * 100 +
+                               (data[offset + 2] - '0') * 10 + data[offset + 3] - '0';
+          request.expected_size_ = -1;
+        }
+      } else {
+        int64_t colon = 0;
+        while (colon < length && data[colon] != ':') {
+          ++colon;
+        }
+        if (colon < length && request.http_code_ == 200) {
+          ObString name(colon, data);
+          ObString value(length - colon - 1, data + colon + 1);
+          value = value.trim();
+          if (equals_mime(name, "content-length")) {
+            int64_t bytes = 0;
+            if (value.empty() || request.expected_size_ != -1) {
+              ret = OB_INVALID_DATA;
+            }
+            for (int64_t i = 0; OB_SUCC(ret) && i < value.length(); ++i) {
+              const char digit = value.ptr()[i];
+              if (digit < '0' || digit > '9' || bytes > (INT64_MAX - (digit - '0')) / 10) {
+                ret = OB_INVALID_DATA;
+              } else {
+                bytes = bytes * 10 + digit - '0';
+              }
+            }
+            if (OB_SUCC(ret)) {
+              const auto &task = *request.job_.task_;
+              if (bytes > request.job_.runtime_->max_bytes_ || bytes > MAX_SOURCE_BYTES) {
+                ret = OB_SIZE_OVERFLOW;
+              } else if (task.declared_size_ >= 0 && bytes != task.declared_size_) {
+                ret = OB_INVALID_DATA;
+              } else {
+                request.expected_size_ = bytes;
+              }
+            }
+          } else if (equals_mime(name, "content-encoding") &&
+                     !equals_mime(value, "identity")) {
+            ret = OB_NOT_SUPPORTED;
+          }
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+      request.ret_ = ret;
+    }
+    return OB_SUCC(ret) ? length : 0;
+  }
+
+  static int progress_callback(void *context, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+  {
+    auto &request = *static_cast<Request *>(context);
+    const int ret = request.job_.runtime_->status();
+    if (OB_SUCCESS != ret) {
+      request.ret_ = ret;
+    }
+    return OB_SUCCESS == ret ? 0 : 1;
+  }
+
+  int start_request(CURLM *multi, Request &request)
+  {
+    auto &runtime = *request.job_.runtime_;
+    auto &task = *request.job_.task_;
+    runtime.started_count_.fetch_add(1);
+    int ret = runtime.status();
+    const int64_t charge = REMOTE_REQUEST_BYTES + task.uri_.length() + 1;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(runtime.reserve_with_eviction(charge))) {
+    } else {
+      request.charged_bytes_ = charge;
+      task.charged_bytes_ += charge;
+      std::memcpy(request.url_, task.uri_.ptr(), task.uri_.length());
+      request.url_[task.uri_.length()] = '\0';
+      if (nullptr == (request.handle_ = curl_easy_init())) {
+        ret = OB_CURL_ERROR;
+      } else {
+        CURL *handle = request.handle_;
+        const int64_t remaining_ms = std::max<int64_t>(1,
+            std::min<int64_t>(LONG_MAX, (runtime.deadline_ - ObTimeUtility::current_time()) / 1000));
+        if (CURLE_OK != curl_easy_setopt(handle, CURLOPT_URL, request.url_) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_HTTPGET, 1L) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_PATH_AS_IS, 1L) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 0L) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_PROTOCOLS,
+                                        static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS)) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS,
+                                        static_cast<long>(CURLPROTO_HTTPS)) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_PROXY, "") ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_NOPROXY, "*") ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 1L) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 2L) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_ACCEPT_ENCODING, "identity") ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_HTTP_CONTENT_DECODING, 0L) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_MAXFILESIZE_LARGE,
+                                        static_cast<curl_off_t>(runtime.max_bytes_)) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS,
+                                        std::min<int64_t>(10000, remaining_ms)) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, remaining_ms) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, write_callback) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_WRITEDATA, &request) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, header_callback) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_HEADERDATA, &request) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_XFERINFOFUNCTION, progress_callback) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_XFERINFODATA, &request) ||
+            CURLE_OK != curl_easy_setopt(handle, CURLOPT_PRIVATE, &request) ||
+            CURLM_OK != curl_multi_add_handle(multi, handle)) {
+          ret = OB_CURL_ERROR;
+        } else {
+          request.attached_ = true;
+        }
+      }
+    }
+    return ret;
+  }
+
+  void close_request(CURLM *multi, Request &request)
+  {
+    if (request.handle_ != nullptr) {
+      if (request.attached_ && CURLM_OK != curl_multi_remove_handle(multi, request.handle_)) {
+        const int ret = OB_CURL_ERROR;
+        LOG_WARN("remove remote media request failed", K(ret));
+      }
+      curl_easy_cleanup(request.handle_);
+      request.handle_ = nullptr;
+      request.attached_ = false;
+    }
+    if (request.charged_bytes_ > 0) {
+      request.job_.task_->charged_bytes_ -= request.charged_bytes_;
+      request.job_.runtime_->budget_->release(request.charged_bytes_);
+      request.charged_bytes_ = 0;
+    }
+  }
+
+  void fail_request(CURLM *multi, Request &request, int ret)
+  {
+    close_request(multi, request);
+    request.job_.runtime_->complete_task(std::move(request.job_.task_), ret);
+    request = Request{};
+  }
+
+  void finish_request(CURLM *multi, Request &request, CURLcode code)
+  {
+    int ret = request.job_.runtime_->status();
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(request.ret_)) {
+    } else if (request.http_code_ != 0 && request.http_code_ != 200) {
+      ret = http_error(request.http_code_);
+    } else if (code != CURLE_OK) {
+      ret = code == CURLE_OPERATION_TIMEDOUT ? OB_TIMEOUT
+          : code == CURLE_FILESIZE_EXCEEDED ? OB_SIZE_OVERFLOW
+          : code == CURLE_PARTIAL_FILE ? OB_INVALID_DATA : OB_CURL_ERROR;
+    } else if (request.http_code_ != 200) {
+      ret = OB_INVALID_DATA;
+    } else {
+      const auto &task = *request.job_.task_;
+      if (task.source_size_ <= 0 ||
+          (request.expected_size_ >= 0 && task.source_size_ != request.expected_size_) ||
+          (task.declared_size_ >= 0 && task.source_size_ != task.declared_size_)) {
+        ret = OB_INVALID_DATA;
+      }
+    }
+    close_request(multi, request);
+    if (OB_FAIL(ret)) {
+      LOG_WARN("remote media GET failed", K(ret), "http_code", request.http_code_,
+               "curl_code", static_cast<int>(code), "curl_error", curl_easy_strerror(code));
+      fail_request(multi, request, ret);
+    } else {
+      request.fetched_ = true;
+    }
+  }
+
+  void run1() override
+  {
+    lib::set_thread_name("SemanticFetch");
+    CURLM *multi = curl_multi_init();
+    int ret = nullptr == multi ? OB_CURL_ERROR : OB_SUCCESS;
+    if (OB_SUCCESS != ret) {
+      LOG_WARN("initialize remote media curl multi failed", K(ret));
+    }
+    if (OB_SUCC(ret) &&
+        (CURLM_OK != curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, ACTIVE_CAPACITY) ||
+         CURLM_OK != curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS, ACTIVE_CAPACITY))) {
+      ret = OB_CURL_ERROR;
+      LOG_WARN("configure remote media curl multi failed", K(ret));
+    }
+    for (;;) {
+      for (auto &request : requests_) {
+        if (!request.job_.task_) {
+          {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (count_ > 0) {
+              request.job_ = std::move(jobs_[head_]);
+              jobs_[head_] = Job{};
+              head_ = (head_ + 1) % jobs_.size();
+              --count_;
+            }
+          }
+          if (request.job_.task_) {
+            const int started = OB_SUCCESS == ret ? start_request(multi, request) : ret;
+            if (OB_SUCCESS != started) {
+              fail_request(multi, request, started);
+            }
+          }
+        } else if (request.job_.runtime_->status() != OB_SUCCESS) {
+          fail_request(multi, request, request.job_.runtime_->status());
+        } else if (request.fetched_) {
+          const int submitted = SemanticMediaScheduler::instance().submit(
+              *request.job_.runtime_, request.job_.task_);
+          if (OB_SUCCESS == submitted) {
+            request = Request{};
+          } else if (OB_EAGAIN != submitted) {
+            fail_request(multi, request, submitted);
+          }
+        }
+      }
+      int running = 0;
+      if (OB_SUCC(ret)) {
+        const CURLMcode code = curl_multi_perform(multi, &running);
+        if (CURLM_OK != code) {
+          ret = OB_CURL_ERROR;
+          LOG_WARN("drive remote media network failed", K(ret), "curl_code", static_cast<int>(code));
+        }
+      }
+      if (OB_SUCCESS != ret) {
+        for (auto &request : requests_) {
+          if (request.job_.task_) {
+            fail_request(multi, request, ret);
+          }
+        }
+      } else {
+        int messages = 0;
+        CURLMsg *message = nullptr;
+        while (nullptr != (message = curl_multi_info_read(multi, &messages))) {
+          if (message->msg == CURLMSG_DONE) {
+            Request *request = nullptr;
+            if (CURLE_OK != curl_easy_getinfo(message->easy_handle, CURLINFO_PRIVATE, &request) ||
+                nullptr == request || !request->job_.task_) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("remote media completion has no owned request", K(ret));
+            } else {
+              finish_request(multi, *request, message->data.result);
+            }
+          }
+        }
+      }
+      const bool active = std::any_of(requests_.begin(), requests_.end(),
+          [](const Request &request) { return static_cast<bool>(request.job_.task_); });
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (stopping_.load() && count_ == 0 && !active) {
+          break;
+        } else if (running == 0) {
+          changed_.wait_for(lock, std::chrono::milliseconds(10));
+        }
+      }
+      if (running > 0 && OB_SUCCESS == ret) {
+        int descriptors = 0;
+        if (CURLM_OK != curl_multi_poll(multi, nullptr, 0, 10, &descriptors)) {
+          ret = OB_CURL_ERROR;
+          LOG_WARN("poll remote media network failed", K(ret));
+        }
+      }
+    }
+    if (nullptr != multi) {
+      curl_multi_cleanup(multi);
+    }
+  }
+
+  mutable std::mutex lifecycle_mutex_;
+  mutable std::mutex mutex_;
+  std::condition_variable changed_;
+  std::array<Job, SemanticMediaRuntime::QUEUE_CAPACITY> jobs_;
+  std::array<Request, ACTIVE_CAPACITY> requests_;
+  size_t head_;
+  size_t count_;
+  std::atomic<bool> started_;
+  std::atomic<bool> stopping_;
+};
+
 SemanticMediaTask::SemanticMediaTask(std::shared_ptr<SemanticQueryBudget> budget,
                                      int64_t charged_bytes)
-    : budget_(std::move(budget)), descriptor_buffer_(), base64_buffer_(), uri_(),
+    : budget_(std::move(budget)), descriptor_buffer_(), base64_buffer_(), source_buffer_(),
+      source_size_(0), source_capacity_(0), source_charge_(0), remote_(false), uri_(),
       declared_mime_type_(), object_version_(), declared_size_(-1), charged_bytes_(charged_bytes),
       base64_(), mime_type_(), audio_format_(), is_audio_(false), result_(OB_EAGAIN)
 {}
@@ -1055,6 +1488,7 @@ SemanticMediaTask::SemanticMediaTask(std::shared_ptr<SemanticQueryBudget> budget
 SemanticMediaTask::~SemanticMediaTask()
 {
   base64_buffer_.reset();
+  source_buffer_.reset();
   descriptor_buffer_.reset();
   budget_->release(charged_bytes_);
 }
@@ -1078,9 +1512,10 @@ bool SemanticMediaTask::is_image() const { return result() == OB_SUCCESS && !is_
 
 SemanticMediaRuntime::SemanticMediaRuntime(std::shared_ptr<SemanticQueryBudget> budget,
     int64_t max_bytes, int64_t parallel, int64_t deadline, int64_t charged_bytes)
-    : budget_(std::move(budget)), root_buffer_(), root_(), root_fd_(-1), max_bytes_(max_bytes),
+    : budget_(std::move(budget)), root_buffer_(), root_(), remote_root_buffer_(), remote_root_(),
+      root_fd_(-1), max_bytes_(max_bytes),
       parallel_(parallel), deadline_(deadline), charged_bytes_(charged_bytes), registered_(false),
-      cancel_ret_(OB_SUCCESS), mutex_(), drained_(), cache_{}, live_(), active_count_(0),
+      cancel_ret_(OB_SUCCESS), mutex_(), drained_(), cache_{}, live_(), active_count_(0), waiting_sources_(0),
       cache_clock_(0), started_count_(0), loaded_count_(0), evicted_count_(0),
       test_hook_(nullptr), test_hook_context_(nullptr)
 {}
@@ -1092,14 +1527,23 @@ bool SemanticMediaRuntime::MediaKeyLess::operator()(const MediaKey &left, const 
 }
 
 int SemanticMediaRuntime::matches_policy(const std::shared_ptr<SemanticQueryBudget> &budget,
-    const ObString &root, int64_t max_bytes, int64_t parallel, int64_t deadline) const
+    const ObString &root, const ObString &remote_root, int64_t max_bytes,
+    int64_t parallel, int64_t deadline) const
 {
-  return budget_.get() != budget.get() || !same_string(root_, root) || max_bytes_ != max_bytes
+  return budget_.get() != budget.get() || !same_string(root_, root) ||
+      !same_string(remote_root_, remote_root) || max_bytes_ != max_bytes
       || parallel_ != parallel || deadline_ != deadline ? OB_ERR_UNEXPECTED : OB_SUCCESS;
 }
 
 int SemanticMediaRuntime::acquire(std::shared_ptr<SemanticQueryBudget> budget, const ObString &root,
     int64_t max_bytes, int64_t parallel, int64_t deadline, std::shared_ptr<SemanticMediaRuntime> &out)
+{
+  return acquire(std::move(budget), root, ObString(), max_bytes, parallel, deadline, out);
+}
+
+int SemanticMediaRuntime::acquire(std::shared_ptr<SemanticQueryBudget> budget, const ObString &root,
+    const ObString &remote_root, int64_t max_bytes, int64_t parallel, int64_t deadline,
+    std::shared_ptr<SemanticMediaRuntime> &out)
 {
   int ret = OB_SUCCESS;
   std::shared_ptr<SemanticMediaRuntime> previous = std::move(out);
@@ -1110,9 +1554,10 @@ int SemanticMediaRuntime::acquire(std::shared_ptr<SemanticQueryBudget> budget, c
   if (!budget || max_bytes <= 0 || parallel <= 0 || deadline <= 0
       || budget->execution_id() == OB_INVALID_ID) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (root.empty()) {
+  } else if (root.empty() && remote_root.empty()) {
     ret = OB_OP_NOT_ALLOW;
-  } else if (OB_FAIL(canonical_path(normalized))) {
+  } else if (!root.empty() && OB_FAIL(canonical_path(normalized))) {
+  } else if (OB_FAIL(FileRefCodec::validate_remote_root(remote_root))) {
   } else if (OB_FAIL(budget->failure())) {
   } else if (ObTimeUtility::current_time() >= deadline) {
     ret = OB_TIMEOUT;
@@ -1138,7 +1583,7 @@ int SemanticMediaRuntime::acquire(std::shared_ptr<SemanticQueryBudget> budget, c
       registry.queries_.erase(entry);
     }
     if (selected) {
-      ret = selected->matches_policy(budget, normalized, max_bytes, parallel, deadline);
+      ret = selected->matches_policy(budget, normalized, remote_root, max_bytes, parallel, deadline);
       if (OB_SUCC(ret)) {
         ret = selected->status();
       }
@@ -1146,22 +1591,31 @@ int SemanticMediaRuntime::acquire(std::shared_ptr<SemanticQueryBudget> budget, c
       ret = OB_EAGAIN;
     } else {
       const int64_t charge = sizeof(SemanticMediaRuntime) + normalized.length() + 1
-          + ALLOCATION_OVERHEAD * 2 + REGISTRY_OVERHEAD;
+          + ALLOCATION_OVERHEAD * 2 + REGISTRY_OVERHEAD +
+          (remote_root.empty() ? 0 : remote_root.length() + 1 + ALLOCATION_OVERHEAD);
       if (OB_FAIL(budget->reserve(charge))) {
       } else {
         Reservation reservation(budget, charge);
         FileDescriptor root_fd;
-        if (OB_FAIL(open_root(normalized, root_fd))) {
+        if (!root.empty() && OB_FAIL(open_root(normalized, root_fd))) {
         } else {
           try {
             auto *created = new SemanticMediaRuntime(budget, max_bytes, parallel, deadline, charge);
             reservation.detach();
             candidate.reset(created);
             candidate->root_buffer_.reset(new char[normalized.length() + 1]);
-            std::memcpy(candidate->root_buffer_.get(), normalized.ptr(), normalized.length());
+            if (!normalized.empty()) {
+              std::memcpy(candidate->root_buffer_.get(), normalized.ptr(), normalized.length());
+            }
             candidate->root_buffer_[normalized.length()] = '\0';
             candidate->root_.assign_ptr(candidate->root_buffer_.get(), normalized.length());
             candidate->root_fd_ = root_fd.detach();
+            if (!remote_root.empty()) {
+              candidate->remote_root_buffer_.reset(new char[remote_root.length() + 1]);
+              std::memcpy(candidate->remote_root_buffer_.get(), remote_root.ptr(), remote_root.length());
+              candidate->remote_root_buffer_[remote_root.length()] = '\0';
+              candidate->remote_root_.assign_ptr(candidate->remote_root_buffer_.get(), remote_root.length());
+            }
             if (OB_FAIL(candidate->status())) {
             } else if (!registry.queries_.emplace(budget->execution_id(), candidate).second) {
               ret = OB_ERR_UNEXPECTED;
@@ -1204,6 +1658,7 @@ SemanticMediaRuntime::~SemanticMediaRuntime()
     root_fd_ = -1;
   }
   root_buffer_.reset();
+  remote_root_buffer_.reset();
   budget_->release(charged_bytes_);
   if (registered_) {
     auto &registry = media_registry();
@@ -1221,7 +1676,8 @@ int SemanticMediaRuntime::status() const
   if (OB_SUCC(ret)) {
     ret = cancel_ret_.load();
   }
-  if (OB_SUCC(ret) && SemanticMediaScheduler::instance().stopping()) {
+  if (OB_SUCC(ret) && (SemanticMediaScheduler::instance().stopping() ||
+                      SemanticRemoteMediaScheduler::instance().stopping())) {
     ret = OB_CANCELED;
   }
   if (OB_SUCC(ret) && ObTimeUtility::current_time() >= deadline_) {
@@ -1238,10 +1694,15 @@ int SemanticMediaRuntime::cancel(int ret)
   }
   int expected = OB_SUCCESS;
   cancel_ret_.compare_exchange_strong(expected, ret);
+  SemanticRemoteMediaScheduler::instance().wake();
   return OB_SUCCESS;
 }
 
-void SemanticMediaRuntime::stop_scheduler() { SemanticMediaScheduler::instance().shutdown(); }
+void SemanticMediaRuntime::stop_scheduler()
+{
+  SemanticRemoteMediaScheduler::instance().shutdown();
+  SemanticMediaScheduler::instance().shutdown();
+}
 
 int64_t SemanticMediaRuntime::get_cached_count() const
 {
@@ -1356,7 +1817,11 @@ bool SemanticMediaRuntime::can_demand() const
     return true;
   }
   std::lock_guard<std::mutex> lock(mutex_);
-  return active_count_ < parallel_ && SemanticMediaScheduler::instance().can_submit();
+  const uint8_t waiting = waiting_sources_ == 0 ? 3 : waiting_sources_;
+  return active_count_ < parallel_ &&
+      (((waiting & 1) != 0 && !root_.empty() && SemanticMediaScheduler::instance().can_submit()) ||
+       ((waiting & 2) != 0 && !remote_root_.empty() &&
+        SemanticRemoteMediaScheduler::instance().can_submit()));
 }
 
 bool SemanticMediaRuntime::admission_ready() const
@@ -1373,14 +1838,19 @@ int SemanticMediaRuntime::demand(const ObString &encoded_file, std::shared_ptr<S
   ObString path;
   ObString relative;
   ObString declared_mime;
+  bool remote = false;
   if (OB_FAIL(ret)) {
   } else if (encoded_file.empty() || encoded_file.length() < 0) {
     ret = OB_INVALID_ARGUMENT;
   } else if (encoded_file.length() > MAX_DESCRIPTOR_BYTES) {
     ret = OB_SIZE_OVERFLOW;
   } else if (OB_FAIL(FileRefCodec::decode(encoded_file, ref))) {
-  } else if (OB_FAIL(local_path(ref.uri_, path_buffer, path))) {
-  } else if (OB_FAIL(relative_path(root_, path, relative))) {
+  } else if (FALSE_IT(remote = FileRefCodec::is_remote_uri(ref.uri_))) {
+  } else if (remote && OB_FAIL(remote_allowed(ref.uri_))) {
+  } else if (!remote && root_.empty()) {
+    ret = OB_OP_NOT_ALLOW;
+  } else if (!remote && OB_FAIL(local_path(ref.uri_, path_buffer, path))) {
+  } else if (!remote && OB_FAIL(relative_path(root_, path, relative))) {
   } else if (OB_FAIL(validate_version(ref.object_version_))) {
   } else if (ref.size_bytes_ < -1) {
     ret = OB_INVALID_ARGUMENT;
@@ -1388,6 +1858,7 @@ int SemanticMediaRuntime::demand(const ObString &encoded_file, std::shared_ptr<S
     ret = OB_SIZE_OVERFLOW;
   } else if (OB_FAIL(normalize_mime(ref.mime_type_, declared_mime))) {
   } else if (OB_FAIL(SemanticMediaScheduler::instance().ensure_started())) {
+  } else if (remote && OB_FAIL(SemanticRemoteMediaScheduler::instance().ensure_started())) {
   }
   if (OB_SUCC(ret)) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1411,8 +1882,11 @@ int SemanticMediaRuntime::demand(const ObString &encoded_file, std::shared_ptr<S
         }
         out = std::move(task);
       }
-    } else if (active_count_ >= parallel_ || !SemanticMediaScheduler::instance().can_submit()) {
+    } else if (active_count_ >= parallel_ ||
+        !(remote ? SemanticRemoteMediaScheduler::instance().can_submit()
+                 : SemanticMediaScheduler::instance().can_submit())) {
       ret = OB_EAGAIN;
+      waiting_sources_ |= remote ? 2 : 1;
     } else {
       const int64_t task_charge = sizeof(SemanticMediaTask) + encoded_file.length() + 1
           + ALLOCATION_OVERHEAD * 2;
@@ -1439,6 +1913,7 @@ int SemanticMediaRuntime::demand(const ObString &encoded_file, std::shared_ptr<S
             task->declared_mime_type_ = declared_mime;
             task->object_version_ = owned.object_version_;
             task->declared_size_ = owned.size_bytes_;
+            task->remote_ = remote;
             LiveEntry live;
             live.key_buffer_.reset(new char[key_size]);
             std::memcpy(live.key_buffer_.get(), ref.uri_.ptr(), ref.uri_.length());
@@ -1471,10 +1946,15 @@ int SemanticMediaRuntime::demand(const ObString &encoded_file, std::shared_ptr<S
               // Full caches with live handles must not deadlock a batch larger than the cache.
               // The budgeted weak index still coalesces those externally owned results.
               ++active_count_;
-              ret = SemanticMediaScheduler::instance().submit(*this, task);
+              ret = remote ? SemanticRemoteMediaScheduler::instance().submit(*this, task)
+                           : SemanticMediaScheduler::instance().submit(*this, task);
               if (OB_FAIL(ret)) {
                 --active_count_;
+                if (ret == OB_EAGAIN) {
+                  waiting_sources_ |= remote ? 2 : 1;
+                }
               } else {
+                waiting_sources_ &= ~(remote ? 2 : 1);
                 out = task;
               }
             }
@@ -1495,13 +1975,70 @@ int SemanticMediaRuntime::demand(const ObString &encoded_file, std::shared_ptr<S
     }
   }
   if (OB_FAIL(ret) && ret != OB_EAGAIN) {
-    LOG_WARN("demand semantic media failed", K(ret), K(encoded_file));
+    LOG_WARN("demand semantic media failed", K(ret), K(encoded_file.length()), K(remote));
   }
   return ret;
 }
 
+int SemanticMediaRuntime::remote_allowed(const ObString &uri) const
+{
+  return remote_root_.empty() || !uri.prefix_match(remote_root_) ? OB_OP_NOT_ALLOW : OB_SUCCESS;
+}
+
+int SemanticMediaRuntime::append_remote_data(SemanticMediaTask &task, const char *data, int64_t size)
+{
+  int ret = status();
+  if (OB_FAIL(ret)) {
+  } else if (size < 0 || task.source_size_ > std::min(max_bytes_, MAX_SOURCE_BYTES) - size) {
+    ret = OB_SIZE_OVERFLOW;
+  } else if (task.declared_size_ >= 0 && task.source_size_ > task.declared_size_ - size) {
+    ret = OB_INVALID_DATA;
+  } else if (task.source_size_ + size > task.source_capacity_) {
+    const int64_t limit = std::min(max_bytes_, MAX_SOURCE_BYTES);
+    const int64_t capacity = std::min(limit, std::max(task.source_size_ + size,
+        task.source_capacity_ == 0 ? READ_CHUNK_BYTES : task.source_capacity_ * 2));
+    const int64_t charge = capacity + ALLOCATION_OVERHEAD;
+    if (OB_FAIL(reserve_with_eviction(charge))) {
+    } else {
+      Reservation reservation(budget_, charge);
+      std::unique_ptr<uint8_t[]> buffer(new (std::nothrow) uint8_t[capacity]);
+      if (!buffer) {
+        ret = OB_SIZE_OVERFLOW;
+      } else {
+        if (task.source_size_ > 0) {
+          std::memcpy(buffer.get(), task.source_buffer_.get(), task.source_size_);
+        }
+        task.source_buffer_ = std::move(buffer);
+        task.charged_bytes_ += charge - task.source_charge_;
+        budget_->release(task.source_charge_);
+        task.source_charge_ = charge;
+        task.source_capacity_ = capacity;
+        reservation.detach();
+      }
+    }
+  }
+  if (OB_SUCC(ret) && size > 0) {
+    std::memcpy(task.source_buffer_.get() + task.source_size_, data, size);
+    task.source_size_ += size;
+  }
+  return ret;
+}
+
+void SemanticMediaRuntime::release_source(SemanticMediaTask &task)
+{
+  task.source_buffer_.reset();
+  budget_->release(task.source_charge_);
+  task.charged_bytes_ -= task.source_charge_;
+  task.source_size_ = 0;
+  task.source_capacity_ = 0;
+  task.source_charge_ = 0;
+}
+
 int SemanticMediaRuntime::load(SemanticMediaTask &task)
 {
+  if (task.remote_) {
+    return encode(task, task.source_buffer_.get(), task.source_size_);
+  }
   int ret = status();
   char path_buffer[MAX_URI_BYTES + 1];
   ObString path;
@@ -1529,8 +2066,7 @@ int SemanticMediaRuntime::load(SemanticMediaTask &task)
   }
   if (OB_SUCC(ret)) {
     const int64_t size = before.st_size;
-    const int64_t raw_charge = size + ALLOCATION_OVERHEAD
-        + (task.object_version_.empty() ? 0 : HASH_WORK_BYTES);
+    const int64_t raw_charge = size + ALLOCATION_OVERHEAD;
     if (OB_FAIL(reserve_with_eviction(raw_charge))) {
     } else {
       Reservation raw_reservation(budget_, raw_charge);
@@ -1554,60 +2090,74 @@ int SemanticMediaRuntime::load(SemanticMediaTask &task)
           }
         }
       }
-      MediaKind kind = MediaKind::UNKNOWN;
-      ObString mime;
-      ObString audio;
       if (OB_FAIL(ret)) {
       } else if (OB_FAIL(status())) {
       } else if (OB_FAIL(unchanged_file(file.get(), before))) {
-      } else if (OB_FAIL(validate_media(raw.get(), size, *this, kind, mime, audio))) {
-      } else if (!task.declared_mime_type_.empty() && !same_string(task.declared_mime_type_, mime)) {
-        ret = OB_INVALID_DATA;
-      } else if (OB_FAIL(status())) {
-      } else if (OB_FAIL(verify_version(task.object_version_, raw.get(), size))) {
-      } else if (OB_FAIL(status())) {
+      } else if (OB_FAIL(encode(task, raw.get(), size))) {
+      } else if (OB_FAIL(unchanged_file(file.get(), before))) {
       }
-      if (OB_SUCC(ret)) {
-        invoke_test_hook(TestStage::BEFORE_ENCODE);
-        ret = status();
-      }
-      if (OB_SUCC(ret)) {
-        const int64_t encoded_size = ObBase64Encoder::needed_encoded_length(size);
-        const int64_t encoded_charge = encoded_size + 1 + ALLOCATION_OVERHEAD;
-        if (OB_FAIL(reserve_with_eviction(encoded_charge))) {
+    }
+  }
+  return ret;
+}
+
+int SemanticMediaRuntime::encode(SemanticMediaTask &task, const uint8_t *raw, int64_t size)
+{
+  int ret = status();
+  MediaKind kind = MediaKind::UNKNOWN;
+  ObString mime;
+  ObString audio;
+  const int64_t hash_charge = task.object_version_.empty() ? 0 : HASH_WORK_BYTES;
+  if (OB_SUCC(ret) && hash_charge > 0) {
+    ret = reserve_with_eviction(hash_charge);
+  }
+  Reservation hash_reservation(budget_, OB_SUCC(ret) ? hash_charge : 0);
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(validate_media(raw, size, *this, kind, mime, audio))) {
+  } else if (!task.declared_mime_type_.empty() && !same_string(task.declared_mime_type_, mime)) {
+    ret = OB_INVALID_DATA;
+  } else if (OB_FAIL(status())) {
+  } else if (OB_FAIL(verify_version(task.object_version_, raw, size))) {
+  } else if (OB_FAIL(status())) {
+  }
+  if (OB_SUCC(ret)) {
+    invoke_test_hook(TestStage::BEFORE_ENCODE);
+    ret = status();
+  }
+  if (OB_SUCC(ret)) {
+    const int64_t encoded_size = ObBase64Encoder::needed_encoded_length(size);
+    const int64_t encoded_charge = encoded_size + 1 + ALLOCATION_OVERHEAD;
+    if (OB_FAIL(reserve_with_eviction(encoded_charge))) {
+    } else {
+      Reservation encoded_reservation(budget_, encoded_charge);
+      std::unique_ptr<char[]> encoded(new char[encoded_size + 1]);
+      int64_t output_pos = 0;
+      for (int64_t input_pos = 0; OB_SUCC(ret) && input_pos < size;) {
+        if (OB_FAIL(status())) {
         } else {
-          Reservation encoded_reservation(budget_, encoded_charge);
-          std::unique_ptr<char[]> encoded(new char[encoded_size + 1]);
-          int64_t output_pos = 0;
-          for (int64_t input_pos = 0; OB_SUCC(ret) && input_pos < size;) {
-            if (OB_FAIL(status())) {
-            } else {
-              const int64_t count = std::min(ENCODE_CHUNK_BYTES, size - input_pos);
-              if (OB_FAIL(ObBase64Encoder::encode(raw.get() + input_pos, count,
-                                                 encoded.get(), encoded_size, output_pos))) {
-              } else {
-                input_pos += count;
-                invoke_test_hook(TestStage::AFTER_ENCODE_CHUNK);
-                ret = status();
-              }
-            }
-          }
-          if (OB_FAIL(ret)) {
-          } else if (output_pos != encoded_size) {
-            ret = OB_ERR_UNEXPECTED;
-          } else if (OB_FAIL(unchanged_file(file.get(), before))) {
-          } else if (OB_FAIL(status())) {
+          const int64_t count = std::min(ENCODE_CHUNK_BYTES, size - input_pos);
+          if (OB_FAIL(ObBase64Encoder::encode(raw + input_pos, count,
+                                             encoded.get(), encoded_size, output_pos))) {
           } else {
-            encoded[encoded_size] = '\0';
-            task.base64_buffer_ = std::move(encoded);
-            task.charged_bytes_ += encoded_charge;
-            encoded_reservation.detach();
-            task.base64_.assign_ptr(task.base64_buffer_.get(), static_cast<int32_t>(encoded_size));
-            task.mime_type_ = mime;
-            task.audio_format_ = audio;
-            task.is_audio_ = kind == MediaKind::WAV || kind == MediaKind::MP3;
+            input_pos += count;
+            invoke_test_hook(TestStage::AFTER_ENCODE_CHUNK);
+            ret = status();
           }
         }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (output_pos != encoded_size) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(status())) {
+      } else {
+        encoded[encoded_size] = '\0';
+        task.base64_buffer_ = std::move(encoded);
+        task.charged_bytes_ += encoded_charge;
+        encoded_reservation.detach();
+        task.base64_.assign_ptr(task.base64_buffer_.get(), static_cast<int32_t>(encoded_size));
+        task.mime_type_ = mime;
+        task.audio_format_ = audio;
+        task.is_audio_ = kind == MediaKind::WAV || kind == MediaKind::MP3;
       }
     }
   }
@@ -1616,15 +2166,23 @@ int SemanticMediaRuntime::load(SemanticMediaTask &task)
 
 void SemanticMediaRuntime::run_task(std::shared_ptr<SemanticMediaTask> task)
 {
-  started_count_.fetch_add(1);
+  if (!task->remote_) {
+    started_count_.fetch_add(1);
+  }
   int ret = OB_SUCCESS;
   try {
     ret = load(*task);
   } catch (const std::bad_alloc &) {
     ret = OB_SIZE_OVERFLOW;
   }
+  complete_task(std::move(task), ret);
+}
+
+void SemanticMediaRuntime::complete_task(std::shared_ptr<SemanticMediaTask> task, int ret)
+{
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    release_source(*task);
     if (OB_SUCC(ret)) {
       ret = status();
     }
@@ -1640,7 +2198,7 @@ void SemanticMediaRuntime::run_task(std::shared_ptr<SemanticMediaTask> task)
       budget_->release(bytes);
     }
     if (OB_FAIL(ret)) {
-      LOG_WARN("asynchronous semantic media load failed", K(ret), "uri", task->uri_);
+      LOG_WARN("asynchronous semantic media load failed", K(ret), "remote", task->remote_);
     }
     task->result_.store(ret, std::memory_order_release);
     task.reset();

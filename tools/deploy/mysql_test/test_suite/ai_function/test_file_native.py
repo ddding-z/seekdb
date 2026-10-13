@@ -1,4 +1,4 @@
-"""Run native FILE codec, storage/wire and asynchronous media contracts."""
+"""Run native FILE codec, storage/wire and local/remote asynchronous media contracts."""
 
 import argparse
 from pathlib import Path
@@ -12,6 +12,7 @@ SOURCES = {
     "codec": ROOT / "unittest/oblib/test_file_ref.cpp",
     "storage": ROOT / "unittest/oblib/test_file_storage.cpp",
     "media": ROOT / "unittest/sql/engine/test_semantic_media.cpp",
+    "remote_media": ROOT / "unittest/sql/engine/test_remote_semantic_media.cpp",
 }
 
 

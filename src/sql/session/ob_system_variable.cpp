@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SHARE
 #include "data_plane/transaction/ob_transaction_isolation.h"
 #include "ob_system_variable.h"
+#include "common/object/file_ref.h"
 #include "data_plane/transaction/ob_i_transaction_service.h"
 #include "share/system_variable/ob_sys_var_meta.h"
 #include "sql/engine/ob_exec_context.h"
@@ -1512,6 +1513,34 @@ int ObSysVarOnCheckFuncs::check_and_convert_net_buffer_length(ObExecContext &ctx
     } else if (net_buffer_len > g_max_allowed_packet) {
       LOG_USER_WARN(OB_WARN_OPTION_BELOW_LIMIT, "max_allowed_packet", "net_buffer_length");
     }
+  }
+  return ret;
+}
+
+int ObSysVarOnCheckFuncs::check_and_convert_ai_media_remote_root(ObExecContext &ctx,
+                                                               const ObSetVar &set_var,
+                                                               const ObBasicSysVar &sys_var,
+                                                               const ObObj &in_val,
+                                                               ObObj &out_val)
+{
+  UNUSED(ctx);
+  int ret = OB_SUCCESS;
+  ObString root;
+  if (set_var.is_set_default_) {
+    out_val.set_varchar(ObString::make_string(""));
+    out_val.set_collation_type(ObCharset::get_system_collation());
+    out_val.set_collation_level(CS_LEVEL_IMPLICIT);
+  } else if (in_val.is_null() || OB_FAIL(in_val.get_varchar(root)) ||
+             OB_FAIL(FileRefCodec::validate_remote_root(root))) {
+    ret = OB_ERR_WRONG_VALUE_FOR_VAR;
+    const ObString constraint = ObString::make_string(
+        "expected an empty value or a query-free HTTPS URL prefix ending in /; "
+        "HTTP is allowed only for numeric loopback fixtures");
+    LOG_USER_ERROR(OB_ERR_WRONG_VALUE_FOR_VAR, sys_var.get_name().length(),
+                   sys_var.get_name().ptr(), constraint.length(), constraint.ptr());
+    LOG_WARN("invalid remote media policy", K(ret), "length", root.length());
+  } else {
+    out_val = in_val;
   }
   return ret;
 }

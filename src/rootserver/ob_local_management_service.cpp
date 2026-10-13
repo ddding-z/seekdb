@@ -2034,9 +2034,11 @@ int ObLocalManagementService::upgrade_ai_media_system_variables_(const bool chec
   int64_t schema_version = OB_INVALID_VERSION;
   ObSysVariableSchema missing_variables;
   const ObSysVarClassType variable_ids[] = {
-      SYS_VAR_AI_MEDIA_ROOT, SYS_VAR_AI_MEDIA_MAX_BYTES, SYS_VAR_AI_MEDIA_PARALLEL};
+      SYS_VAR_AI_MEDIA_ROOT, SYS_VAR_AI_MEDIA_MAX_BYTES, SYS_VAR_AI_MEDIA_PARALLEL,
+      SYS_VAR_AI_MEDIA_REMOTE_ROOT};
   const char *variable_names[] = {
-      OB_SV_AI_MEDIA_ROOT, OB_SV_AI_MEDIA_MAX_BYTES, OB_SV_AI_MEDIA_PARALLEL};
+      OB_SV_AI_MEDIA_ROOT, OB_SV_AI_MEDIA_MAX_BYTES, OB_SV_AI_MEDIA_PARALLEL,
+      OB_SV_AI_MEDIA_REMOTE_ROOT};
   bool present[ARRAYSIZEOF(variable_ids)] = {};
 
   if (!check_only && (share::server_role() != ObServerRole::PRIMARY_ROLE
@@ -2049,8 +2051,9 @@ int ObLocalManagementService::upgrade_ai_media_system_variables_(const bool chec
       ObSqlString sql;
       sqlclient::ObMySQLResult *rows = nullptr;
       if (OB_FAIL(sql.assign_fmt(
-          "SELECT name FROM %s WHERE name IN ('%s','%s','%s')",
-          OB_ALL_SYS_VARIABLE_TNAME, variable_names[0], variable_names[1], variable_names[2]))) {
+          "SELECT name FROM %s WHERE name IN ('%s','%s','%s','%s')",
+          OB_ALL_SYS_VARIABLE_TNAME, variable_names[0], variable_names[1], variable_names[2],
+          variable_names[3]))) {
       } else if (OB_FAIL(sql_proxy_.read(result, sql.ptr()))) {
         FLOG_WARN("failed to read persisted AI media system variables", KR(ret));
       } else if (OB_ISNULL(rows = result.get_result())) {

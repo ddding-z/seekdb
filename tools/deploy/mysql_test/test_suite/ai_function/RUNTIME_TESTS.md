@@ -4,6 +4,115 @@ Legacy baseline validation (2026-09-29): the Debug build, all **105 SQL contract
 
 For the current architecture, code map, maintenance invariants and handoff checklist, see the [Chinese maintenance handoff](../../../../../docs/developer-guide/zh/ai-function-runtime-handoff.md).
 
+## Opt-in Semantic Late Evaluation (2026-10-13)
+
+```sql
+SELECT /*+ OPT_PARAM('enable_semantic_lift', 'true') */ a.id, b.category
+FROM semantic_inputs a
+JOIN selected_ids b ON a.id = b.id
+WHERE b.enabled = 1 AND AI_FILTER('classifier', a.prompt);
+```
+
+The option defaults to **false**. Its quoted `true`/`false` values are
+case-insensitive; other values fail with `OB_INVALID_ARGUMENT`, rather than
+silently enabling or ignoring this new behavior. This is a placement rule after
+ordinary join planning, not a model-latency-aware join CBO.
+
+After complete lowering and projection/shared-value registration, a post-order
+placement pass operates on the plan already selected by ordinary CBO. Other
+candidate plans are discarded before mutation because their operator subtrees
+can be shared. The pass can move a directly adjacent MAP/FILTER stage
+above an ordinary INNER HASH/MERGE JOIN, from either operand, and repeat over
+consecutive eligible joins. The **opposite** input must be provably unique on
+the complete ordinary `=` column keys using existing FD/equality/constant
+metadata. Computed/differently typed keys and null-safe equality are rejected.
+No foreign-key existence assumption is required: eliminating unmatched rows
+is exactly the useful work this rule puts before inference.
+
+The first version rejects nested loops, parameterized/correlated or late
+materialization joins, shared/carried model values, semantic input/sibling
+subtrees, model-dependent join consumers, and unsafe ordinary expressions.
+CASE/AND/OR guards inside an individual semantic recipe stay intact and are
+not lifted. Only conservative column/constant/boolean/comparison recipes,
+known-lossless implicit casts, native ordered inputs and direct `TO_FILE`
+recipes are admitted; explicit casts, JSON extraction, UDFs and volatile
+recipes are not. Existing ordinary scan predicates remain in place.
+LIMIT/Top-N, GROUP, DISTINCT, outer/semi/anti joins, subquery and AI_JOIN
+candidate boundaries are not crossed. Existing projection-after-LIMIT demand
+and AI_AGG/AI_JOIN rewrite safeguards are unchanged.
+
+Lifting happens before producer allocation and code generation, never during
+partial lowering before HAVING/projection reuse or AI_JOIN bindings are known.
+The JOIN
+retains its path-derived FD/order/distribution properties and its updated
+child costs. The relocated stage recomputes properties over the JOIN, so its
+input columns, materialization cost and shared query-task count are wired to
+the new topology. Changed ancestors refresh their properties/costs without
+using unary FD inheritance for joins. AI_JOIN's immediate candidate JOIN
+is explicitly protected during this traversal. EXPLAIN reports
+`semantic_placement=LIFTED, crossed_inner_joins=N`; rejected attempts report
+`KEPT` and `lift_stop_reason`. Internal `OPT_TRACE` instrumentation also records
+the applied/blocked rule when that tracer is active; this is not the separate
+`information_schema.OPTIMIZER_TRACE` JSON interface. EXPLAIN is the public
+placement verification entrypoint.
+Estimated rows/time are still ordinary CBO estimates, not measured model calls
+or inference latency.
+
+Opting in deliberately suppresses **model/media demand for unmatched rows**.
+Those rows make no provider request or object GET; their model/media-specific
+validation failures are therefore not raised. Surviving rows retain strict
+validation and error propagation. This is not an error-to-false fallback,
+model-result caching, fetch streaming or removal of asynchronous batch barriers.
+
+The measured private baselines require changed operator ancestry and placement
+markers as well as exact deterministic SQL tuples and request payload counts:
+
+| Shape | Disabled | Enabled |
+|---|---:|---:|
+| Unique HASH JOIN, either operand | 100 calls | 10 calls |
+| Larger unique HASH JOIN | 1000 calls | 100 calls |
+| Unique MERGE JOIN | 12 calls | 2 calls |
+| Two consecutive eligible joins | 24 calls | 4 calls, two crossings |
+| Local/remote FILE filter | 12 model calls | 3 model calls |
+| Remote FILE object GETs | 12 GETs | 3 GETs |
+
+Disabled: `HASH JOIN -> SEMANTIC FILTER -> SCAN`.
+Enabled: `SEMANTIC FILTER -> HASH JOIN -> SCAN`.
+Filtered-out objects have zero GETs; malformed surviving bytes still fail
+before model submission. Generated fixtures do not establish real-model quality,
+GPU overlap or an end-to-end SemBench speedup.
+
+The focused [semantic placement runner](test_semantic_lift.py) provides strict
+positive/negative plan and counter oracles, generated loopback media, private
+database lifecycle and fixture self-tests:
+
+```bash
+(
+  binary="$PWD/build_debug/bin/src/observer/seekdb"
+  cd tools/deploy/mysql_test/test_suite/ai_function
+  python -m test_semantic_lift --self-test
+  python -m test_semantic_lift --list-cases
+  python -m test_semantic_lift --binary "$binary"
+)
+```
+
+The final Debug build passed **29/29 focused SQL contracts** and **18/18 fixture
+self-tests**. Coverage includes false/default demand, both HASH operands,
+MERGE/repeated joins, complete/incomplete composite uniqueness, multiplicity and
+null-safe hazards, blocked NLJ/CAST/JSON/volatile/dependent/shared recipes,
+AI_JOIN roles/candidate boundaries, guarded and three-valued demand, local/remote
+FILE pruning/validation, and surviving GROUP/DISTINCT output. Shared FILTER/HAVING
+without ORDER/LIMIT stays below the JOIN; grouping/distinct positives still
+require 100-to-10 requests and matching grouped/duplicate-eliminated results.
+
+Targeted existing default-off regressions also passed: composition **10**,
+MAP/FILTER **9**, AI_AGG **5**, AI_JOIN **4**, local FILE **6**, actual PX **4**,
+and remote zero-demand/cancellation **2**, for **40** cases. This is not a rerun
+of every historical/native/legacy suite. All fixtures own private databases
+and generated/loopback inputs; normal shutdown and resource cleanup completed.
+No commit, cloud account, real inference service or GPU performance validation
+is implied by these results.
+
 ## Native Semantic Aggregation (2026-10-12)
 
 `AI_AGG(model, input, instruction[, options])` is a native aggregate expression,
@@ -271,14 +380,15 @@ result must be checked before publishing MIME/base64 blocks.
 Cancellation, deadline, rescan and normal server shutdown must drain owned work
 and balance shared byte accounting.
 
-Only absolute local paths / `file:///` under the configured root are supported.
-Arbitrary HTTP URLs, path escapes, symlinks and nonregular files are not allowed.
+Absolute local paths / `file:///` require the configured local root. Pre-signed
+HTTPS GET URLs require the separate GLOBAL-only `ai_media_remote_root` described
+below. Arbitrary HTTP URLs, path escapes, symlinks and nonregular files are not allowed.
 Missing, corrupt, oversized, changed or metadata-inconsistent sources error.
 JPEG/PNG/WAV/MP3 checks are bounded structural/container validation, not full
 pixel or audio decoding; a provider can still reject structurally valid media.
 External files do not gain database MVCC; deleting a SQL reference does not
-delete media. No remote stage, signed URL, upload, implicit ASR or generic media
-decoder is implied. FILE data requires a server supporting the native type;
+delete media. No native storage credential/signing API, remote stage, upload,
+implicit ASR or generic media decoder is implied. FILE data requires a server supporting the native type;
 these checks are not mixed-version/downgrade compatibility evidence.
 
 The [FILE runtime contracts](test_file_runtime.py) cover typed SQL/storage,
@@ -296,6 +406,110 @@ python tools/deploy/mysql_test/test_suite/ai_function/test_file_native.py \
 python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_input.py \
   --build-dir build_debug --link-manifest /path/to/cached_debug_link_action.json
 ```
+
+### Pre-signed object-storage FILE reads (2026-10-12)
+
+```sql
+SET GLOBAL ai_media_remote_root = 'https://media.example/bucket/images/';
+-- Insert short-lived signed URLs through TO_FILE using application bind parameters.
+SELECT id, AI_MAP('vision_model', ('Describe this image.', image))
+FROM image_data;
+```
+
+Both local and remote policies default to deny, are administrator-controlled,
+and are read from GLOBAL configuration rather than writable session overrides.
+The remote policy is one complete, canonical origin/path prefix ending in `/`,
+without a query. Invalid policies are rejected at `SET GLOBAL`; empty/DEFAULT
+disables remote reads. Disabled/nonmatching source policies retain the existing
+`OB_OP_NOT_ALLOW` contract. Only matching URLs are admitted; prefix boundaries cannot be
+expanded by userinfo, fragments, dot segments, escaped slash/backslash or
+unescaped control/space/non-ASCII bytes. HTTPS scheme and DNS host must be
+lowercase. Numeric-loopback HTTP (`127.0.0.1` or `[::1]`) is available for private
+fixtures only; ordinary remote HTTP and `localhost` are rejected. Empty local
+root can coexist with enabled remote reads and must still deny local FILE.
+
+FILE constructors perform no I/O and retain remote escaped paths and queries
+byte for byte, including signature parameter order and percent-escape case.
+The URI cap remains 4096 bytes and the FILE binary layout/version is unchanged.
+FILE expressions support dynamic result buffers: metadata/URLs beyond the
+128-byte reserved result buffer must not fail with a misleading memory error.
+The loader issues GET, never HEAD; verifies TLS certificates/hostname using
+system trust; disables redirects, environment proxies, cookies and transparent
+content decoding. Error statuses/transport failures are explicit errors, with
+no new download retry or text/false fallback. `object_version` remains a
+`sha256:<hex>` content check, not an ETag or storage SDK version token; a provider
+versionId belongs in the signed URL. Cached/live coalescing requires the same
+full URL/version and consistent declared MIME/size. Expired URLs are not refreshed.
+
+A separate single-thread curl multi executor, requiring asynchronous DNS,
+holds at most 64 active fetches and 128 queued jobs. It does not occupy the four
+local read/validation/encoding workers while waiting on network input.
+Downloaded bytes pass through the existing bounded preparation queue,
+container validation, hash and Base64 path. Query `ai_media_parallel` covers
+queued/fetching/preparing tasks; media remains separate from inference credits.
+Known/unknown/chunked lengths obey the same actual byte cap and declared-size
+checks. Request logical overhead, source capacity, temporary buffer growth and
+encoded output consume the query budget; source buffers are released before
+publishing completed results. Curl internals/RSS are not fully accounted.
+Cancellation/deadline remove active transfers without requiring a server reply;
+query teardown and normal shutdown drain fetch/preparation work.
+Shared readiness checks query/session termination even before any model HTTP
+request exists. It wakes the owning SQL worker; background threads never evaluate
+SQL frames or use thread-dependent execution-context status checks.
+
+Media loader error logs omit the full signed URL/descriptor. FILE accessors,
+application logs and SQL/audit records can still expose signed credentials;
+protect FILE columns and avoid valid URL literals in stored code or diagnostics.
+This backend does not yet provide fetch-to-provider streaming, cross-query
+caching, a general object-store SDK, or GPU-aware scheduling.
+
+The focused remote suites use generated media and private loopback
+storage/provider fixtures only. They are not a live S3/OSS/MinIO account test,
+a real-model quality test, or an end-to-end performance benchmark.
+
+The final Debug build passed the **12 native remote contracts in three isolated
+rounds**, **10/10 remote SQL contracts** and **9/9 fixture self-tests**. They cover
+all four media formats; exact GET targets and signatures; metadata/hash and
+4096-byte URLs; default/prefix/privilege denials; no HEAD/proxy/redirect/retry;
+untrusted TLS; fixed/chunked/close-delimited lengths and byte caps; held
+download/local-worker overlap; shared fetch/encoding admission; cancellation,
+deadlines, source-buffer accounting and scheduler shutdown. SQL composition
+includes vision MAP -> text AI_AGG -> post-MAP with causal request auditing.
+
+[test_remote_file_shutdown.py](test_remote_file_shutdown.py) additionally passed
+one private normal-shutdown contract: the SQL client and four storage GET gates
+remain open through SIGUSR1, exit must be zero within ten seconds without forced
+termination, every storage socket must close, and no model request may be sent.
+
+Run from the repository root, using the configured Python environment:
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_remote_file_runtime.py --self-test
+python tools/deploy/mysql_test/test_suite/ai_function/test_remote_file_runtime.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+python tools/deploy/mysql_test/test_suite/ai_function/test_file_native.py \
+  --suite remote_media --build-dir build_debug --repeat 3 --timeout 180
+(
+  binary="$PWD/build_debug/bin/src/observer/seekdb"
+  cd tools/deploy/mysql_test/test_suite/ai_function
+  python -m test_remote_file_shutdown --binary "$binary"
+)
+```
+
+The native helper links cached build objects rather than rebuilding seekdb.
+Explicitly rebuild the production binary after core edits and before native runs.
+Remote SQL failures print a bounded set of engine diagnostics before private
+database cleanup.
+
+The final build also passed the existing native codec/storage/local media
+10/6/29 contracts in three rounds, the standard Bazel FILE codec target, 27 local
+fixture checks, 12 selected local FILE SQL contracts including actual PX, and
+targeted text MAP/FILTER (6), JOIN (2), AGG (3), and sorted/unordered actual PX (4)
+readiness/cancellation regressions. Compile metadata was refreshed to 2977 source
+commands. These are targeted results, not a rerun of every historical SQL suite.
+Storage download/preparation is still whole-object, SQL slot/Dispatch barriers
+remain, and AI_AGG is still text-only and makes its statement serial. This work
+does not provide maximum heterogeneous overlap or a query-wide resource DAG.
 
 ### FILE persistence, upgrades and verification (2026-10-09)
 
@@ -339,8 +553,8 @@ python tools/deploy/mysql_test/test_suite/ai_function/test_file_runtime.py \
   --case test_old_catalog_upgrade_preserves_model_masks_and_is_idempotent
 ```
 
-Schema fetch supplies logged, safe defaults only for the three newly introduced
-media variables when their catalog entries are absent; it does not silently
+Schema fetch supplies logged, safe defaults only for the four media variables,
+including the remote root, when their catalog entries are absent; it does not silently
 default arbitrary missing variables or replace existing policies. Once system
 schemas are published, writable-primary startup persists the missing variables
 and their history in one transaction, refreshes, then initializes DDL/max-ID
@@ -353,16 +567,39 @@ primary write admission additionally requires durable media/model metadata.
 End-to-end activation of a fully replayed standby is not included in this
 local-only upgrade gate.
 
-The separate [read-only catalog runner](test_file_catalog_roles.py) passed two
+The separate [read-only catalog runner](test_file_catalog_roles.py) historically passed two
 private contracts: legacy standby startup loads safe defaults without durable
 catalog writes, and current standby restart preserves nondefault media policy,
 model masks/history and native FILE values. Both reject ordinary writes.
-It requires explicit new/old binaries and never connects to an existing service:
+Its pre-FILE contract requires explicit new/old binaries; current-policy and
+missing-remote-policy selectors require only the current binary. It never
+connects to an existing service:
 
 ```bash
 python tools/deploy/mysql_test/test_suite/ai_function/test_file_catalog_roles.py \
   --binary "$PWD/build_debug/bin/src/observer/seekdb" \
   --upgrade-binary /path/to/pre_FILE_seekdb
+```
+
+The remote-read build passed three current-binary catalog contracts: complete
+policy standby preservation, and primary/standby restarts after the fixture
+removes only the new remote variable and its history from its own private
+catalog. Primary adds the empty deny-by-default policy and one history entry;
+standby publishes only a safe in-memory default and leaves the persistent
+catalog unchanged. A second restart preserves all policies/history, model masks
+and native FILE values. This missing-variable fixture is not a new actual
+pre-FILE-binary upgrade test; those historical binary-upgrade checks were not
+rerun in this stage.
+
+```bash
+(
+  binary="$PWD/build_debug/bin/src/observer/seekdb"
+  cd tools/deploy/mysql_test/test_suite/ai_function
+  python -m test_file_catalog_roles --binary "$binary" \
+    --case test_current_standby_restart_preserves_policy_masks_and_file_values \
+    --case test_missing_remote_policy_primary_restart_persists_default_and_preserves_catalog \
+    --case test_missing_remote_policy_standby_restart_keeps_safe_default_unpersisted
+)
 ```
 
 Native validation passed nine codec/object/compact-cell groups, the four

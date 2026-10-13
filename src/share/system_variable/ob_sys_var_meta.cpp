@@ -46,6 +46,7 @@ const char *ObSysVarMeta::SYS_VAR_NAMES_SORTED_BY_NAME[] = {
   "activate_all_roles_on_login",
   "ai_media_max_bytes",
   "ai_media_parallel",
+  "ai_media_remote_root",
   "ai_media_root",
   "ai_pipeline_memory_limit",
   "ai_pipeline_slots",
@@ -773,6 +774,7 @@ const ObSysVarClassType ObSysVarMeta::SYS_VAR_IDS_SORTED_BY_NAME[] = {
   SYS_VAR_ACTIVATE_ALL_ROLES_ON_LOGIN,
   SYS_VAR_AI_MEDIA_MAX_BYTES,
   SYS_VAR_AI_MEDIA_PARALLEL,
+  SYS_VAR_AI_MEDIA_REMOTE_ROOT,
   SYS_VAR_AI_MEDIA_ROOT,
   SYS_VAR_AI_PIPELINE_MEMORY_LIMIT,
   SYS_VAR_AI_PIPELINE_SLOTS,
@@ -2204,7 +2206,8 @@ const char *ObSysVarMeta::SYS_VAR_NAMES_SORTED_BY_ID[] = {
   "ai_pipeline_memory_limit",
   "ai_media_root",
   "ai_media_max_bytes",
-  "ai_media_parallel"
+  "ai_media_parallel",
+  "ai_media_remote_root"
 };
 
 bool ObSysVarMeta::sys_var_name_case_cmp(const char *name1, const ObString &name2)

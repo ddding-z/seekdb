@@ -744,6 +744,7 @@ namespace share
   static const char* const OB_SV_AI_MEDIA_ROOT = "ai_media_root";
   static const char* const OB_SV_AI_MEDIA_MAX_BYTES = "ai_media_max_bytes";
   static const char* const OB_SV_AI_MEDIA_PARALLEL = "ai_media_parallel";
+  static const char* const OB_SV_AI_MEDIA_REMOTE_ROOT = "ai_media_remote_root";
 
 }
 }

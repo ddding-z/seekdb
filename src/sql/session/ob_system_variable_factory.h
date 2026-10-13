@@ -5243,6 +5243,13 @@ public:
   inline virtual share::ObSysVarClassType get_type() const { return share::SYS_VAR_AI_MEDIA_PARALLEL; }
   inline virtual const common::ObObj &get_global_default_value() const { return share::ObSysVariables::get_default_value(723); }
 };
+class ObSysVarAiMediaRemoteRoot : public ObVarcharSysVar
+{
+public:
+  ObSysVarAiMediaRemoteRoot() : ObVarcharSysVar(ObSysVarOnCheckFuncs::check_and_convert_ai_media_remote_root, NULL, NULL, NULL, NULL) {}
+  inline virtual share::ObSysVarClassType get_type() const { return share::SYS_VAR_AI_MEDIA_REMOTE_ROOT; }
+  inline virtual const common::ObObj &get_global_default_value() const { return share::ObSysVariables::get_default_value(724); }
+};
 
 
 class ObSysVarFactory

@@ -1364,6 +1364,7 @@ int ObSchemaServiceSQLImpl::get_sys_variable_schema(
       const ObSysVarSchema *sys_var = NULL;
       if (nullptr == sys_variable_schema.get_sysvar_schema(i)
           && (sys_var_id == SYS_VAR_AI_MEDIA_ROOT
+              || sys_var_id == SYS_VAR_AI_MEDIA_REMOTE_ROOT
               || sys_var_id == SYS_VAR_AI_MEDIA_MAX_BYTES
               || sys_var_id == SYS_VAR_AI_MEDIA_PARALLEL)) {
         // Publish safe defaults so an old catalog can load before primary-only persistence.

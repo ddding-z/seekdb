@@ -4,6 +4,7 @@
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
+#include "sql/session/ob_sql_session_info.h"
 #include "lib/time/ob_time_utility.h"
 #include <algorithm>
 #include <map>
@@ -230,7 +231,9 @@ int SemanticExecutionState::media_runtime(std::shared_ptr<SemanticMediaRuntime> 
   if (!media_) {
     ObArenaAllocator policy_allocator("SemanticPolicy");
     ObObj global_root;
+    ObObj global_remote_root;
     ObString root;
+    ObString remote_root;
     int64_t max_bytes = 0;
     int64_t parallel = 0;
     ObSQLSessionInfo *session = ctx_->get_my_session();
@@ -239,9 +242,13 @@ int SemanticExecutionState::media_runtime(std::shared_ptr<SemanticMediaRuntime> 
     } else if (OB_FAIL(ObBasicSessionInfo::get_global_sys_variable(
         policy_allocator, session->get_dtc_params(), share::SYS_VAR_AI_MEDIA_ROOT, global_root))) {
     } else if (OB_FAIL(global_root.get_varchar(root))) {
+    } else if (OB_FAIL(ObBasicSessionInfo::get_global_sys_variable(
+        policy_allocator, session->get_dtc_params(), share::SYS_VAR_AI_MEDIA_REMOTE_ROOT,
+        global_remote_root))) {
+    } else if (OB_FAIL(global_remote_root.get_varchar(remote_root))) {
     } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_AI_MEDIA_MAX_BYTES, max_bytes))) {
     } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_AI_MEDIA_PARALLEL, parallel))) {
-    } else if (OB_FAIL(SemanticMediaRuntime::acquire(budget_, root, max_bytes, parallel,
+    } else if (OB_FAIL(SemanticMediaRuntime::acquire(budget_, root, remote_root, max_bytes, parallel,
                                                    deadline_, media_))) {
     }
     if (OB_FAIL(ret)) {
@@ -278,8 +285,10 @@ bool SemanticExecutionState::can_resume(const void *data)
 {
   auto &state = *const_cast<SemanticExecutionState *>(
       static_cast<const SemanticExecutionState *>(data));
+  const ObSQLSessionInfo *session = state.ctx_->get_my_session();
   bool ready = state.budget().failure() != OB_SUCCESS ||
-               ObTimeUtility::current_time() >= state.deadline_;
+               ObTimeUtility::current_time() >= state.deadline_ ||
+               (nullptr != session && (session->is_query_killed() || session->is_zombie()));
   std::lock_guard<std::mutex> guard(state.mutex_);
   for (const Waiter &waiter : state.waiters_) {
     if (!ready && waiter.ready_(waiter.operation_)) {

@@ -5039,6 +5039,228 @@ bool can_project_semantic_before_sort(const ObSelectStmt &stmt)
   return supported;
 }
 
+int semantic_lift_expression_safe(ObRawExpr *expr, bool semantic_recipe,
+                                  bool semantic_input, bool &safe)
+{
+  int ret = OB_SUCCESS;
+  safe = false;
+  if (OB_ISNULL(expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null expression while checking semantic placement", K(ret));
+  } else if (expr->is_const_raw_expr()) {
+    safe = true;
+  } else if (expr->is_column_ref_expr()) {
+    safe = nullptr == static_cast<ObColumnRefRawExpr *>(expr)->get_dependant_expr();
+  } else if (expr->get_expr_type() == T_FUN_SYS_CAST &&
+             CM_IS_IMPLICIT_CAST(expr->get_cast_mode()) && expr->get_param_count() == 2) {
+    ObRawExpr *child = expr->get_param_expr(0);
+    if (OB_ISNULL(child)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("implicit cast lost its input while checking semantic placement", K(ret));
+    } else {
+      safe = ObOptimizerUtil::is_lossless_type_conv(child->get_result_type(),
+                                                    expr->get_result_type());
+      if (!safe && semantic_input && ob_is_string_type(child->get_data_type()) &&
+          child->get_data_type() == expr->get_data_type() &&
+          child->get_result_type().get_charset_type() == CHARSET_UTF8MB4 &&
+          expr->get_collation_type() == CS_TYPE_UTF8MB4_BIN &&
+          child->get_accuracy().get_length() <= expr->get_accuracy().get_length()) {
+        // Model inputs get a binary collation without changing their UTF-8 bytes.
+        safe = true;
+      }
+      if (safe) {
+        ret = SMART_CALL(semantic_lift_expression_safe(
+            child, semantic_recipe, semantic_input, safe));
+      }
+    }
+  } else if (semantic_recipe &&
+             (expr->get_expr_type() == T_FUN_SYS_AI_MAP ||
+              expr->get_expr_type() == T_FUN_SYS_AI_FILTER)) {
+    if (expr->get_param_count() < 2 || expr->get_param_count() > 3) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid semantic recipe while checking placement", K(ret));
+    } else {
+      ret = SMART_CALL(semantic_lift_expression_safe(
+          expr->get_param_expr(1), true, true, safe));
+    }
+  } else if (semantic_input && expr->get_expr_type() == T_FUN_SYS_TO_FILE) {
+    if (expr->get_param_count() < 1) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid FILE recipe while checking placement", K(ret));
+    } else if (OB_FAIL(SMART_CALL(semantic_lift_expression_safe(
+        expr->get_param_expr(0), false, false, safe)))) {
+    } else {
+      for (int64_t index = 1; safe && index < expr->get_param_count(); ++index) {
+        safe = nullptr != expr->get_param_expr(index) &&
+            expr->get_param_expr(index)->is_static_scalar_const_expr();
+      }
+    }
+  } else {
+    const ObItemType type = expr->get_expr_type();
+    bool contains_semantic = false;
+    const bool comparison = type == T_OP_EQ || type == T_OP_NE || type == T_OP_LT ||
+        type == T_OP_LE || type == T_OP_GT || type == T_OP_GE ||
+        type == T_OP_IS || type == T_OP_IS_NOT;
+    const bool boolean_wrapper = type == T_OP_BOOL || type == T_OP_NOT;
+    if (semantic_recipe && OB_FAIL(SemanticExprUtils::contains_semantic(
+        expr, contains_semantic))) {
+    }
+    safe = OB_SUCC(ret) && (comparison || boolean_wrapper ||
+        (semantic_input && (type == T_OP_ROW || type == T_FUN_SYS_AI_INPUT)) ||
+        (!semantic_recipe && (type == T_OP_AND || type == T_OP_OR)));
+    if (safe && boolean_wrapper) {
+      const ObRawExpr *child = expr->get_param_expr(0);
+      safe = expr->get_param_count() == 1 && nullptr != child &&
+          (child->get_type_class() == ObIntTC || child->get_type_class() == ObUIntTC);
+    }
+    if (safe && comparison && !contains_semantic && type != T_OP_IS &&
+        type != T_OP_IS_NOT) {
+      const ObRawExpr *left = expr->get_param_expr(0);
+      const ObRawExpr *right = expr->get_param_expr(1);
+      safe = nullptr != left && nullptr != right &&
+          left->get_type_class() == right->get_type_class() &&
+          (left->get_type_class() == ObIntTC || left->get_type_class() == ObUIntTC ||
+           (left->get_type_class() == ObStringTC &&
+            left->get_collation_type() == right->get_collation_type()));
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && safe &&
+         index < expr->get_param_count(); ++index) {
+      ret = SMART_CALL(semantic_lift_expression_safe(
+          expr->get_param_expr(index), semantic_recipe, semantic_input, safe));
+    }
+    if (OB_SUCC(ret) && !safe) {
+      OPT_TRACE("semantic_lift unsafe expression", "expression_type", get_type_name(type));
+    }
+  }
+  return ret;
+}
+
+bool semantic_lift_join_supported(ObLogJoin &join)
+{
+  return join.get_join_type() == INNER_JOIN &&
+      (join.get_join_algo() == HASH_JOIN || join.get_join_algo() == MERGE_JOIN) &&
+      join.get_nl_params().empty() &&
+      join.get_above_pushdown_left_params().empty() &&
+      join.get_above_pushdown_right_params().empty() && !join.is_late_mat();
+}
+
+int semantic_lift_relational_safe(ObLogicalOperator &node, bool &safe)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObRawExpr *, 16> expressions;
+  safe = node.get_type() == LOG_TABLE_SCAN ||
+      (node.get_type() == LOG_JOIN &&
+       semantic_lift_join_supported(static_cast<ObLogJoin &>(node))) ||
+      (node.get_type() == LOG_SORT &&
+       nullptr == static_cast<ObLogSort &>(node).get_topn_expr());
+  if (safe && OB_FAIL(node.get_op_exprs(expressions))) {
+    LOG_WARN("failed to inspect relational expressions for semantic placement", K(ret));
+  } else if (safe && OB_FAIL(append_array_no_dup(expressions, node.get_pushdown_filter_exprs()))) {
+    LOG_WARN("failed to inspect pushdown expressions for semantic placement", K(ret));
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && safe &&
+       index < expressions.count(); ++index) {
+    ret = semantic_lift_expression_safe(expressions.at(index), false, false, safe);
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && safe &&
+       index < node.get_num_of_child(); ++index) {
+    ObLogicalOperator *child = node.get_child(index);
+    if (OB_ISNULL(child)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing relational child while checking semantic placement", K(ret));
+    } else {
+      ret = SMART_CALL(semantic_lift_relational_safe(*child, safe));
+    }
+  }
+  return ret;
+}
+
+int semantic_lift_candidate(ObLogJoin &join, int64_t side, LogSemantic &stage,
+                            const char *&reason)
+{
+  int ret = OB_SUCCESS;
+  reason = nullptr;
+  ObLogicalOperator *source = stage.get_child(ObLogicalOperator::first_child);
+  ObLogicalOperator *opposite = join.get_child(1 - side);
+  bool safe = false;
+  bool unique = false;
+  ObSEArray<ObRawExpr *, 8> left_keys;
+  ObSEArray<ObRawExpr *, 8> right_keys;
+  ObSEArray<bool, 8> null_safe;
+  ObSEArray<ObRawExpr *, 8> join_expressions;
+  if (OB_ISNULL(source) || OB_ISNULL(opposite)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing input while checking semantic placement", K(ret));
+  } else if (!semantic_lift_join_supported(join)) {
+    reason = "unsupported_join_boundary";
+  } else if (nullptr == join.get_join_path()) {
+    reason = "missing_join_path";
+  } else if (!stage.shared_exprs().empty() || !stage.carried_exprs().empty()) {
+    reason = "shared_semantic_value";
+  } else {
+    for (int64_t index = 0; OB_SUCC(ret) && nullptr == reason &&
+         index < stage.expressions().count(); ++index) {
+      ObRawExpr *expr = stage.expressions().at(index);
+      if (OB_FAIL(semantic_lift_expression_safe(expr, true, false, safe))) {
+      } else if (!safe || !expr->get_relation_ids().is_subset(source->get_table_set())) {
+        reason = "guarded_or_unsafe_recipe";
+      }
+    }
+    if (OB_SUCC(ret) && nullptr == reason) {
+      // get_op_exprs through the public base interface includes every join consumer.
+      if (OB_FAIL(static_cast<ObLogicalOperator &>(join).get_op_exprs(join_expressions))) {
+      } else if (OB_FAIL(append_array_no_dup(join_expressions, join.get_pushdown_filter_exprs()))) {
+      }
+      for (int64_t index = 0; OB_SUCC(ret) && nullptr == reason &&
+           index < join_expressions.count(); ++index) {
+        if (OB_FAIL(semantic_lift_expression_safe(
+            join_expressions.at(index), false, false, safe))) {
+        } else if (!safe) {
+          reason = "dependent_or_unsafe_join_expression";
+        }
+      }
+    }
+    if (OB_SUCC(ret) && nullptr == reason) {
+      if (OB_FAIL(semantic_lift_relational_safe(*source, safe))) {
+      } else if (!safe) {
+        reason = "unsafe_semantic_input_subtree";
+      } else if (OB_FAIL(semantic_lift_relational_safe(*opposite, safe))) {
+      } else if (!safe) {
+        reason = "unsafe_opposite_subtree";
+      } else if (OB_FAIL(ObOptimizerUtil::get_equal_keys(
+          join.get_equal_join_conditions(), join.get_left_table()->get_table_set(),
+          left_keys, right_keys, null_safe))) {
+      } else if (left_keys.empty()) {
+        reason = "no_direct_equality_keys";
+      }
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && nullptr == reason &&
+         index < left_keys.count(); ++index) {
+      ObRawExpr *left = left_keys.at(index);
+      ObRawExpr *right = right_keys.at(index);
+      if (OB_ISNULL(left) || OB_ISNULL(right)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("missing equality key while checking semantic placement", K(ret));
+      } else if (null_safe.at(index) || !left->is_column_ref_expr() ||
+                 !right->is_column_ref_expr() ||
+                 left->get_result_meta() != right->get_result_meta()) {
+        reason = "nullable_or_computed_join_key";
+      }
+    }
+    if (OB_SUCC(ret) && nullptr == reason) {
+      const ObIArray<ObRawExpr *> &keys = side == ObLogicalOperator::first_child ?
+          right_keys : left_keys;
+      if (OB_FAIL(ObOptimizerUtil::is_exprs_unique(keys, opposite->get_table_set(),
+          opposite->get_fd_item_set(), opposite->get_output_equal_sets(),
+          opposite->get_output_const_exprs(), unique))) {
+      } else if (!unique) {
+        reason = "opposite_keys_not_unique";
+      }
+    }
+  }
+  return ret;
+}
+
 class SemanticPlanLowering
 {
 public:
@@ -5152,6 +5374,39 @@ public:
     return ret;
   }
 
+  int place(ObLogicalOperator *&node, bool candidate_boundary, bool &changed)
+  {
+    int ret = OB_SUCCESS;
+    changed = false;
+    if (OB_ISNULL(node)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing operator while placing semantic stages", K(ret));
+    } else {
+      for (int64_t index = 0; OB_SUCC(ret) && index < node->get_num_of_child(); ++index) {
+        ObLogicalOperator *child = node->get_child(index);
+        bool child_changed = false;
+        const bool candidate = node->get_type() == LOG_SEMANTIC_JOIN &&
+            index == ObLogicalOperator::first_child;
+        if (OB_FAIL(SMART_CALL(place(child, candidate, child_changed)))) {
+        } else {
+          node->set_child(index, child);
+          changed |= child_changed;
+        }
+      }
+      if (OB_SUCC(ret) && changed && OB_FAIL(refresh_placement(*node))) {
+        LOG_WARN("failed to refresh semantic placement ancestor", K(ret));
+      }
+      if (OB_SUCC(ret) && node->get_type() == LOG_JOIN) {
+        bool lifted = false;
+        if (OB_FAIL(lift_child_stage(node, candidate_boundary, lifted))) {
+        } else {
+          changed |= lifted;
+        }
+      }
+    }
+    return ret;
+  }
+
   int add_projection(ObLogicalOperator *&node, const ObIArray<ObRawExpr *> &selects)
   {
     int ret = OB_SUCCESS;
@@ -5196,6 +5451,82 @@ public:
   }
 
 private:
+  int refresh_placement(ObLogicalOperator &node)
+  {
+    int ret = OB_SUCCESS;
+    if (node.get_type() != LOG_JOIN) {
+      ret = node.compute_property();
+    } else {
+      auto &join = *static_cast<ObLogJoin *>(&node);
+      double card = 0;
+      double op_cost = 0;
+      double cost = 0;
+      EstimateCostInfo param;
+      param.need_parallel_ = join.get_parallel();
+      join.get_output_const_exprs().reuse();
+      if (OB_FAIL(join.compute_property(join.get_join_path()))) {
+      } else if (OB_FAIL(join.do_re_est_cost(param, card, op_cost, cost))) {
+      } else {
+        join.set_card(card);
+        join.set_op_cost(op_cost);
+        join.set_cost(cost);
+      }
+    }
+    return ret;
+  }
+
+  int lift_child_stage(ObLogicalOperator *&node, bool candidate_boundary, bool &lifted)
+  {
+    int ret = OB_SUCCESS;
+    auto &join = *static_cast<ObLogJoin *>(node);
+    lifted = false;
+    for (int64_t side = 0; OB_SUCC(ret) && !lifted &&
+         side < join.get_num_of_child(); ++side) {
+      ObLogicalOperator *child = join.get_child(side);
+      if (OB_ISNULL(child)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("missing join child while lifting semantic stage", K(ret));
+      } else if (child->get_type() == LOG_SEMANTIC_MAP ||
+                 child->get_type() == LOG_SEMANTIC_FILTER) {
+        auto &stage = *static_cast<LogSemantic *>(child);
+        const char *reason = nullptr;
+        if (candidate_boundary) {
+          reason = "semantic_join_candidate_boundary";
+        } else {
+          ret = semantic_lift_candidate(join, side, stage, reason);
+        }
+        if (OB_FAIL(ret)) {
+          LOG_WARN("failed to check semantic placement", K(ret));
+        } else if (nullptr != reason) {
+          stage.set_lift_stop_reason(reason);
+          OPT_TRACE("semantic_lift kept before join", "reason", reason, "input_side", side);
+        } else {
+          const bool root = join.is_plan_root();
+          join.set_child(side, stage.get_child(ObLogicalOperator::first_child));
+          join.set_is_plan_root(false);
+          stage.set_child(ObLogicalOperator::first_child, &join);
+          stage.set_is_plan_root(root);
+          // JOIN FD/order/distribution come from its join path, not the unary default.
+          join.get_output_const_exprs().reuse();
+          if (OB_FAIL(join.compute_property(join.get_join_path()))) {
+          } else {
+            join.set_cost(join.get_op_cost() + join.get_left_table()->get_cost() +
+                          join.get_right_table()->get_cost());
+            if (OB_FAIL(stage.compute_property())) {
+            } else {
+              stage.record_lifted_join();
+              node = &stage;
+              lifted = true;
+              OPT_TRACE("semantic_lift applied", "input_side", side,
+                        "estimated_input_rows", join.get_card());
+            }
+          }
+        }
+      }
+    }
+    return ret;
+  }
+
   int needs_stage(ObRawExpr *expr, bool &needed)
   {
     int ret = OB_SUCCESS;
@@ -5356,6 +5687,41 @@ int ObSelectLogPlan::candi_allocate_semantic(bool projection)
       if (OB_FAIL(lowering.lower(root))) {
       } else if (projection && OB_FAIL(lowering.add_projection(root, selects))) {
       } else if (OB_FAIL(lowering.assign_query_limits())) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSelectLogPlan::place_semantic_stages()
+{
+  int ret = OB_SUCCESS;
+  bool enabled = false;
+  ObLogicalOperator *root = nullptr;
+  if (OB_FAIL(get_optimizer_context().get_global_hint().opt_params_.get_bool_opt_param(
+      ObOptParamHint::ENABLE_SEMANTIC_LIFT, enabled))) {
+    LOG_WARN("failed to read semantic placement option", K(ret));
+  } else if (!enabled) {
+  } else if (OB_FAIL(candidates_.get_best_plan(root))) {
+  } else if (OB_ISNULL(root)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing selected plan for semantic placement", K(ret));
+  } else if (semantic_plan_present(*root)) {
+    // Select before mutation: candidate plans can share operator subtrees.
+    SemanticPlanLowering placement(*this);
+    ObSEArray<CandidatePlan, 1> selected;
+    bool changed = false;
+    if (OB_FAIL(selected.push_back(CandidatePlan(root)))) {
+    } else if (OB_FAIL(init_candidate_plans(selected))) {
+    } else if (OB_FAIL(placement.place(root, false, changed))) {
+    } else {
+      candidates_.candidate_plans_.at(0).plan_tree_ = root;
+      if (is_final_root_plan()) {
+        set_plan_root(root);
+        root->mark_is_plan_root();
+        get_optimizer_context().set_plan_type(root->get_phy_plan_type(),
+                                              root->get_location_type(),
+                                              root->is_exchange_allocated());
       }
     }
   }
@@ -5618,6 +5984,9 @@ int ObSelectLogPlan::allocate_plan_top()
       } else {
         LOG_TRACE("succeed to allocate root exchange", K(candidates_.candidate_plans_.count()));
       }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(place_semantic_stages())) {
+      LOG_WARN("failed to place semantic stages on the selected plan", K(ret));
     }
   }
   return ret;

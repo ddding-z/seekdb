@@ -48,10 +48,10 @@ public:
   // Opaque v1 payload: big-endian FILE magic, version byte, three int32 byte
   // lengths, int64 size, then URI/MIME/object-version bytes. Decode rejects
   // unsupported versions, noncanonical URIs, trailing data and malformed sizes.
-  // Constructors perform no filesystem access. Only absolute local paths and
-  // authority-free file:/// URIs are accepted; URI query/fragment components
-  // and traversal above the root are rejected. Stored URIs are normalized and
-  // percent-encoded. Encoded values and JSON results belong to the allocator.
+  // Constructors perform no I/O. Local paths/file:/// URIs are normalized.
+  // HTTPS URLs (and numeric-loopback HTTP URLs) retain their exact escaped path
+  // and query for pre-signed GET requests. Userinfo, fragments and ambiguous
+  // paths are rejected. Encoded values and JSON results belong to the allocator.
   static int from_path(ObIAllocator &allocator, const ObString &path, ObString &encoded);
   // JSON requires format_version=1 and uri. The only optional fields are
   // mime_type (concrete type/subtype), object_version, and nonnegative size_bytes.
@@ -60,6 +60,11 @@ public:
   static int decode(const ObString &encoded, FileRef &ref);
   static int to_json(ObIAllocator &allocator, const ObString &encoded, ObString &json);
   static int get_uri(const ObString &encoded, ObString &uri);
+  static bool is_remote_uri(const ObString &uri);
+  // Validates the supported URL subset; returned origin/path borrow uri.
+  // path excludes the query. Scheme and DNS host must be lowercase.
+  static int parse_remote_uri(const ObString &uri, ObString &origin, ObString &path);
+  static int validate_remote_root(const ObString &root);
 };
 }
 }

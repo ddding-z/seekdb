@@ -9977,11 +9977,25 @@ static struct VarsInit{
       ObSysVars[723].default_value_ = "4" ;
       ObSysVars[723].base_value_ = "4" ;
       ObSysVars[723].data_type_ = ObIntType ;
-      ObSysVars[723].info_ = "Maximum concurrent local AI media loads per query" ;
+      ObSysVars[723].info_ = "Maximum concurrent local and remote AI media loads per query" ;
       ObSysVars[723].flags_ = ObSysVarFlag::GLOBAL_SCOPE | ObSysVarFlag::SESSION_SCOPE | ObSysVarFlag::NEED_SERIALIZE ;
       ObSysVars[723].min_val_ = "1" ;
       ObSysVars[723].max_val_ = "64" ;
     ObSysVars[723].alias_ = "OB_SV_AI_MEDIA_PARALLEL" ;
+    }();
+
+    [&] (){
+      ObSysVars[724].id_ = SYS_VAR_AI_MEDIA_REMOTE_ROOT ;
+      cur_max_var_id = MAX(cur_max_var_id, static_cast<int64_t>(SYS_VAR_AI_MEDIA_REMOTE_ROOT)) ;
+      ObSysVarsIdToArrayIdx[SYS_VAR_AI_MEDIA_REMOTE_ROOT] = 724 ;
+      ObSysVars[724].name_ = "ai_media_remote_root" ;
+      ObSysVars[724].default_value_ = "" ;
+      ObSysVars[724].base_value_ = "" ;
+      ObSysVars[724].data_type_ = ObVarcharType ;
+      ObSysVars[724].info_ = "Administrator-controlled URL prefix for pre-signed HTTPS AI media GETs; must end in / and contain no query. Empty disables remote reads. HTTP is limited to numeric loopback fixtures." ;
+      ObSysVars[724].flags_ = ObSysVarFlag::GLOBAL_SCOPE | ObSysVarFlag::NEED_SERIALIZE ;
+      ObSysVars[724].on_check_and_convert_func_ = "ObSysVarOnCheckFuncs::check_and_convert_ai_media_remote_root" ;
+    ObSysVars[724].alias_ = "OB_SV_AI_MEDIA_REMOTE_ROOT" ;
     }();
 
     if (cur_max_var_id >= ObSysVarMeta::OB_MAX_SYS_VAR_ID) {
@@ -9990,7 +10004,7 @@ static struct VarsInit{
   }
 }vars_init;
 
-static int64_t var_amount = 724;
+static int64_t var_amount = 725;
 
 int64_t ObSysVariables::get_all_sys_var_count(){ return ObSysVarMeta::ALL_SYS_VARS_COUNT;}
 ObSysVarClassType ObSysVariables::get_sys_var_id(int64_t i){ return ObSysVars[i].id_;}

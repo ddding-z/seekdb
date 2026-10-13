@@ -299,6 +299,7 @@ struct ObDynReserveBuf
     const common::ObObjTypeClass tc = common::ob_obj_type_class(type);
     return common::ObStringTC == tc || common::ObTextTC == tc
            || common::ObRawTC == tc
+           || common::ObFileType == type
            || common::ObRowIDTC == tc
            || common::ObLobTC == tc
            || common::ObJsonTC == tc

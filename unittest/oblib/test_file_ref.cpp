@@ -133,7 +133,7 @@ bool test_invalid_paths_and_limits()
   TestAllocator allocator;
   const char *invalid[] = {
     "", "relative/file", "./file", "~/file", "file:/tmp/a", "file://host/tmp/a",
-    "file://localhost/tmp/a", "https://host/a", "file:///tmp/a?query=1",
+    "file://localhost/tmp/a", "s3://bucket/a", "file:///tmp/a?query=1",
     "file:///tmp/a#fragment", "file:///tmp/%", "file:///tmp/%GG",
     "file:///tmp/%00a", "file:///tmp/%0Aa", "file:///tmp/%C0%AFa",
     "/../a", "/a/../../b", "/tmp/\xFF", "/tmp/\n",
@@ -159,6 +159,86 @@ bool test_invalid_paths_and_limits()
   path.assign(FileRefCodec::MAX_URI_BYTES + 1, 'a');
   path[0] = '/';
   REQUIRE(OB_SUCCESS != FileRefCodec::from_path(allocator, string(path), encoded));
+  return true;
+}
+
+bool test_remote_url_roundtrip_and_policy_parts()
+{
+  TestAllocator allocator;
+  const char *valid[] = {
+    "https://bucket.example/images/a%20b.png?X-Amz-Signature=synthetic&part=%2f%2B",
+    "https://minio.example:9000/bucket//x.png?versionId=v%2B1",
+    "http://127.0.0.1:9000/bucket/x.png?signature=synthetic",
+    "http://[::1]:9000/bucket/x.png",
+    "https://bucket.example/images/%E5%9B%BE.png",
+  };
+  for (const char *url : valid) {
+    ObString encoded;
+    REQUIRE(OB_SUCCESS == FileRefCodec::from_path(allocator, ObString::make_string(url), encoded));
+    FileRef ref;
+    REQUIRE(OB_SUCCESS == FileRefCodec::decode(encoded, ref));
+    REQUIRE(ref.uri_ == ObString::make_string(url));
+    REQUIRE(FileRefCodec::is_remote_uri(ref.uri_));
+    ObString origin;
+    ObString path;
+    REQUIRE(OB_SUCCESS == FileRefCodec::parse_remote_uri(ref.uri_, origin, path));
+    REQUIRE(origin.length() > 7 && path.prefix_match("/"));
+    REQUIRE(origin.length() + path.length() <= ref.uri_.length());
+    ObString json;
+    REQUIRE(OB_SUCCESS == FileRefCodec::to_json(allocator, encoded, json));
+    ObJsonNode *tree = nullptr;
+    REQUIRE(OB_SUCCESS == ObJsonParser::get_tree(
+        &allocator, json, tree, ObJsonParser::JSN_STRICT_FLAG));
+    ObString roundtrip;
+    REQUIRE(OB_SUCCESS == FileRefCodec::from_json(allocator, *tree, roundtrip));
+    REQUIRE(roundtrip == encoded);
+  }
+  ObString origin;
+  ObString path;
+  REQUIRE(OB_SUCCESS == FileRefCodec::parse_remote_uri(
+      ObString::make_string(valid[0]), origin, path));
+  REQUIRE(origin == ObString::make_string("https://bucket.example"));
+  REQUIRE(path == ObString::make_string("/images/a%20b.png"));
+  for (const char *root : {"", "https://bucket.example/images/",
+                          "http://127.0.0.1:9000/bucket/", "http://[::1]:9000/bucket/"}) {
+    REQUIRE(OB_SUCCESS == FileRefCodec::validate_remote_root(ObString::make_string(root)));
+  }
+  for (const char *root : {"https://bucket.example", "https://bucket.example/images",
+                          "https://bucket.example/images/?signature=synthetic",
+                          "http://outside.example/images/"}) {
+    REQUIRE(OB_SUCCESS != FileRefCodec::validate_remote_root(ObString::make_string(root)));
+  }
+  const char *invalid[] = {
+    "http://bucket.example/a", "http://localhost/a", "http://127.1/a",
+    "HTTPS://bucket.example/a", "https://BUCKET.example/a", "https://bucket.example./a",
+    "https://user:password@bucket.example/a", "https://bucket.example",
+    "https://bucket.example:0/a", "https://bucket.example:0443/a",
+    "https://bucket.example:65536/a", "https://bucket.example:443extra/a",
+    "https://bucket.example/a#fragment", "https://bucket.example/a\\b",
+    "https://bucket.example/a/../b", "https://bucket.example/a/%2e%2e/b",
+    "https://bucket.example/a/./b", "https://bucket.example/a/%2Fother",
+    "https://bucket.example/a/%5cb", "https://bucket.example/a%00",
+    "https://bucket.example/a%0a", "https://bucket.example/a%7F",
+    "https://bucket.example/a?bad=%", "https://bucket.example/a?bad=%GG",
+    "https://bucket.example/a?bad=raw space", "https://bucket.example/a?bad=\"raw\"",
+    "https://bucket.example/\xE5\x9B\xBE.png", "https://bucket.example/a%2",
+  };
+  for (const char *url : invalid) {
+    ObString encoded = ObString::make_string("old");
+    const int ret = FileRefCodec::from_path(allocator, ObString::make_string(url), encoded);
+    if (ret == OB_SUCCESS) {
+      std::fprintf(stderr, "unexpectedly accepted synthetic invalid URL: %s\n", url);
+    }
+    REQUIRE(OB_SUCCESS != ret);
+    REQUIRE(encoded.empty());
+  }
+  std::string maximum = "https://bucket.example/";
+  maximum.append(FileRefCodec::MAX_URI_BYTES - maximum.size(), 'a');
+  ObString encoded;
+  REQUIRE(OB_SUCCESS == FileRefCodec::from_path(allocator, string(maximum), encoded));
+  maximum.push_back('a');
+  REQUIRE(OB_SUCCESS != FileRefCodec::from_path(allocator, string(maximum), encoded));
+  REQUIRE(encoded.empty());
   return true;
 }
 
@@ -503,6 +583,7 @@ int main()
   const TestCase tests[] = {
     {"path normalization and borrowed references", test_path_normalization},
     {"invalid paths and URI boundaries", test_invalid_paths_and_limits},
+    {"remote URL byte-preserving interchange and policy parts", test_remote_url_roundtrip_and_policy_parts},
     {"canonical JSON interchange", test_json_interchange},
     {"strict JSON descriptor validation", test_invalid_json},
     {"versioned payload validation", test_payload_validation},

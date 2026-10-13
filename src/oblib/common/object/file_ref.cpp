@@ -70,6 +70,16 @@ int normalize_uri(const ObString input, char *uri_buf, ObString &uri)
 {
   int ret = OB_SUCCESS;
   uri.reset();
+  if (FileRefCodec::is_remote_uri(input)) {
+    ObString origin;
+    ObString remote_path;
+    if (OB_FAIL(FileRefCodec::parse_remote_uri(input, origin, remote_path))) {
+    } else {
+      MEMCPY(uri_buf, input.ptr(), input.length());
+      uri.assign_ptr(uri_buf, input.length());
+    }
+    return ret;
+  }
   char path[FileRefCodec::MAX_URI_BYTES];
   int64_t path_len = 0;
   const bool is_uri = input.length() >= 8 && OB_NOT_NULL(input.ptr())
@@ -257,6 +267,174 @@ int json_integer(ObIJsonBase &value, int64_t &number)
   }
   return ret;
 }
+}
+
+bool FileRefCodec::is_remote_uri(const ObString &uri)
+{
+  return OB_NOT_NULL(uri.ptr()) && (uri.prefix_match("https://") || uri.prefix_match("http://"));
+}
+
+int FileRefCodec::parse_remote_uri(const ObString &uri, ObString &origin, ObString &path)
+{
+  int ret = OB_SUCCESS;
+  origin.reset();
+  path.reset();
+  const bool https = OB_NOT_NULL(uri.ptr()) && uri.prefix_match("https://");
+  const int64_t authority_begin = https ? 8 : 7;
+  int64_t path_begin = authority_begin;
+  int64_t query_begin = uri.length();
+  if (!is_remote_uri(uri) || uri.length() > MAX_URI_BYTES || OB_ISNULL(uri.ptr())) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < uri.length(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(uri.ptr()[i]);
+    if (c <= 0x20 || c >= 0x7f || c == '\\' || c == '#') {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (c == '%') {
+      if (i + 2 >= uri.length() || hex_digit(uri.ptr()[i + 1]) < 0
+          || hex_digit(uri.ptr()[i + 2]) < 0) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        const unsigned char decoded = hex_digit(uri.ptr()[i + 1]) * 16 + hex_digit(uri.ptr()[i + 2]);
+        if (decoded < 0x20 || decoded == 0x7f) {
+          ret = OB_INVALID_ARGUMENT;
+        }
+        i += 2;
+      }
+    }
+  }
+  while (OB_SUCC(ret) && path_begin < uri.length() && uri.ptr()[path_begin] != '/') {
+    ++path_begin;
+  }
+  ObString host;
+  int64_t port_begin = path_begin;
+  if (OB_SUCC(ret)) {
+    if (path_begin == uri.length() || path_begin == authority_begin) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (uri.ptr()[authority_begin] == '[') {
+      // Numeric loopback is also useful for private, credential-free test fixtures.
+      const int64_t host_end = authority_begin + 5;
+      if (host_end > path_begin || MEMCMP(uri.ptr() + authority_begin, "[::1]", 5) != 0) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        host.assign_ptr(uri.ptr() + authority_begin, 5);
+        port_begin = host_end;
+      }
+    } else {
+      int64_t host_end = authority_begin;
+      while (host_end < path_begin && uri.ptr()[host_end] != ':') {
+        ++host_end;
+      }
+      host.assign_ptr(uri.ptr() + authority_begin, host_end - authority_begin);
+      port_begin = host_end;
+      int64_t label_begin = 0;
+      for (int64_t i = 0; OB_SUCC(ret) && i <= host.length(); ++i) {
+        if (i == host.length() || host.ptr()[i] == '.') {
+          const int64_t length = i - label_begin;
+          if (length <= 0 || length > 63 || host.ptr()[label_begin] == '-'
+              || host.ptr()[i - 1] == '-') {
+            ret = OB_INVALID_ARGUMENT;
+          }
+          label_begin = i + 1;
+        } else {
+          const char c = host.ptr()[i];
+          if (!(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '-') {
+            ret = OB_INVALID_ARGUMENT;
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && port_begin < path_begin) {
+    int64_t port = 0;
+    if (uri.ptr()[port_begin] != ':' || port_begin + 1 >= path_begin
+        || uri.ptr()[port_begin + 1] == '0') {
+      ret = OB_INVALID_ARGUMENT;
+    }
+    for (int64_t i = port_begin + 1; OB_SUCC(ret) && i < path_begin; ++i) {
+      const char c = uri.ptr()[i];
+      if (c < '0' || c > '9' || port > 6553) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        port = port * 10 + c - '0';
+      }
+    }
+    if (OB_SUCC(ret) && (port <= 0 || port > 65535)) {
+      ret = OB_INVALID_ARGUMENT;
+    }
+  }
+  if (OB_SUCC(ret) && !https && host != ObString::make_string("127.0.0.1")
+      && host != ObString::make_string("[::1]")) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  if (OB_SUCC(ret)) {
+    for (int64_t i = path_begin; i < uri.length(); ++i) {
+      if (uri.ptr()[i] == '?') {
+        query_begin = i;
+        break;
+      }
+    }
+    for (int64_t i = query_begin + 1; OB_SUCC(ret) && i < uri.length(); ++i) {
+      const unsigned char c = static_cast<unsigned char>(uri.ptr()[i]);
+      if (c == '%') {
+        i += 2;
+      } else if (!is_unreserved(c) && c != '!' && c != '$' && c != '&' && c != '\''
+          && c != '(' && c != ')' && c != '*' && c != '+' && c != ',' && c != ';'
+          && c != '=' && c != ':' && c != '@' && c != '/' && c != '?') {
+        ret = OB_INVALID_ARGUMENT;
+      }
+    }
+    int64_t segment_length = 0;
+    bool dots_only = true;
+    for (int64_t i = path_begin + 1; OB_SUCC(ret) && i <= query_begin; ++i) {
+      if (i == query_begin || uri.ptr()[i] == '/') {
+        if (dots_only && (segment_length == 1 || segment_length == 2)) {
+          ret = OB_INVALID_ARGUMENT;
+        }
+        segment_length = 0;
+        dots_only = true;
+      } else {
+        unsigned char c = static_cast<unsigned char>(uri.ptr()[i]);
+        if (c == '%') {
+          c = hex_digit(uri.ptr()[i + 1]) * 16 + hex_digit(uri.ptr()[i + 2]);
+          i += 2;
+          if (c == '/' || c == '\\') {
+            ret = OB_INVALID_ARGUMENT;
+          }
+        } else if (!is_unreserved(c) && c != '!' && c != '$' && c != '&' && c != '\''
+            && c != '(' && c != ')' && c != '*' && c != '+' && c != ',' && c != ';'
+            && c != '=' && c != ':' && c != '@') {
+          ret = OB_INVALID_ARGUMENT;
+        }
+        ++segment_length;
+        dots_only = dots_only && c == '.';
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    origin.assign_ptr(uri.ptr(), path_begin);
+    path.assign_ptr(uri.ptr() + path_begin, query_begin - path_begin);
+  } else {
+    LOG_WARN("invalid remote FILE URL", K(ret), "length", uri.length());
+  }
+  return ret;
+}
+
+int FileRefCodec::validate_remote_root(const ObString &root)
+{
+  int ret = OB_SUCCESS;
+  ObString origin;
+  ObString path;
+  if (root.empty()) {
+  } else if (OB_FAIL(parse_remote_uri(root, origin, path))) {
+  } else if (root.ptr()[root.length() - 1] != '/' ||
+             origin.length() + path.length() != root.length()) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("invalid remote media URL prefix", K(ret), "length", root.length());
+  }
+  return ret;
 }
 
 int FileRefCodec::from_path(ObIAllocator &allocator, const ObString &path, ObString &encoded)

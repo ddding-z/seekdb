@@ -116,9 +116,14 @@ def decode_descriptor(value):
     if not isinstance(uri, str):
         raise AssertionError("FILE descriptor uri must be a string")
     parsed = urlsplit(uri)
-    if (parsed.scheme != "file" or parsed.netloc or not parsed.path.startswith("/")
-            or parsed.query or parsed.fragment or not uri.startswith("file:///")):
-        raise AssertionError("FILE descriptor must contain a canonical local file URI")
+    local = (parsed.scheme == "file" and not parsed.netloc and parsed.path.startswith("/")
+             and not parsed.query and not parsed.fragment and uri.startswith("file:///"))
+    remote = (parsed.scheme in {"https", "http"} and uri.startswith(parsed.scheme + "://")
+              and parsed.netloc and parsed.path.startswith("/") and not parsed.fragment
+              and parsed.username is None and parsed.password is None
+              and (parsed.scheme == "https" or parsed.hostname in {"127.0.0.1", "::1"}))
+    if not local and not remote:
+        raise AssertionError("FILE descriptor must contain a supported file or remote URI")
     for name in ("mime_type", "object_version"):
         if name in result and not isinstance(result[name], str):
             raise AssertionError(f"FILE descriptor {name} must be a string")
@@ -599,7 +604,7 @@ class FileHarnessTests(unittest.TestCase):
         values.extend(descriptor_text(value) for value in (
             {"uri": valid["uri"]}, {**valid, "format_version": True},
             {**valid, "format_version": 2}, {**valid, "uri": "/not-a-uri"},
-            {**valid, "uri": "https://example.invalid/a"}, {**valid, "mime_type": 1},
+            {**valid, "uri": "s3://bucket/a"}, {**valid, "mime_type": 1},
             {**valid, "size_bytes": -1}, {**valid, "size_bytes": 1.5},
             {**valid, "size_bytes": True}, {**valid, "object_version": {}},
             {**valid, "unknown": "field"},
@@ -1321,7 +1326,8 @@ class FileContracts(unittest.TestCase):
                 self.reject("SELECT TO_FILE(%s)", (value,))
 
     def test_to_file_rejects_remote_authority_uri_and_nontext_scalars(self):
-        for value in ("https://example.invalid/image.png", "file://localhost/tmp/image.png",
+        for value in ("s3://bucket/image.png", "http://example.invalid/image.png",
+                      "file://localhost/tmp/image.png",
                       "file://server/share/image.png", "file:///tmp/image.png?query=1",
                       "file:///tmp/image.png#fragment"):
             with self.subTest(value=value):
@@ -2959,7 +2965,8 @@ class CatalogUpgradeContracts(unittest.TestCase):
         self.assert_legacy_columns_absent()
         media_query = (
             "SELECT name, value FROM oceanbase.__all_sys_variable "
-            "WHERE name IN ('ai_media_root','ai_media_max_bytes','ai_media_parallel') ORDER BY name")
+            "WHERE name IN ('ai_media_root','ai_media_max_bytes','ai_media_parallel',"
+            "'ai_media_remote_root') ORDER BY name")
         self.assertEqual(self.execute(media_query), (),
                          "old-binary bootstrap unexpectedly persisted new media variables")
         self.cursor.execute("CALL DBMS_AI_SERVICE.CREATE_AI_MODEL(%s, %s)", (
@@ -2991,8 +2998,8 @@ class CatalogUpgradeContracts(unittest.TestCase):
         upgraded = self.upgraded_schema()
         self.assertEqual(self.execute(media_query),
                          (("ai_media_max_bytes", "2097152"), ("ai_media_parallel", "4"),
-                          ("ai_media_root", "")),
-                         "upgrade did not durably add exactly the three safe media defaults")
+                          ("ai_media_remote_root", ""), ("ai_media_root", "")),
+                         "upgrade did not durably add exactly the four safe media defaults")
         self.assertEqual(self.execute(
             "SELECT model_id, name, type, model_name, input_modalities "
             "FROM oceanbase.__all_ai_model WHERE model_id=%s", (legacy_id,)),
@@ -3018,13 +3025,15 @@ class CatalogUpgradeContracts(unittest.TestCase):
             "FROM oceanbase.__all_ai_model WHERE name LIKE 'upgrade_%' ORDER BY model_id")
         self.assertEqual(len(identities), 4)
         media_root = str(self.database.base / "upgrade-media-policy")
+        remote_root = "https://upgrade.example.invalid/media/"
         self.cursor.execute("SET GLOBAL ai_media_root=%s", (media_root,))
+        self.cursor.execute("SET GLOBAL ai_media_remote_root=%s", (remote_root,))
         self.cursor.execute("SET GLOBAL ai_media_max_bytes=1077")
         self.cursor.execute("SET GLOBAL ai_media_parallel=2")
         media_policy = self.execute(media_query)
         self.assertEqual(media_policy,
                          (("ai_media_max_bytes", "1077"), ("ai_media_parallel", "2"),
-                          ("ai_media_root", media_root)))
+                          ("ai_media_remote_root", remote_root), ("ai_media_root", media_root)))
         self.restart_as(self.new_binary)
         self.assertEqual(self.upgraded_schema(), upgraded,
                          "second new-binary startup changed system columns or added duplicates")

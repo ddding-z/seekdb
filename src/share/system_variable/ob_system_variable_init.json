@@ -1,4 +1,18 @@
 {
+  "ai_media_remote_root": {
+    "id": 10759,
+    "name": "ai_media_remote_root",
+    "default_value": "",
+    "base_value": "",
+    "data_type": "varchar",
+    "info": "Administrator-controlled URL prefix for pre-signed HTTPS AI media GETs; must end in / and contain no query. Empty disables remote reads. HTTP is limited to numeric loopback fixtures.",
+    "flags": "GLOBAL | NEED_SERIALIZE",
+    "on_check_and_convert_func": "ObSysVarOnCheckFuncs::check_and_convert_ai_media_remote_root",
+    "publish_version": "1.0.0.0",
+    "info_cn": "",
+    "background_cn": "",
+    "ref_url": ""
+  },
   "ai_media_root": {
     "id": 10756,
     "name": "ai_media_root",
@@ -33,7 +47,7 @@
     "default_value": "4",
     "base_value": "4",
     "data_type": "int",
-    "info": "Maximum concurrent local AI media loads per query",
+    "info": "Maximum concurrent local and remote AI media loads per query",
     "flags": "GLOBAL | SESSION | NEED_SERIALIZE",
     "min_val": "1",
     "max_val": "64",

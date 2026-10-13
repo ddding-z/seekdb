@@ -400,8 +400,9 @@ SOLO 覆盖全局跨批排列、末行非法零请求、条件前缀选列、JSO
 FILE 保存有类型的外部引用，不保存图片/音频内容，也不是 JSON 的别名。
 `TO_FILE(path_or_json)` 只做格式校验和词法规范化，不做文件 I/O；
 `FILE_URI(file)` 返回规范 URI，`FILE_META(file)` 返回版本化 JSON 元数据。
-这三个函数对 SQL NULL 返回 NULL。首版来源是绝对本地路径或 `file:///`，
-不包括 HTTP、stage、上传或临时签名 URL。外部文件不参与数据库 MVCC，
+这三个函数对 SQL NULL 返回 NULL。来源支持绝对本地路径、`file:///` 和
+预签名 HTTPS URL；数值回环 HTTP 仅用于私有测试。没有原生 S3/OSS 凭据、
+stage 或上传接口。外部文件不参与数据库 MVCC，
 删除引用也不会删除文件。
 
 ```sql
@@ -417,9 +418,10 @@ WHERE AI_FILTER('vision_model', ('Does this image contain a zebra?', image));
 只有 completion 模型可声明媒体输入。声明不是数据库自动发现的模型能力，
 也不能证明 endpoint 真正支持相应输入与严格布尔 schema。
 
-读取需要管理员设置 GLOBAL-only 的 `ai_media_root`，默认空值禁止读取，
-普通会话不能扩大根目录。`ai_media_max_bytes` 默认每文件 2 MiB，
-`ai_media_parallel` 默认查询内四个加载准入，可按会话调整。
+本地读取需要管理员设置 GLOBAL-only 的 `ai_media_root`，远程读取需要
+GLOBAL-only 的 `ai_media_remote_root`；两者分别默认空值禁止读取，
+普通会话不能扩大读取范围。`ai_media_max_bytes` 默认每媒体 2 MiB，
+`ai_media_parallel` 默认查询内四个本地/远程加载准入，可按会话调整。
 引用构造/元数据投影不需要启用读取。越界、符号链接、非普通文件、缺失、
 损坏、超限、读取期间变化或元数据不匹配必须报错，不能降级为文字或 false。
 
@@ -428,6 +430,83 @@ WHERE AI_FILTER('vision_model', ('Does this image contain a zebra?', image));
 `$seekdb_ai_input` 是内部保留标记；不能把它当作 FILE 的存储格式或公开稳定接口。
 配方保留次序，按需接回原生编码的 FILE 引用。NULL 错误在实际语义调用处报告，
 未选中的 CASE/AND/OR 分支不能因为加载媒体产生副作用。
+
+### 2026-10-12：预签名对象存储 URL 异步读取
+
+首版复用对象存储预签名 GET URL，不在 seekdb 中保存 AK/SK 或生成签名。
+管理员显式允许一个完整 origin 和路径前缀，必须以 `/` 结尾且没有 query：
+
+```sql
+SET GLOBAL ai_media_remote_root = 'https://media.example/bucket/images/';
+SELECT id, AI_MAP('vision_model', ('Describe this image.', image))
+FROM image_data;
+```
+
+非法 prefix 在 `SET GLOBAL` 时就拒绝；空值或 `DEFAULT` 关闭远程来源。
+普通用户不能设置 GLOBAL policy，也不能通过 SESSION override 扩大范围。
+未启用或不匹配的本地/远程来源沿用 `OB_OP_NOT_ALLOW`，不能按不支持的功能
+静默跳过。新增配置也接入旧库的安全默认值和 primary-only 持久化迁移。
+
+应用通过绑定参数将预签名 URL 写入 `TO_FILE`/FILE 列；也可通过版本化 JSON
+descriptor 提供 MIME、size_bytes 和 `sha256:<hex>` 内容校验。HTTPS scheme
+和 DNS host 必须小写，显式端口保留且不能含前导零。URI 的 escaped path
+和 query 原样保存、原样发送，不能规范化或重排签名参数。不同签名 URL
+是不同缓存键；仅同一查询内相同完整 URL/version 共享读取。`object_version`
+仍表示内容 hash，不是对象存储 ETag/versionId；若读取特定云对象版本，
+应由预签名 URL 包含对应 versionId。签名在执行读取时必须有效。
+URI 仍限制为 4096 字节，FILE binary layout/version 不变。FILE 结果现在支持
+表达式动态缓冲，避免长 URL 或 size/hash 元数据超过 128 字节保留缓冲时误报 4013。
+
+远程访问范围与本地 root 独立；仅启用远程来源时本地 root 可以保持空值。
+拒绝 userinfo、fragment、dot traversal、路径中 escaped slash/backslash、
+控制字符、未编码空格和非 ASCII 字节；这是一组明确限制的 URL 子集，不是任意
+HTTP 浏览器。仅允许严格的数值回环 HTTP `127.0.0.1`/`[::1]`，不能用
+`localhost` 或非回环明文 HTTP 访问远端。HTTPS 使用系统 CA 并强制证书和
+主机名验证；禁止重定向、环境代理、cookie 和自动内容解压。下载只发 GET，
+不发 HEAD，不新增下载重试，HTTP/传输错误直接报错；云端压缩对象暂不支持。
+
+独立的 `SemanticFetch` 单线程 curl multi 执行器推进非阻塞网络 I/O，
+最多 64 个活跃下载、128 个等待任务；依赖 curl 的 asynchronous DNS 支持。
+慢下载不占用原有四个本地读取/校验/编码 worker。完整下载成功后，按有界
+队列交给同一个媒体容器校验、内容 hash 和 Base64 阶段；不是逐块上传或
+数据库内 pixel decode。查询内的 media parallel 覆盖排队、下载和准备阶段。
+未知长度和 chunked 响应同样受实际字节上限约束，声明大小与 Content-Length
+不一致必须失败。请求逻辑开销、原始 buffer、增长时的新旧 buffer 和编码结果
+纳入共享预算；原始下载 buffer 在完成/失败时释放，不能留在结果缓存中。
+这仍是逻辑预算，不是 curl 内部或进程 RSS 的硬上限。
+
+只等待媒体、尚未提交模型请求时，共享 readiness 也检查 query/session kill，
+恢复原 SQL worker，由正常状态检查传播错误并取消媒体；后台线程不求值 SQL frame。
+取消/deadline 会主动从 multi 移除在途下载，不能等服务端发完响应才退出；
+查询销毁和正常停机必须 drain 下载及后续准备任务。媒体加载器的错误诊断不打印完整 URL
+或 descriptor，防止泄露签名 query；但 FILE_URI/FILE_META、SQL 字面量、
+审计记录和应用日志仍可能包含它。应按短期凭据保护 FILE 列，并优先使用绑定
+参数，不把有效签名写入代码、文档或测试日志。
+
+本轮最终 Debug 构建和编译信息刷新通过（2977 source commands）。
+远程 native 12 项契约在三个独立进程轮次全部通过，SQL 10/10、
+fixture 9/9 通过；覆盖逐字节签名 query、四种媒体、4096 字节 URL、
+MIME/size/hash、chunked/未知长度、错误状态、TLS 拒绝、代理/重定向禁用、
+四个挂起下载不阻塞本地 worker、共享准入、预算释放、取消和 deadline。
+SQL 还验证 vision MAP → text AI_AGG → post-MAP 的依赖和精确请求数。
+独立正常停机契约保持 SQL client、四个 GET 和全部服务端 gate 未释放，
+要求 SIGUSR1 十秒内零退出码，并观察到四个下载 socket 关闭。
+
+缺失远程变量的 private catalog 模拟通过 primary/standby 两项重启契约：
+primary 持久化默认值和 history，standby 只发布内存安全默认值、不写 catalog；
+再次重启保留已有 policy、模型和 FILE 数据。当前完整 policy 的 standby 重启
+也通过。旧 pre-FILE binary 的历史升级验收没有在本轮重跑，不能把上述模拟
+称为新的跨版本二进制升级证明。相关回归通过 native codec/storage/local media
+10/6/29 项各三轮、标准 Bazel codec target、12 项 local FILE SQL（含实际 PX）、
+6 项 text MAP/FILTER、2 项 JOIN、3 项 AGG 和 4 项实际 PX 取消/deadline。
+本地 fixture 27/27 也通过。
+
+测试说明与命令见 [RUNTIME_TESTS.md](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md)。
+全部媒体是生成数据，存储/模型端是私有回环夹具；未验证真实 S3/OSS/MinIO
+账号互通、真实模型/GPU 性能或完整 SemBench。当前仍整对象下载后准备、
+沿用 SQL slot/Dispatch 屏障；没有 fetch-to-provider streaming、跨查询缓存、
+原生对象存储 SDK、签名续期或资源感知的全查询 DAG。AI_AGG 仍只接收文本，
+图像可先由 vision MAP 生成文字，再进入异步归约；包含 AGG 的 SQL 仍为 serial。
 
 共享 media runtime 随查询预算存活，后台任务拥有读取/编码缓冲，不访问 SQL frame。
 文件准入和 logical-wave task credit 分开；前一个 HTTP 子批次仍被扣住时，
@@ -450,7 +529,7 @@ URI/META 投影才是普通 SQL 值。非键值传递、NULL、COUNT 和兼容 C
 或原生内部编码。FILE 数据要求支持该类型的服务端，不能把本轮检查当作旧二进制
 降级或混合版本滚动升级的证明。
 
-旧库升级有两层：schema fetch 只对缺少的三项新媒体变量提供明确记录的安全默认值，
+旧库升级有两层：schema fetch 只对缺少的四项媒体变量（包括远程 root）提供明确记录的安全默认值，
 不能对任意缺失变量悄悄补默认，也不能覆盖已有 policy。系统表 schema 发布之后，
 可写 primary 才用一个事务持久化缺少的变量及 history 并刷新；不能在系统表可解析
 之前执行这段 SQL。随后初始化 DDL/max-ID 服务，使用初始化后的 UTC time-zone map
@@ -664,3 +743,75 @@ self-test。另跑通 5 项既有语义组合及 5 项 MAP/FILTER 运行时回�
 3 项受控并发/子树推进/逆序完成测试另重复三轮，9 次全部通过。
 AI_AGG 私有数据库正常停机退出码为零，未发现语义资源泄漏日志。
 没有启动 GPU 或真实模型服务，也没有完整重跑历史 FILE/PX/legacy suites。
+
+## 12. 可选的语义算子延后求值（2026-10-13）
+
+```sql
+SELECT /*+ OPT_PARAM('enable_semantic_lift', 'true') */ a.id, b.category
+FROM semantic_inputs a
+JOIN selected_ids b ON a.id = b.id
+WHERE b.enabled = 1 AND AI_FILTER('classifier', a.prompt);
+```
+
+默认关闭；`'true'` / `'false'` 不区分大小写，其他值明确返回
+`OB_INVALID_ARGUMENT`。这是普通 JOIN 规划之后的放置规则，还不是把模型延迟
+纳入代价的 CBO。执行树从下往上看：先扫描、先 JOIN 删掉不需要的行，
+再执行位于 JOIN 上面的 `SEMANTIC FILTER/MAP`。
+
+首版只交换直接相邻的语义阶段与普通 INNER HASH/MERGE JOIN，支持左右两侧，
+也可逐层越过连续的合法 JOIN。必须用已有 FD、等价集合和常量信息证明
+**另一侧**在完整等值键上唯一，保证一条语义输入最多产生一条 JOIN 输出；
+不要求外键证明一定匹配，因为删掉不匹配行就是优化目的。只接受同类型直接列
+的普通 `=`，不接受 null-safe 等值或计算键，不能为了少调用模型破坏 bag 语义。
+
+Nested Loop、带参数/相关依赖、late materialization、shared/carried 语义值、
+两侧或输入子树还有语义阶段、JOIN 依赖模型值、以及可能失败的普通表达式均保守
+拒绝。单个语义配方内的 CASE/AND/OR 守卫不拆开，也不移动。允许直接列/常量、
+简单布尔和比较、已知无损的隐式转换、原生 tuple 输入和直接 `TO_FILE` 配方；
+显式 CAST、JSON 提取、UDF、易变表达式不在首版范围。普通 scan filter 仍在原处。
+不越过 LIMIT/Top-N、GROUP、DISTINCT、outer/semi/anti JOIN 或子查询边界，
+不移动 AI_JOIN 的 candidate-pair 边界，不放松 AI_AGG 的改写保护。
+已有投影 MAP 在 LIMIT 后按需执行的行为不变。
+
+移动在全部 lowering、HAVING/投影共享值登记之后，只对关系 CBO 已经选出的计划
+执行；其余候选计划先移除，避免改坏共享的逻辑子树。不能在第一次递归 lowering
+时就移动，否则尚未登记的 carried 值或后续 AI_JOIN candidate 边界会被绕开。
+移动仍发生在表达式 producer 分配和 codegen 之前。JOIN 通过原 join path 恢复
+FD/排序/分布属性并更新子节点成本；语义阶段对新的 JOIN 输入重算属性，
+必要列由正常的表达式分配穿过 JOIN，查询任务数仍使用共享计数；发生变化的
+上层节点也刷新属性/成本，不把普通 JOIN 当作单子节点继承 FD。
+遍历中显式保护 `SEMANTIC JOIN` 的直接 candidate JOIN。
+`EXPLAIN` 用 `semantic_placement=LIFTED, crossed_inner_joins=N` 标记应用；
+尝试但拒绝时打印 `KEPT` 和 `lift_stop_reason`。内部 `OPT_TRACE` 启用时同样记录
+原因；它不是 `information_schema.OPTIMIZER_TRACE` 的 JSON 接口，公开验收以
+`EXPLAIN` 为准。
+估计行数/耗时仍是关系优化器的估计，不是实际模型次数或推理延迟。
+
+开启后明确减少未匹配行的模型/媒体 demand：这些行不发模型请求、不做对象 GET，
+也不再触发其模型/媒体专属校验错误；留下的行仍严格校验和传播失败。
+这不是把错误变成 false，也不是缓存模型答案。异步 slot/Dispatch 屏障和
+整对象下载行为没有借此改变。
+
+真实私有 SQL 基线已验证：关闭时 `JOIN -> SEMANTIC FILTER -> SCAN`，
+开启时 `SEMANTIC FILTER -> JOIN -> SCAN`，不仅比较计划标签，还检查节点祖先关系、
+模型 payload 和最终 SQL 元组。唯一 HASH JOIN 的左右两侧均为 100 → 10 次；
+较大输入为 1000 → 100 次；MERGE JOIN 为 12 → 2 次；连续两层 JOIN 为
+24 → 4 次且显示两个 crossings。本地/远程 FILE 均为 12 → 3 次模型调用，
+远程对象 GET 同样为 12 → 3 次，被过滤对象零 GET，留下的损坏对象仍报错。
+确定性夹具下最终 SQL 元组完全一致。不能据此宣称真实模型质量不变、
+GPU overlap 已最大化或完整 SemBench 已提速。
+
+实现入口为 [semantic lowering](../../../src/sql/optimizer/ob_select_log_plan.cpp)、
+[逻辑语义阶段](../../../src/sql/optimizer/ob_log_semantic.cpp)
+和 [OPT_PARAM 注册](../../../src/sql/resolver/dml/ob_hint.cpp)。
+专项入口为 [语义放置 SQL/mock 契约](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_lift.py)，
+运行命令和验收证据见 [RUNTIME_TESTS.md](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md#opt-in-semantic-late-evaluation-2026-10-13)。
+
+最终 Debug 构建通过 29/29 项专项 SQL 和 18/18 项 fixture self-test。
+无 ORDER/LIMIT 的 shared FILTER/HAVING 仍在 JOIN 下，不依赖 before-sort
+那次 lowering 才能识别共享；普通 GROUP/DISTINCT 上层的刷新用例也要求
+100 → 10 次请求和完全相同的分组/去重结果，不能用计划标签代替调用数验收。
+既有定向回归另通过 composition 10、MAP/FILTER 9、AGG 5、AI_JOIN 4、
+local FILE 6、实际 PX 4、remote demand/取消 2，共 40 项。没有重跑全部历史
+native/legacy suites。私有进程正常停止并清理资源；本轮未提交代码，
+未连接真实云存储或模型/GPU 服务。

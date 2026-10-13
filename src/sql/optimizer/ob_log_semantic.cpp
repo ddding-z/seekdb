@@ -135,6 +135,22 @@ int LogSemantic::is_my_fixed_expr(const ObRawExpr *expr, bool &fixed)
   return OB_SUCCESS;
 }
 
+int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ObLogicalOperator::get_plan_item_info(plan_text, plan_item))) {
+  } else if (lifted_join_count_ > 0 || nullptr != lift_stop_reason_) {
+    BEGIN_BUF_PRINT;
+    if (OB_FAIL(BUF_PRINTF("semantic_placement=%s, crossed_inner_joins=%ld",
+                          lifted_join_count_ > 0 ? "LIFTED" : "KEPT", lifted_join_count_))) {
+    } else if (nullptr != lift_stop_reason_) {
+      ret = BUF_PRINTF(", lift_stop_reason=%s", lift_stop_reason_);
+    }
+    END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
+  }
+  return ret;
+}
+
 int LogSemantic::est_cost()
 {
   int ret = OB_SUCCESS;

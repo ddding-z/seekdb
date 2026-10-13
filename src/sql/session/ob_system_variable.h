@@ -789,6 +789,11 @@ public:
                                                  const ObBasicSysVar &sys_var,
                                                  const common::ObObj &in_val,
                                                  common::ObObj &out_val);
+  static int check_and_convert_ai_media_remote_root(sql::ObExecContext &ctx,
+                                                    const ObSetVar &set_var,
+                                                    const ObBasicSysVar &sys_var,
+                                                    const common::ObObj &in_val,
+                                                    common::ObObj &out_val);
   static int check_and_convert_charset(sql::ObExecContext &ctx,
                                        const ObSetVar &set_var,
                                        const ObBasicSysVar &sys_var,

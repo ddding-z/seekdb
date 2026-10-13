@@ -10,7 +10,9 @@ namespace sql
 class LogSemantic : public ObLogicalOperator
 {
 public:
-  explicit LogSemantic(ObLogPlan &plan) : ObLogicalOperator(plan), query_task_count_(1) {}
+  explicit LogSemantic(ObLogPlan &plan)
+      : ObLogicalOperator(plan), query_task_count_(1), lifted_join_count_(0),
+        lift_stop_reason_(nullptr) {}
   int add_expression(ObRawExpr *expr);
   int add_shared_expression(ObRawExpr *expr);
   int add_carried_expression(ObRawExpr *expr);
@@ -22,6 +24,9 @@ public:
   const common::ObIArray<ObRawExpr *> &local_exprs() const { return local_exprs_; }
   void set_query_task_count(int64_t count) { query_task_count_ = count; }
   int64_t query_task_count() const { return query_task_count_; }
+  void record_lifted_join() { ++lifted_join_count_; lift_stop_reason_ = nullptr; }
+  void set_lift_stop_reason(const char *reason) { lift_stop_reason_ = reason; }
+  int get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item) override;
   int get_op_exprs(common::ObIArray<ObRawExpr *> &exprs) override;
   int allocate_expr_pre(ObAllocExprContext &ctx) override;
   int allocate_expr_post(ObAllocExprContext &ctx) override;
@@ -38,6 +43,8 @@ private:
   common::ObSEArray<ObRawExpr *, 16> owned_exprs_;
   common::ObSEArray<ObRawExpr *, 16> local_exprs_;
   int64_t query_task_count_;
+  int64_t lifted_join_count_;
+  const char *lift_stop_reason_;
 };
 
 class LogSemanticMap : public LogSemantic
