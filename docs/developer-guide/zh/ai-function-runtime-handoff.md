@@ -759,7 +759,7 @@ WHERE b.enabled = 1 AND AI_FILTER('classifier', a.prompt);
 再执行位于 JOIN 上面的 `SEMANTIC FILTER/MAP`。
 
 首版只交换直接相邻的语义阶段与普通 INNER HASH/MERGE JOIN，支持左右两侧，
-也可逐层越过连续的合法 JOIN。必须用已有 FD、等价集合和常量信息证明
+也可逐层越过连续的合法 JOIN。未开启函数缓存时，必须用已有 FD、等价集合和常量信息证明
 **另一侧**在完整等值键上唯一，保证一条语义输入最多产生一条 JOIN 输出；
 不要求外键证明一定匹配，因为删掉不匹配行就是优化目的。只接受同类型直接列
 的普通 `=`，不接受 null-safe 等值或计算键，不能为了少调用模型破坏 bag 语义。
@@ -789,7 +789,7 @@ FD/排序/分布属性并更新子节点成本；语义阶段对新的 JOIN 输�
 
 开启后明确减少未匹配行的模型/媒体 demand：这些行不发模型请求、不做对象 GET，
 也不再触发其模型/媒体专属校验错误；留下的行仍严格校验和传播失败。
-这不是把错误变成 false，也不是缓存模型答案。异步 slot/Dispatch 屏障和
+单独开启上提不是把错误变成 false，也不是缓存模型答案。异步 slot/Dispatch 屏障和
 整对象下载行为没有借此改变。
 
 真实私有 SQL 基线已验证：关闭时 `JOIN -> SEMANTIC FILTER -> SCAN`，
@@ -815,3 +815,80 @@ GPU overlap 已最大化或完整 SemBench 已提速。
 local FILE 6、实际 PX 4、remote demand/取消 2，共 40 项。没有重跑全部历史
 native/legacy suites。私有进程正常停止并清理资源；本轮未提交代码，
 未连接真实云存储或模型/GPU 服务。
+
+## 13. 查询级函数缓存与缓存支撑的贪心上提（2026-10-13）
+
+```sql
+SELECT /*+ OPT_PARAM('enable_semantic_cache', 'true')
+           OPT_PARAM('enable_semantic_lift', 'true') */
+       a.id, b.category
+FROM semantic_inputs a
+JOIN selected_rows b ON a.id = b.input_id
+WHERE b.enabled = 1 AND AI_FILTER('classifier', a.prompt);
+```
+
+两个开关都默认关闭，值必须为带引号的 true/false（不区分大小写）。只开缓存也
+有效，不要求同时上提。缓存覆盖模型和 options 为静态常量、输入布局可证明为
+纯文字的 MAP/FILTER/AI_JOIN；FILE、未知 JSON 输入布局和动态模型/options
+不使用这版缓存。AI_AGG 不缓存答案，AI_JOIN 不改变放置位置，也不放松其直接
+candidate JOIN 的保护。
+
+同一节点、同一次执行的所有语义算子、批次和本地 PX worker 共享缓存。第一次
+实际 demand 时捕获并冻结该模型参数的模型/端点元数据。调用键包含函数种类、
+模型绑定、生效配置和带长度边界的有序输入；JSON 配置按对象键排序，保留标量
+类型，文本按实际字节比较，不按 SQL collation 合并。JOIN 的 rule/left/right
+以及文字 tuple 的分段边界不会因拼接后相同而混用结果。查询结束释放，不跨
+查询、租户或服务器共用答案；不是跨节点的 exactly-once 协议。
+
+缓存同时保存 PENDING 和完成状态。同键的进行中请求只产生一个 producer，其他
+行订阅同一结果，不额外占网络 wave credit。请求及其 allocator 由查询级
+dispatch 持有，不借用 producer Slot/表达式 frame/worker session；协调者的
+执行上下文持有查询 lease，避免本地 PX producer 完成后丢失缓存。
+完成收集接入现有查询级轮询，即使后续是未缓存的语义/聚合算子也可以推进。
+SQL 行和 JOIN 候选不去重，复制行只是复用同一个答案。
+
+布尔响应使用与未缓存路径共用的严格解析器，校验通过才发布。失败保存为
+FAILED future 并向订阅者传播，不变成 false/空字符串。输入照常在 lookup 前
+校验，未 demand 的守卫分支不创建缓存记录，也不照搬 PLOP 的 NULL 免调用
+约定。开启缓存明确采用“本次执行同一有效调用复用一次采样结果”的契约；
+不保证关闭缓存或另一次真实模型执行的逐字答案一致。
+
+永久键、结果和模型/配置 allocator 页占用上限为
+`ai_pipeline_memory_limit` 的一半，同时计入原有查询预算。活动请求和响应
+buffer 也计入同一预算。缓存不淘汰已完成答案后重新推理；超限明确报资源错误，
+不能静默绕过或等待永久缓存自行释放。需要保存更多不同输入/答案时增大既有
+查询内存限制，或关闭缓存。这版没有磁盘 spill。
+
+上提仍只跨原先允许的普通 INNER HASH/MERGE JOIN；关闭缓存时继续要求另一侧
+完整等值键唯一。开启缓存且阶段内每个语义调用都可可靠缓存时，允许跨会复制行
+的 JOIN。保留其他求值守卫、共享值、依赖模型输出、易变/可能失败的普通配方、
+子查询及 LIMIT/GROUP/DISTINCT 等边界。遍历重复到固定点，能合法上提就上提，
+不比较关系/模型成本，不引入成本 DP、embedding proxy 或行间结果发布。
+缓存配方的字符串比较额外接受 resolver 为常量文字引入的 UTF8MB4→binary
+隐式 collation 转换，仍要求类型不变、长度不缩短，使 `AI_MAP(...) = 'keep'`
+可以移动；不放开显式 CAST、任意比较转换或缓存关闭时的旧配方检查。
+
+`EXPLAIN` 新增 `function_cache=LOCAL_QUERY_TEXT, memoized_calls=N`，表示绑定的
+可缓存调用点数，不是实际推理次数；原 placement/crossings 标记继续保留。
+INFO 查询摘要统计 distinct keys、ready hits、进行中合并、实际提交的不同调用和
+缓存字节，不打印 prompt 或凭据；HTTP 重试单独计数。
+源码入口为 [查询缓存](../../../src/sql/engine/basic/ob_semantic_cache.cpp)、
+[查询共享运行时](../../../src/sql/engine/basic/ob_semantic_runtime.cpp)、
+[异步语义执行器](../../../src/sql/engine/basic/ob_semantic_op.cpp) 和
+[放置规则](../../../src/sql/optimizer/ob_select_log_plan.cpp)。
+专项入口为 [缓存 SQL/mock 契约](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_cache.py)，
+运行方式见 [RUNTIME_TESTS.md](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md#query-function-caching-and-cached-greedy-lifting-2026-10-13)。
+
+最终 Debug 构建及缓存专项 16/16 SQL（无 skip）、27/27 fixture self-test 通过。
+非唯一 HASH/FILTER 为 12→6（仅缓存）→3（缓存+上提）；MAP 比较配方为
+12→3，MERGE 为 12→6→2，连续 JOIN 为 24→4 且两个 crossings，跨算子
+相同 FILTER 为 70→1。SQL bag/值均与确定性基线一致。持有响应时同批/跨批
+重复 MAP 只提交两个不同键；本地 PX 有四个实际 task/thread，但只提交一个
+同键模型请求，未释放响应时取消返回 1317，随后独立恢复通过。quota 返回 4019，
+不重新推理；布尔/provider 错误同键只请求一次且原错误传播。下次查询重新取答案。
+
+原生输入/共用解析器 15/15、旧上提 29/29 和定向 default-off runtime 9、
+composition 10、实际 PX 4 另通过，共 52 项既有 SQL 回归。没有重跑全部历史
+legacy suites，也没有真实模型/云存储/GPU 性能证据。普通 LIMIT drain 不会
+关闭其语义 child，本轮没有为了测试而改动该行为；专项没有独立证明提前关闭
+producer 后 FAILED future 的消费时序。所有私有 DB/mock 均已清理，本轮未提交。

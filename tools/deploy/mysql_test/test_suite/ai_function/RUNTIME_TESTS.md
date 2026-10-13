@@ -4,6 +4,123 @@ Legacy baseline validation (2026-09-29): the Debug build, all **105 SQL contract
 
 For the current architecture, code map, maintenance invariants and handoff checklist, see the [Chinese maintenance handoff](../../../../../docs/developer-guide/zh/ai-function-runtime-handoff.md).
 
+## Query Function Caching and Cached Greedy Lifting (2026-10-13)
+
+```sql
+SELECT /*+ OPT_PARAM('enable_semantic_cache', 'true')
+           OPT_PARAM('enable_semantic_lift', 'true') */
+       a.id, b.category
+FROM semantic_inputs a
+JOIN selected_rows b ON a.id = b.input_id
+WHERE b.enabled = 1 AND AI_FILTER('classifier', a.prompt);
+```
+
+Both options default to false and require quoted, case-insensitive `true` or
+`false`; invalid values explicitly fail. Caching can be enabled without lifting.
+The new placement policy is greedy: move each eligible MAP/FILTER stage as high
+as its existing safety boundaries permit, repeating to a fixed point. It does
+not compare relational and inference costs or implement model-aware join CBO.
+
+With caching disabled, the opposite JOIN input must still be provably unique.
+With both options enabled, that restriction can be relaxed only when **every**
+semantic call in the moved stage supports reliable memoization. The supported
+movement remains directly adjacent ordinary INNER HASH/MERGE JOINs with
+same-type direct equality keys. Existing guards, shared/carried-value,
+model-dependent-consumer, NLJ, GROUP/DISTINCT, LIMIT/Top-N and semantic-subtree
+protections remain. AI_JOIN's position and immediate candidate-pair boundary
+are unchanged. Cached FILE-dependent row-multiplying movement is not supported.
+Cached comparison recipes additionally admit the resolver's implicit
+UTF8MB4-to-UTF8MB4_BIN coercion of constant string literals when the type stays
+unchanged and the length does not shrink. This permits predicates such as
+`AI_MAP(...) = 'keep'` without allowing explicit casts or arbitrary comparison
+conversions. Cache-disabled recipe eligibility is unchanged.
+
+The cache supports demanded TEXT MAP/FILTER/AI_JOIN calls with constant model
+and options and statically known text-only input layouts. It is shared by
+operators, batches and local PX workers for one execution on one server, not
+across executions, tenants or servers. The first demand freezes the model/
+endpoint metadata for that model argument. The effective options are encoded
+with sorted JSON object keys and retained scalar types. Function kinds, model
+arguments, settings, ordered argument roles and tuple-part boundaries remain
+distinct; text equality is byte equality, not SQL collation equality.
+
+Atomic PENDING entries coalesce in-flight duplicates; completed entries retain
+the original result. Only unique misses consume network wave credits. A query-
+owned dispatch copies its request data and holds its own allocator, so a result
+does not borrow a producer Slot, expression frame or worker session. A root
+execution-context lease preserves the cache while local PX producers finish.
+Completion collection is shared with the existing semantic runtime, including
+non-cached semantic/aggregate operators that share its resource budget.
+
+Boolean results pass the same strict parser as uncached execution before
+publication. Failures remain FAILED futures and propagate to subscribers;
+they never become false or empty answers. Arguments still undergo normal
+validation before lookup, and undemanded expressions do not create entries.
+NULL/empty-input and FILE behavior are not replaced by PLOP's NULL convention.
+Caching deliberately means one sampled answer per effective call within this
+execution; it does not prove real-model determinism across separate queries.
+
+Persistent keys, values, model metadata and allocator pages have a non-evicting
+quota of **half `ai_pipeline_memory_limit`**, charged to the same query budget.
+Active dispatches and response buffers also use that budget. Exhaustion raises
+an explicit resource error: there is no LRU recomputation, silent bypass or
+unbounded wait for permanent cache memory to become free. Increase the existing
+query memory limit or disable the cache for workloads whose distinct inputs/
+answers exceed the quota. Disk spill is not part of this version.
+
+EXPLAIN adds `function_cache=LOCAL_QUERY_TEXT, memoized_calls=N`; this is the
+number of eligible bound call sites, not measured inference calls. Cache-only
+AI_JOIN retains `candidate_policy=ALL_SQL_CANDIDATES`. Existing placement
+markers still show real ancestry changes. The INFO execution summary reports
+distinct keys, ready hits, coalesced subscribers, submitted unique calls and
+retained cache bytes without logging prompts or credentials. HTTP retries
+remain separate from logical-call counts.
+
+The [cache/lifting contracts](test_semantic_cache.py) use deterministic,
+loopback-only models and private database instances:
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_cache.py --self-test
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_cache.py --list-cases
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_cache.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+```
+
+The existing default-off [lifting contracts](test_semantic_lift.py) and native
+[ordered-input contracts](../../../../../unittest/sql/engine/test_semantic_input.cpp)
+also cover preserved demand, legacy text concatenation, and the shared strict
+Boolean parser. Embedding proxies, AI_JOIN relocation, AI_AGG answer caching,
+row-level publication and cross-server cache coordination are out of scope.
+
+Validation on the final Debug binary: **16/16 cache SQL contracts** passed
+without skips, with **27/27 fixture self-tests**. Measured deterministic cases:
+
+| Shape | Original | Cache only | Cache + lift |
+|---|---:|---:|---:|
+| Nonunique HASH/FILTER | 12 requests | 6 requests | 3 requests |
+| MAP comparison recipe | 12 requests | — | 3 requests |
+| MERGE/FILTER | 12 requests | 6 requests | 2 requests |
+| Two consecutive eligible joins | 24 requests | — | 4 requests, two crossings |
+| Cross-operator FILTER reuse | 70 requests | 1 request | — |
+
+Held cross-batch MAP duplicates issued exactly two requests for two distinct
+keys before any reply. Different models/options/function kinds remained
+separate. A local PX query used four actual tasks/threads but one shared model
+request; cancellation returned 1317 before the held response was released,
+then independent recovery succeeded. Boolean/provider failures coalesced to
+one request and propagated their original errors. Answers were uniform within
+one cached query, refreshed in the next execution. The half-budget quota
+contract returned 4019 without recomputation and recovered in a fresh query.
+AI_JOIN role/tuple-boundary and candidate-protection contracts passed unchanged.
+
+Current additional gates passed: native input/parser **15/15**, existing
+conservative lifting **29/29**, and targeted default-off runtime **9**,
+composition **10**, local PX **4**, for **52** existing SQL regressions.
+These are not all historical/legacy suites or a real-model/cloud/GPU benchmark.
+The suite does not independently prove FAILED-future delivery after an early
+producer close; ordinary LIMIT drain does not close its semantic child. No
+early-detach behavior was added solely to manufacture that scenario.
+
 ## Opt-in Semantic Late Evaluation (2026-10-13)
 
 ```sql
@@ -23,7 +140,7 @@ placement pass operates on the plan already selected by ordinary CBO. Other
 candidate plans are discarded before mutation because their operator subtrees
 can be shared. The pass can move a directly adjacent MAP/FILTER stage
 above an ordinary INNER HASH/MERGE JOIN, from either operand, and repeat over
-consecutive eligible joins. The **opposite** input must be provably unique on
+consecutive eligible joins. Without function caching, the **opposite** input must be provably unique on
 the complete ordinary `=` column keys using existing FD/equality/constant
 metadata. Computed/differently typed keys and null-safe equality are rejected.
 No foreign-key existence assumption is required: eliminating unmatched rows
@@ -62,7 +179,7 @@ Opting in deliberately suppresses **model/media demand for unmatched rows**.
 Those rows make no provider request or object GET; their model/media-specific
 validation failures are therefore not raised. Surviving rows retain strict
 validation and error propagation. This is not an error-to-false fallback,
-model-result caching, fetch streaming or removal of asynchronous batch barriers.
+model-result caching by itself, fetch streaming or removal of asynchronous batch barriers.
 
 The measured private baselines require changed operator ancestry and placement
 markers as well as exact deterministic SQL tuples and request payload counts:

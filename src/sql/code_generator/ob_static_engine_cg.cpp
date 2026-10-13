@@ -1060,9 +1060,17 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
 {
   int ret = OB_SUCCESS;
   ObSEArray<ObRawExpr *, 16> local_exprs;
+  ObSEArray<ObRawExpr *, 8> memoized_exprs;
   for (int64_t index = 0; OB_SUCC(ret) && index < op.local_exprs().count(); ++index) {
     if (!op.is_child_output_exprs(op.local_exprs().at(index))) {
       ret = local_exprs.push_back(op.local_exprs().at(index));
+    }
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && op.function_cache_enabled() &&
+       index < op.semantic_exprs().count(); ++index) {
+    ObRawExpr *expr = op.semantic_exprs().at(index);
+    if (nullptr != expr && SemanticExprUtils::supports_function_cache(*expr)) {
+      ret = memoized_exprs.push_back(expr);
     }
   }
   spec.query_task_count_ = op.query_task_count();
@@ -1076,6 +1084,7 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
   } else if (OB_FAIL(generate_rt_exprs(local_exprs, spec.local_exprs_))) {
   } else if (OB_FAIL(generate_rt_exprs(op.shared_exprs(), spec.shared_exprs_))) {
   } else if (OB_FAIL(generate_rt_exprs(op.carried_exprs(), spec.carried_exprs_))) {
+  } else if (OB_FAIL(generate_rt_exprs(memoized_exprs, spec.memoized_exprs_))) {
   } else if (OB_FAIL(mark_expr_self_produced(op.owned_exprs()))) {
   }
   return ret;

@@ -22,6 +22,7 @@
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_input.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -171,6 +172,59 @@ void test_input_byte_boundary()
           "failed append must not change input");
 }
 
+void test_text_rendering()
+{
+  ObArenaAllocator allocator;
+  for (const std::vector<const char *> &parts : {
+      std::vector<const char *>{"ab", "c"}, std::vector<const char *>{"a", "bc"},
+      std::vector<const char *>{"", "abc", ""}, std::vector<const char *>{"abc"}}) {
+    SemanticInput input;
+    for (const char *part : parts) {
+      require(OB_SUCCESS == input.append(allocator, SemanticInputPart::TEXT, ObString(part)),
+              "append text rendering fixture");
+    }
+    ObString rendered;
+    require(OB_SUCCESS == input.render_text(allocator, rendered), "render native text input");
+    require(rendered == "abc", "text rendering must preserve legacy concatenation without separators");
+  }
+}
+
+void test_text_rendering_rejects_media()
+{
+  ObArenaAllocator allocator;
+  SemanticInput empty;
+  ObString rendered;
+  require(OB_INVALID_ARGUMENT == empty.render_text(allocator, rendered),
+          "empty native input has no renderable text");
+  SemanticInput media;
+  require(OB_SUCCESS == media.append(allocator, SemanticInputPart::FILE,
+      ObString("file:///controlled/zebra.png")), "append media rendering fixture");
+  require(OB_INVALID_ARGUMENT == media.render_text(allocator, rendered),
+          "text renderer must not stringify native FILE inputs");
+}
+
+void test_shared_boolean_parser()
+{
+  for (const ObItemType type : {T_FUN_SYS_AI_FILTER, T_FUN_SYS_AI_JOIN}) {
+    for (const bool expected : {false, true}) {
+      ObArenaAllocator allocator;
+      bool value = !expected;
+      require(OB_SUCCESS == SemanticExprUtils::parse_boolean_result(
+          type, allocator, ObString(expected ? "{\"value\":true}" : "{\"value\":false}"), value),
+          "shared native/cached Boolean parser accepts exact Boolean schema");
+      require(value == expected, "shared Boolean parser preserves false and true");
+    }
+    for (const char *fixture : {"", "true", "null", "{\"value\":1}", "{\"value\":\"true\"}",
+        "{\"value\":true,\"extra\":0}", "{\"value\":true,\"value\":false}", "{"}) {
+      ObArenaAllocator allocator;
+      bool value = true;
+      require(OB_INVALID_DATA == SemanticExprUtils::parse_boolean_result(
+          type, allocator, ObString(fixture), value),
+          "shared native/cached parser rejects malformed or non-Boolean results");
+    }
+  }
+}
+
 void test_image_body()
 {
   ObArenaAllocator allocator;
@@ -313,6 +367,9 @@ const TestCase TESTS[] = {
   {"part_boundary", test_part_boundary},
   {"input_ownership", test_input_ownership},
   {"input_byte_boundary", test_input_byte_boundary},
+  {"text_rendering", test_text_rendering},
+  {"text_rendering_rejects_media", test_text_rendering_rejects_media},
+  {"shared_boolean_parser", test_shared_boolean_parser},
   {"image_body", test_image_body},
   {"audio_body", test_audio_body},
   {"join_roles", test_join_roles},

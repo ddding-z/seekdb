@@ -139,12 +139,21 @@ int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_ite
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(ObLogicalOperator::get_plan_item_info(plan_text, plan_item))) {
-  } else if (lifted_join_count_ > 0 || nullptr != lift_stop_reason_) {
+  } else if (lifted_join_count_ > 0 || nullptr != lift_stop_reason_ || function_cache_enabled_) {
     BEGIN_BUF_PRINT;
-    if (OB_FAIL(BUF_PRINTF("semantic_placement=%s, crossed_inner_joins=%ld",
+    const bool placement = lifted_join_count_ > 0 || nullptr != lift_stop_reason_;
+    if (placement && OB_FAIL(BUF_PRINTF("semantic_placement=%s, crossed_inner_joins=%ld",
                           lifted_join_count_ > 0 ? "LIFTED" : "KEPT", lifted_join_count_))) {
     } else if (nullptr != lift_stop_reason_) {
       ret = BUF_PRINTF(", lift_stop_reason=%s", lift_stop_reason_);
+    }
+    if (OB_SUCC(ret) && function_cache_enabled_) {
+      int64_t memoized = 0;
+      for (const ObRawExpr *expr : semantic_exprs_) {
+        memoized += nullptr != expr && SemanticExprUtils::supports_function_cache(*expr);
+      }
+      ret = BUF_PRINTF("%sfunction_cache=LOCAL_QUERY_TEXT, memoized_calls=%ld",
+                       placement ? ", " : "", memoized);
     }
     END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
   }
@@ -225,6 +234,14 @@ int LogSemanticJoin::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan
     } else {
       const ObIArray<ObRawExpr *> &pair_predicates = join_exprs_;
       EXPLAIN_PRINT_EXPRS(pair_predicates, type);
+    }
+    if (OB_SUCC(ret) && function_cache_enabled()) {
+      int64_t memoized = 0;
+      for (int64_t index = 0; index < semantic_exprs().count(); ++index) {
+        const ObRawExpr *expr = semantic_exprs().at(index);
+        memoized += nullptr != expr && SemanticExprUtils::supports_function_cache(*expr);
+      }
+      ret = BUF_PRINTF(", function_cache=LOCAL_QUERY_TEXT, memoized_calls=%ld", memoized);
     }
     END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
   }

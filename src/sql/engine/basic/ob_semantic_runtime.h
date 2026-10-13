@@ -13,6 +13,7 @@ namespace oceanbase
 namespace sql
 {
 class ObExecContext;
+class SemanticFunctionCache;
 
 class SemanticQueryBudget
 {
@@ -32,6 +33,10 @@ public:
   int64_t task_limit() const { return task_limit_; }
   int64_t *memory_counter() { return &memory_used_; }
   uint64_t execution_id() const { return execution_id_; }
+  int function_cache(int64_t deadline, SemanticFunctionCache *&cache);
+  int poll_function_cache(bool &progress);
+  bool function_cache_ready() const;
+  bool function_cache_pending() const;
 private:
   uint64_t execution_id_;
   int64_t memory_limit_;
@@ -39,6 +44,8 @@ private:
   int64_t memory_used_;
   std::atomic<int64_t> active_tasks_;
   std::atomic<int> failure_;
+  mutable std::mutex cache_mutex_;
+  std::unique_ptr<SemanticFunctionCache> function_cache_;
 };
 
 class SemanticExecutionState
@@ -59,6 +66,7 @@ public:
   const SemanticQueryBudget &budget() const { return *budget_; }
   const std::shared_ptr<SemanticQueryBudget> &budget_handle() const { return budget_; }
   int media_runtime(std::shared_ptr<class SemanticMediaRuntime> &runtime);
+  int function_cache(SemanticFunctionCache *&cache);
 private:
   struct Waiter
   {

@@ -12,7 +12,7 @@ class LogSemantic : public ObLogicalOperator
 public:
   explicit LogSemantic(ObLogPlan &plan)
       : ObLogicalOperator(plan), query_task_count_(1), lifted_join_count_(0),
-        lift_stop_reason_(nullptr) {}
+        lift_stop_reason_(nullptr), function_cache_enabled_(false) {}
   int add_expression(ObRawExpr *expr);
   int add_shared_expression(ObRawExpr *expr);
   int add_carried_expression(ObRawExpr *expr);
@@ -24,6 +24,8 @@ public:
   const common::ObIArray<ObRawExpr *> &local_exprs() const { return local_exprs_; }
   void set_query_task_count(int64_t count) { query_task_count_ = count; }
   int64_t query_task_count() const { return query_task_count_; }
+  void set_function_cache_enabled(bool enabled) { function_cache_enabled_ = enabled; }
+  bool function_cache_enabled() const { return function_cache_enabled_; }
   void record_lifted_join() { ++lifted_join_count_; lift_stop_reason_ = nullptr; }
   void set_lift_stop_reason(const char *reason) { lift_stop_reason_ = reason; }
   int get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item) override;
@@ -45,6 +47,7 @@ private:
   int64_t query_task_count_;
   int64_t lifted_join_count_;
   const char *lift_stop_reason_;
+  bool function_cache_enabled_;
 };
 
 class LogSemanticMap : public LogSemantic

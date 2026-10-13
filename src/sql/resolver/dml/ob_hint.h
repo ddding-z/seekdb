@@ -152,6 +152,7 @@ struct ObOptParamHint
     DEF(ENABLE_GROUPING_SETS_EXPANSION,)            \
     DEF(APPROX_COUNT_DISTINCT_PRECISION,)           \
     DEF(ENABLE_SEMANTIC_LIFT,)                      \
+    DEF(ENABLE_SEMANTIC_CACHE,)                     \
 
 
   DECLARE_ENUM(OptParamType, opt_param, OPT_PARAM_TYPE_DEF, static);

@@ -5040,7 +5040,8 @@ bool can_project_semantic_before_sort(const ObSelectStmt &stmt)
 }
 
 int semantic_lift_expression_safe(ObRawExpr *expr, bool semantic_recipe,
-                                  bool semantic_input, bool &safe)
+                                  bool semantic_input, bool &safe,
+                                  bool cached_recipe = false)
 {
   int ret = OB_SUCCESS;
   safe = false;
@@ -5060,17 +5061,19 @@ int semantic_lift_expression_safe(ObRawExpr *expr, bool semantic_recipe,
     } else {
       safe = ObOptimizerUtil::is_lossless_type_conv(child->get_result_type(),
                                                     expr->get_result_type());
-      if (!safe && semantic_input && ob_is_string_type(child->get_data_type()) &&
+      if (!safe && (semantic_input ||
+                   (cached_recipe && semantic_recipe && child->is_const_raw_expr())) &&
+          ob_is_string_type(child->get_data_type()) &&
           child->get_data_type() == expr->get_data_type() &&
           child->get_result_type().get_charset_type() == CHARSET_UTF8MB4 &&
           expr->get_collation_type() == CS_TYPE_UTF8MB4_BIN &&
           child->get_accuracy().get_length() <= expr->get_accuracy().get_length()) {
-        // Model inputs get a binary collation without changing their UTF-8 bytes.
+        // Model inputs and cached comparison literals keep their UTF-8 bytes under this coercion.
         safe = true;
       }
       if (safe) {
         ret = SMART_CALL(semantic_lift_expression_safe(
-            child, semantic_recipe, semantic_input, safe));
+            child, semantic_recipe, semantic_input, safe, cached_recipe));
       }
     }
   } else if (semantic_recipe &&
@@ -5081,14 +5084,14 @@ int semantic_lift_expression_safe(ObRawExpr *expr, bool semantic_recipe,
       LOG_WARN("invalid semantic recipe while checking placement", K(ret));
     } else {
       ret = SMART_CALL(semantic_lift_expression_safe(
-          expr->get_param_expr(1), true, true, safe));
+          expr->get_param_expr(1), true, true, safe, cached_recipe));
     }
   } else if (semantic_input && expr->get_expr_type() == T_FUN_SYS_TO_FILE) {
     if (expr->get_param_count() < 1) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid FILE recipe while checking placement", K(ret));
     } else if (OB_FAIL(SMART_CALL(semantic_lift_expression_safe(
-        expr->get_param_expr(0), false, false, safe)))) {
+        expr->get_param_expr(0), false, false, safe, cached_recipe)))) {
     } else {
       for (int64_t index = 1; safe && index < expr->get_param_count(); ++index) {
         safe = nullptr != expr->get_param_expr(index) &&
@@ -5126,7 +5129,7 @@ int semantic_lift_expression_safe(ObRawExpr *expr, bool semantic_recipe,
     for (int64_t index = 0; OB_SUCC(ret) && safe &&
          index < expr->get_param_count(); ++index) {
       ret = SMART_CALL(semantic_lift_expression_safe(
-          expr->get_param_expr(index), semantic_recipe, semantic_input, safe));
+          expr->get_param_expr(index), semantic_recipe, semantic_input, safe, cached_recipe));
     }
     if (OB_SUCC(ret) && !safe) {
       OPT_TRACE("semantic_lift unsafe expression", "expression_type", get_type_name(type));
@@ -5201,7 +5204,8 @@ int semantic_lift_candidate(ObLogJoin &join, int64_t side, LogSemantic &stage,
     for (int64_t index = 0; OB_SUCC(ret) && nullptr == reason &&
          index < stage.expressions().count(); ++index) {
       ObRawExpr *expr = stage.expressions().at(index);
-      if (OB_FAIL(semantic_lift_expression_safe(expr, true, false, safe))) {
+      if (OB_FAIL(semantic_lift_expression_safe(
+          expr, true, false, safe, stage.function_cache_enabled()))) {
       } else if (!safe || !expr->get_relation_ids().is_subset(source->get_table_set())) {
         reason = "guarded_or_unsafe_recipe";
       }
@@ -5254,7 +5258,16 @@ int semantic_lift_candidate(ObLogJoin &join, int64_t side, LogSemantic &stage,
           opposite->get_fd_item_set(), opposite->get_output_equal_sets(),
           opposite->get_output_const_exprs(), unique))) {
       } else if (!unique) {
-        reason = "opposite_keys_not_unique";
+        if (!stage.function_cache_enabled()) {
+          reason = "opposite_keys_not_unique";
+        } else {
+          for (int64_t index = 0; nullptr == reason && index < stage.semantic_exprs().count(); ++index) {
+            const ObRawExpr *call = stage.semantic_exprs().at(index);
+            if (nullptr == call || !SemanticExprUtils::supports_function_cache(*call)) {
+              reason = "unmemoized_row_multiplication";
+            }
+          }
+        }
       }
     }
   }
@@ -5427,6 +5440,11 @@ public:
   int assign_query_limits()
   {
     int ret = OB_SUCCESS;
+    bool cache_enabled = false;
+    if (OB_FAIL(plan_.get_optimizer_context().get_global_hint().opt_params_.get_bool_opt_param(
+        ObOptParamHint::ENABLE_SEMANTIC_CACHE, cache_enabled))) {
+      LOG_WARN("failed to read semantic function cache option", K(ret));
+    }
     ObSEArray<ObRawExpr *, 16> calls;
     for (LogSemantic *stage : stages_) {
       if (OB_SUCC(ret)) {
@@ -5443,6 +5461,7 @@ public:
     }
     for (LogSemantic *stage : stages_) {
       stage->set_query_task_count(calls.count());
+      stage->set_function_cache_enabled(cache_enabled);
     }
     for (ObLogGroupBy *group : aggregate_stages_) {
       group->set_semantic_query_task_count(calls.count());
@@ -5713,8 +5732,13 @@ int ObSelectLogPlan::place_semantic_stages()
     bool changed = false;
     if (OB_FAIL(selected.push_back(CandidatePlan(root)))) {
     } else if (OB_FAIL(init_candidate_plans(selected))) {
-    } else if (OB_FAIL(placement.place(root, false, changed))) {
     } else {
+      do {
+        changed = false;
+        ret = placement.place(root, false, changed);
+      } while (OB_SUCC(ret) && changed);
+    }
+    if (OB_SUCC(ret)) {
       candidates_.candidate_plans_.at(0).plan_tree_ = root;
       if (is_final_root_plan()) {
         set_plan_root(root);

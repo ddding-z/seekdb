@@ -1,5 +1,6 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/basic/ob_semantic_op.h"
+#include "sql/engine/basic/ob_semantic_cache.h"
 #include "sql/engine/basic/ob_semantic_media.h"
 #include "common/object/file_ref.h"
 #include "query/ai/ob_ai_endpoint_resolver.h"
@@ -53,7 +54,8 @@ SemanticRequestMemory request_memory(const SemanticInput &input)
 }
 
 OB_SERIALIZE_MEMBER((SemanticSpec, ObOpSpec), expressions_, semantic_exprs_, owned_exprs_,
-                    local_exprs_, shared_exprs_, carried_exprs_, query_task_count_, filter_expr_count_);
+                    local_exprs_, shared_exprs_, carried_exprs_, query_task_count_, filter_expr_count_,
+                    memoized_exprs_);
 OB_SERIALIZE_MEMBER((SemanticMapSpec, SemanticSpec));
 OB_SERIALIZE_MEMBER((SemanticFilterSpec, SemanticSpec));
 OB_SERIALIZE_MEMBER((SemanticJoinSpec, SemanticSpec), join_exprs_);
@@ -111,11 +113,13 @@ struct SemanticOp::Dispatch
 
 struct SemanticOp::Task
 {
-  enum RowState : uint8_t { UNREQUESTED, QUEUED, IN_FLIGHT, COMPLETE };
-  Task(const ObExpr *expr, int64_t max_parallel)
+  enum RowState : uint8_t { UNREQUESTED, QUEUED, IN_FLIGHT, COMPLETE, CACHE_WAIT };
+  Task(const ObExpr *expr, int64_t max_parallel, bool memoized)
       : expression_(expr), request_arena_("SemanticReq"), request_allocator_(request_arena_),
         dispatches_(nullptr), states_(nullptr), results_(nullptr), config_(nullptr), info_(nullptr),
-        input_bytes_(0), in_flight_rows_(0), max_parallel_(max_parallel), credit_(false) {}
+        input_bytes_(0), in_flight_rows_(0), max_parallel_(max_parallel), credit_(false),
+        memoized_(memoized), cache_keys_(nullptr), cache_prompts_(nullptr),
+        cache_handles_(nullptr), cache_binding_id_(0) {}
   ~Task()
   {
     while (nullptr != dispatches_) {
@@ -126,6 +130,9 @@ struct SemanticOp::Task
     }
     for (SemanticInput *input : inputs_) {
       input->~SemanticInput();
+    }
+    for (int64_t row = 0; nullptr != cache_handles_ && row < max_parallel_; ++row) {
+      cache_handles_[row].~shared_ptr();
     }
   }
   const ObExpr *expression_;
@@ -145,6 +152,11 @@ struct SemanticOp::Task
   int64_t in_flight_rows_;
   int64_t max_parallel_;
   bool credit_;
+  bool memoized_;
+  ObString *cache_keys_;
+  ObString *cache_prompts_;
+  SemanticFunctionCache::Handle *cache_handles_;
+  uint64_t cache_binding_id_;
 };
 
 struct SemanticOp::Slot
@@ -168,7 +180,8 @@ struct SemanticOp::Slot
 };
 
 SemanticOp::SemanticOp(ObExecContext &ctx, const ObOpSpec &spec, ObOpInput *input)
-    : ObOperator(ctx, spec, input), slots_(nullptr), slot_count_(0), head_(0), count_(0),
+    : ObOperator(ctx, spec, input), function_cache_(nullptr),
+      slots_(nullptr), slot_count_(0), head_(0), count_(0),
       input_end_(false), pending_input_(nullptr), waiting_memory_(0),
       evaluating_slot_(nullptr), registered_(false), first_prepare_logged_(false)
 {
@@ -228,6 +241,8 @@ int SemanticOp::inner_open()
     LOG_WARN("invalid semantic query limits", K(ret), K(slot_count_), K(memory_limit));
   } else if (OB_FAIL(SemanticExecutionState::acquire(ctx_, memory_limit,
                          slot_count_ * spec.query_task_count_, execution_))) {
+  } else if (!spec.memoized_exprs_.empty() &&
+             OB_FAIL(execution_->function_cache(function_cache_))) {
   } else if (OB_FAIL(child_frame_.init(child_->get_spec().output_, eval_ctx_,
                                       &ctx_.get_allocator()))) {
   } else if (OB_ISNULL(slots_ = static_cast<Slot **>(
@@ -287,6 +302,11 @@ void SemanticOp::reset_task(Slot &slot, Task &task)
     input->~SemanticInput();
   }
   task.inputs_.reset();
+  if (nullptr != task.cache_handles_) {
+    for (int64_t row : task.rows_) {
+      task.cache_handles_[row].reset();
+    }
+  }
   task.media_.reset();
   task.request_allocator_.reset();
   task.rows_.reset();
@@ -346,7 +366,12 @@ int SemanticOp::inner_close()
     execution_->unregister_operator(this);
     registered_ = false;
   }
+  if (function_cache_ && execution_) {
+    LOG_DEBUG("semantic cached producer closed", "execution_id", execution_->budget().execution_id(),
+              "operator_id", spec_.id_, "operator_type", spec_.type_);
+  }
   execution_.reset();
+  function_cache_ = nullptr;
   return ret;
 }
 
@@ -376,6 +401,7 @@ void SemanticOp::destroy()
     registered_ = false;
   }
   execution_.reset();
+  function_cache_ = nullptr;
   for (int64_t index = 0; nullptr != slots_ && index < slot_count_; ++index) {
     OB_DELETEx(Slot, &ctx_.get_allocator(), slots_[index]);
   }
@@ -399,10 +425,12 @@ int64_t SemanticOp::slot_metadata_bytes(int64_t size) const
   const int64_t columns = child_->get_spec().output_.count();
   const int64_t expressions = semantic_spec().expressions_.count();
   const int64_t tasks = semantic_spec().semantic_exprs_.count();
+  const int64_t memoized = semantic_spec().memoized_exprs_.count();
   return size * (columns * sizeof(ObDatum) +
       expressions * (sizeof(ObDatum) + sizeof(uint8_t)) + sizeof(int64_t) +
       tasks * (sizeof(uint8_t) + sizeof(ObString))) +
-      tasks * (sizeof(Task) + sizeof(Task *));
+      tasks * (sizeof(Task) + sizeof(Task *)) +
+      size * memoized * (2 * sizeof(ObString) + sizeof(SemanticFunctionCache::Handle));
 }
 
 int SemanticOp::allocate_slot(Slot &slot, int64_t size)
@@ -429,7 +457,9 @@ int SemanticOp::allocate_slot(Slot &slot, int64_t size)
       new (&slot.values_[index]) ObDatum();
     }
     for (int64_t index = 0; OB_SUCC(ret) && index < tasks; ++index) {
-      auto *task = OB_NEWx(Task, &allocator, semantic_spec().semantic_exprs_.at(index), size);
+      const ObExpr *expr = semantic_spec().semantic_exprs_.at(index);
+      auto *task = OB_NEWx(Task, &allocator, expr, size,
+          contains_expression(semantic_spec().memoized_exprs_, expr));
       if (OB_ISNULL(task)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else {
@@ -442,6 +472,27 @@ int SemanticOp::allocate_slot(Slot &slot, int64_t size)
           MEMSET(task->states_, Task::UNREQUESTED, size);
           for (int64_t row = 0; row < size; ++row) {
             new (&task->results_[row]) ObString();
+          }
+          if (task->memoized_) {
+            task->cache_keys_ = static_cast<ObString *>(allocator.alloc(size * sizeof(ObString)));
+            task->cache_prompts_ = static_cast<ObString *>(allocator.alloc(size * sizeof(ObString)));
+            if (nullptr == task->cache_keys_ || nullptr == task->cache_prompts_) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else {
+              for (int64_t row = 0; row < size; ++row) {
+                new (&task->cache_keys_[row]) ObString();
+                new (&task->cache_prompts_[row]) ObString();
+              }
+              task->cache_handles_ = static_cast<SemanticFunctionCache::Handle *>(
+                  allocator.alloc(size * sizeof(SemanticFunctionCache::Handle)));
+              if (nullptr == task->cache_handles_) {
+                ret = OB_ALLOCATE_MEMORY_FAILED;
+              } else {
+                for (int64_t row = 0; row < size; ++row) {
+                  new (&task->cache_handles_[row]) SemanticFunctionCache::Handle();
+                }
+              }
+            }
           }
         }
       }
@@ -701,17 +752,21 @@ int SemanticOp::evaluate(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &result)
       ObEvalCtx::TempAllocGuard input_guard(ctx);
       MultimodeAlloctor input_allocator(input_guard.get_allocator());
       ObString model;
+      ObString cache_key;
       SemanticInput input;
       ObJsonObject *config = nullptr;
       const bool first_request = task->rows_.empty();
       int64_t bytes = 0;
       if (OB_FAIL(SemanticExprUtils::prepare_request_input(expr, ctx, input_allocator,
                                                           model, input, config, first_request))) {
+      } else if (task->memoized_ && OB_FAIL(SemanticExprUtils::prepare_cache_key(
+          expr, ctx, input_allocator, cache_key))) {
       } else {
         const uint64_t config_bytes = nullptr == config ? 0 : config->get_serialize_size();
         bytes = input.owned_bytes_ + sizeof(SemanticInput) +
                 input.parts_.count() * sizeof(SemanticInputPart) +
-                (first_request ? model.length() : 0);
+                (first_request ? model.length() : 0) + cache_key.length() +
+                (task->memoized_ && input.parts_.count() > 1 ? input.owned_bytes_ : 0);
         if (bytes > ObAIFuncClient::MAX_BATCH_BYTES ||
             config_bytes > static_cast<uint64_t>(ObAIFuncClient::MAX_BATCH_BYTES - bytes)) {
           ret = OB_SIZE_OVERFLOW;
@@ -734,6 +789,12 @@ int SemanticOp::evaluate(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &result)
         for (int64_t part = 0; OB_SUCC(ret) && part < input.parts_.count(); ++part) {
           const auto &value = input.parts_.at(part);
           ret = owned_input->append(task->request_allocator_, value.kind_, value.value_);
+        }
+        if (OB_SUCC(ret) && task->memoized_) {
+          if (OB_FAIL(ob_write_string(task->request_allocator_, cache_key, task->cache_keys_[row]))) {
+          } else {
+            ret = owned_input->render_text(task->request_allocator_, task->cache_prompts_[row]);
+          }
         }
         if (OB_FAIL(ret)) {
         } else if (first_request &&
@@ -913,7 +974,8 @@ bool SemanticOp::has_pending_requests() const
     }
   }
   // A held wave credit without a dispatch cannot free request memory by itself.
-  return pending || execution_->budget().active_tasks() > idle_credits;
+  return pending || execution_->budget().function_cache_pending() ||
+      execution_->budget().active_tasks() > idle_credits;
 }
 
 int SemanticOp::build_request_parts(Task &task, Dispatch &dispatch, int64_t position)
@@ -922,16 +984,8 @@ int SemanticOp::build_request_parts(Task &task, Dispatch &dispatch, int64_t posi
   SemanticInput &input = *task.inputs_.at(position);
   ObString prompt;
   ObJsonArray *parts = nullptr;
-  if (!input.has_files_ && input.parts_.count() == 1) {
-    prompt = input.parts_.at(0).value_;
-  } else if (!input.has_files_) {
-    ObJsonBuffer buffer(&dispatch.allocator_);
-    for (int64_t index = 0; OB_SUCC(ret) && index < input.parts_.count(); ++index) {
-      const auto &part = input.parts_.at(index);
-      ret = buffer.append(part.value_.ptr(), part.value_.length());
-    }
-    if (OB_SUCC(ret) && OB_FAIL(ob_write_string(dispatch.allocator_, buffer.string(), prompt))) {
-    }
+  if (!input.has_files_) {
+    ret = input.render_text(dispatch.allocator_, prompt);
   } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(dispatch.allocator_, parts))) {
   } else {
     for (int64_t index = 0; OB_SUCC(ret) && index < input.parts_.count(); ++index) {
@@ -980,12 +1034,50 @@ int SemanticOp::build_request_parts(Task &task, Dispatch &dispatch, int64_t posi
   return ret;
 }
 
+int SemanticOp::submit_cached_tasks(Slot &slot, Task &task, bool &progress)
+{
+  UNUSED(slot);
+  int ret = OB_SUCCESS;
+  ObArray<int64_t> rows;
+  ObArray<ObString> keys;
+  ObArray<ObString> prompts;
+  std::vector<SemanticFunctionCache::Handle> handles;
+  for (int64_t row : task.rows_) {
+    if (OB_FAIL(ret) || task.states_[row] != Task::QUEUED) {
+    } else if (OB_FAIL(rows.push_back(row))) {
+    } else if (OB_FAIL(keys.push_back(task.cache_keys_[row]))) {
+    } else {
+      ret = prompts.push_back(task.cache_prompts_[row]);
+    }
+  }
+  if (OB_FAIL(ret) || rows.empty()) {
+  } else if (nullptr == function_cache_) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(function_cache_->submit(task.expression_->type_, task.model_, task.config_,
+      keys, prompts, task.max_parallel_, task.cache_binding_id_, handles, progress))) {
+  } else {
+    for (int64_t index = 0; index < rows.count(); ++index) {
+      if (handles.at(index)) {
+        const int64_t row = rows.at(index);
+        task.cache_handles_[row] = handles.at(index);
+        task.states_[row] = Task::CACHE_WAIT;
+        ++task.in_flight_rows_;
+        progress = true;
+      }
+    }
+  }
+  return ret;
+}
+
 int SemanticOp::submit_tasks(Slot &slot, bool &progress)
 {
   int ret = OB_SUCCESS;
   for (int64_t index = 0; OB_SUCC(ret) && index < slot.task_count_; ++index) {
     Task &task = *slot.tasks_[index];
     if (task.rows_.empty()) {
+      continue;
+    } else if (task.memoized_) {
+      ret = submit_cached_tasks(slot, task, progress);
       continue;
     } else if (OB_FAIL(advance_media(task, progress))) {
       break;
@@ -1100,6 +1192,32 @@ int SemanticOp::poll_tasks(Slot &slot, bool &progress)
   int ret = OB_SUCCESS;
   for (int64_t index = 0; OB_SUCC(ret) && index < slot.task_count_; ++index) {
     Task &task = *slot.tasks_[index];
+    if (task.memoized_) {
+      bool complete = !task.rows_.empty();
+      for (int64_t row : task.rows_) {
+        if (OB_FAIL(ret)) {
+        } else if (task.states_[row] == Task::CACHE_WAIT) {
+          const auto &entry = task.cache_handles_[row];
+          if (!entry) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (entry->state() == SemanticFunctionCache::Entry::FAILED) {
+            ret = entry->error();
+            LOG_WARN("memoized semantic call failed", K(ret), K(row));
+          } else if (entry->state() == SemanticFunctionCache::Entry::COMPLETE) {
+            task.results_[row] = entry->result();
+            task.states_[row] = Task::COMPLETE;
+            --task.in_flight_rows_;
+            slot.needs_prepare_ = true;
+            progress = true;
+          }
+        }
+        complete = complete && task.states_[row] == Task::COMPLETE;
+      }
+      if (OB_SUCC(ret) && complete) {
+        reset_task(slot, task);
+      }
+      continue;
+    }
     Dispatch **link = &task.dispatches_;
     while (OB_SUCC(ret) && nullptr != *link) {
       Dispatch &dispatch = **link;
@@ -1265,7 +1383,19 @@ bool SemanticOp::can_resume(const void *data)
       }
       if (!ready && !task.rows_.empty()) {
         for (int64_t position = 0; !ready && position < task.rows_.count(); ++position) {
-          if (task.states_[task.rows_.at(position)] != Task::QUEUED) {
+          const int64_t row = task.rows_.at(position);
+          if (task.memoized_) {
+            if (task.states_[row] == Task::CACHE_WAIT) {
+              ready = task.cache_handles_[row] &&
+                  task.cache_handles_[row]->state() != SemanticFunctionCache::Entry::PENDING;
+            } else if (task.states_[row] == Task::QUEUED) {
+              const int64_t config_bytes = nullptr == task.config_ ? 0 : task.config_->get_serialize_size();
+              ready = operation.function_cache_ && operation.function_cache_->can_submit(
+                  task.cache_binding_id_, task.cache_keys_[row], task.cache_prompts_[row], config_bytes);
+            }
+            continue;
+          }
+          if (task.states_[row] != Task::QUEUED) {
             continue;
           }
           bool media_ready = true;

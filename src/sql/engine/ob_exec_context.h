@@ -38,6 +38,7 @@
 #include "sql/engine/ob_physical_plan_ctx.h"
 #include "sql/engine/ob_subschema_ctx.h"
 #include "query/optimizer/ob_optimizer_location_defs.h"
+#include <memory>
 
 #define GET_PHY_PLAN_CTX(ctx) ((ctx).get_physical_plan_ctx())
 #define GET_MY_SESSION(ctx) ((ctx).get_my_session())
@@ -109,6 +110,7 @@ class ObIPhyOperatorInput;
 class ObSqlExecutorCtx;
 class ObSQLSessionInfo;
 class ObSQLSessionMgr;
+class SemanticQueryBudget;
 class ObExprOperatorCtx;
 class ObPxSqcHandler;
 class ObOpSpec;
@@ -273,6 +275,10 @@ public:
   // Used for result_set to regenerate plan when retrying after violation
   void reset_op_env();
   void reset_op_ctx();
+  const std::shared_ptr<SemanticQueryBudget> &get_semantic_query_budget() const
+  { return semantic_query_budget_; }
+  void set_semantic_query_budget(const std::shared_ptr<SemanticQueryBudget> &budget)
+  { semantic_query_budget_ = budget; }
 
   bool is_valid() const
   {
@@ -824,6 +830,7 @@ protected:
   ObStmtFactory *stmt_factory_;
   ObRawExprFactory *expr_factory_;
   uint64_t execution_id_;
+  std::shared_ptr<SemanticQueryBudget> semantic_query_budget_;
   //common::ObInterruptibleTaskID interrupt_id_;
   bool has_non_trivial_expr_op_ctx_;
   ObSqlCtx *sql_ctx_;

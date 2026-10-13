@@ -630,10 +630,12 @@ int ObOptParamHint::add_opt_param_hint(const OptParamType param_type, const ObOb
   int ret = OB_SUCCESS;
   ObObj cur_value;
   if (!is_param_val_valid(param_type, val)) {
-    if (param_type == ENABLE_SEMANTIC_LIFT) {
+    if (param_type == ENABLE_SEMANTIC_LIFT || param_type == ENABLE_SEMANTIC_CACHE) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "enable_semantic_lift requires 'true' or 'false'");
-      LOG_WARN("invalid semantic placement option", K(ret), K(param_type), K(val));
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, param_type == ENABLE_SEMANTIC_LIFT
+          ? "enable_semantic_lift requires 'true' or 'false'"
+          : "enable_semantic_cache requires 'true' or 'false'");
+      LOG_WARN("invalid semantic execution option", K(ret), K(param_type), K(val));
     }
   } else if (OB_FAIL(get_opt_param(param_type, cur_value))) {
   } else if (!cur_value.is_nop_value()) {
@@ -668,6 +670,7 @@ bool ObOptParamHint::is_param_val_valid(const OptParamType param_type, const ObO
     case ENABLE_PX_ORDERED_COORD:
     case ENABLE_TOPN_RUNTIME_FILTER:
     case ENABLE_SEMANTIC_LIFT:
+    case ENABLE_SEMANTIC_CACHE:
     case PRESERVE_ORDER_FOR_GROUPBY: {
       is_valid = val.is_varchar() && (0 == val.get_varchar().case_compare("true")
                                       || 0 == val.get_varchar().case_compare("false"));

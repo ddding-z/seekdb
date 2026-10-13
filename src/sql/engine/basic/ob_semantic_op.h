@@ -18,7 +18,7 @@ public:
       : ObOpSpec(allocator, type), expressions_(allocator), semantic_exprs_(allocator),
         owned_exprs_(allocator), local_exprs_(allocator),
         shared_exprs_(allocator), carried_exprs_(allocator),
-        query_task_count_(1), filter_expr_count_(0) {}
+        query_task_count_(1), filter_expr_count_(0), memoized_exprs_(allocator) {}
   common::ObFixedArray<ObExpr *, common::ObIAllocator> expressions_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> semantic_exprs_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> owned_exprs_;
@@ -29,6 +29,7 @@ public:
   common::ObFixedArray<ObExpr *, common::ObIAllocator> carried_exprs_;
   int64_t query_task_count_;
   int64_t filter_expr_count_;
+  common::ObFixedArray<ObExpr *, common::ObIAllocator> memoized_exprs_;
 };
 
 class SemanticMapSpec : public SemanticSpec
@@ -89,6 +90,7 @@ private:
   bool has_pending_requests() const;
   int build_request_parts(Task &task, Dispatch &dispatch, int64_t position);
   int submit_tasks(Slot &slot, bool &progress);
+  int submit_cached_tasks(Slot &slot, Task &task, bool &progress);
   int poll_tasks(Slot &slot, bool &progress);
   int restore_input(Slot &slot);
   void clear_owned_flags(int64_t size);
@@ -102,6 +104,7 @@ private:
   int wait_for_work(bool &suspended);
   ObBatchResultHolder child_frame_;
   std::shared_ptr<SemanticExecutionState> execution_;
+  class SemanticFunctionCache *function_cache_;
   Slot **slots_;
   int64_t slot_count_;
   int64_t head_;

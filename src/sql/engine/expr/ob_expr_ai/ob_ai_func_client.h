@@ -154,6 +154,8 @@ public:
     client_.set_shared_buffer_usage(bytes, limit);
   }
   void set_max_parallel(int64_t count) { client_.set_max_parallel(count); }
+  void set_status_checker(int (*checker)(void *), void *context)
+  { client_.set_status_checker(checker, context); }
   void require_complete_text_output() { complete_text_output_ = true; }
 private:
   friend class ObAIFuncModel;

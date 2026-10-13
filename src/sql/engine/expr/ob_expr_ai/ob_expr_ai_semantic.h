@@ -66,6 +66,11 @@ public:
                                   MultimodeAlloctor &allocator,
                                   common::ObString &model_id, SemanticInput &input,
                                   common::ObJsonObject *&config, bool prepare_config = true);
+  static bool supports_function_cache(const ObRawExpr &expr);
+  static int prepare_cache_key(const ObExpr &expr, ObEvalCtx &ctx,
+                               MultimodeAlloctor &allocator, common::ObString &key);
+  static int parse_boolean_result(ObItemType type, common::ObIAllocator &allocator,
+                                  const common::ObString &result, bool &value);
   static int set_result(const ObExpr &expr, ObEvalCtx &ctx, common::ObDatum &datum,
                         const common::ObString &result);
 private:

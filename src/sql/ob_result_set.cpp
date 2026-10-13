@@ -26,7 +26,9 @@
 #include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/engine/table/ob_table_scan_op.h"
+#include "sql/engine/basic/ob_semantic_op.h"
 #include "share/ob_ddl_checksum.h"
+#include <algorithm>
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -41,6 +43,50 @@ namespace sql
 {
 namespace
 {
+int find_semantic_cache_tasks(const ObOpSpec *spec, int64_t &tasks)
+{
+  int ret = OB_SUCCESS;
+  if (nullptr != spec) {
+    if (spec->type_ == PHY_SEMANTIC_MAP || spec->type_ == PHY_SEMANTIC_FILTER ||
+        spec->type_ == PHY_SEMANTIC_JOIN) {
+      const auto &semantic = *static_cast<const SemanticSpec *>(spec);
+      if (!semantic.memoized_exprs_.empty()) {
+        tasks = std::max(tasks, semantic.query_task_count_);
+      }
+    }
+    for (uint32_t child = 0; OB_SUCC(ret) && child < spec->get_child_cnt(); ++child) {
+      ret = SMART_CALL(find_semantic_cache_tasks(spec->get_child(child), tasks));
+    }
+  }
+  return ret;
+}
+
+int pin_semantic_cache_query(ObExecContext &ctx, const ObOpSpec *root)
+{
+  int ret = OB_SUCCESS;
+  int64_t tasks = 0;
+  int64_t slots = 0;
+  int64_t memory = 0;
+  std::shared_ptr<SemanticExecutionState> state;
+  if (OB_FAIL(find_semantic_cache_tasks(root, tasks))) {
+  } else if (tasks == 0) {
+  } else if (OB_FAIL(ctx.get_my_session()->get_sys_variable(
+      share::SYS_VAR_AI_PIPELINE_SLOTS, slots))) {
+  } else if (OB_FAIL(ctx.get_my_session()->get_sys_variable(
+      share::SYS_VAR_AI_PIPELINE_MEMORY_LIMIT, memory))) {
+  } else if (slots <= 0 || tasks > INT64_MAX / slots) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(SemanticExecutionState::acquire(ctx, memory, slots * tasks, state))) {
+  } else {
+    // The coordinator owns this lease even when all semantic operators execute inside local PX workers.
+    ctx.set_semantic_query_budget(state->budget_handle());
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to anchor query-wide semantic memo lifetime", K(ret));
+  }
+  return ret;
+}
+
 int find_table_scan_table_id(const ObOpSpec *spec, uint64_t &table_id)
 {
   int ret = OB_SUCCESS;
@@ -492,6 +538,7 @@ OB_INLINE int ObResultSet::do_open_plan(ObExecContext &ctx)
                                                                get_stmt_type(), *physical_plan_))) {
       LOG_WARN("fail to enter px admission", KR(ret));
     } else if (OB_FAIL(executor_.init(physical_plan_))) {
+    } else if (OB_FAIL(pin_semantic_cache_query(ctx, physical_plan_->get_root_op_spec()))) {
     } else if (OB_FAIL(executor_.execute_plan(ctx))) {
     }
   }

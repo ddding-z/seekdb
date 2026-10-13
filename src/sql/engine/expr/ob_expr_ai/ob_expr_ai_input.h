@@ -50,6 +50,7 @@ public:
   int append(common::ObIAllocator &allocator, SemanticInputPart::Kind kind,
              const common::ObString &value);
   int append_json(common::ObIAllocator &allocator, common::ObIJsonBase &document);
+  int render_text(common::ObIAllocator &allocator, common::ObString &prompt) const;
   static int is_input_object(const common::ObIJsonBase &document, bool &found);
   common::ObArray<SemanticInputPart> parts_;
   bool has_files_;

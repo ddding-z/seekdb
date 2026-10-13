@@ -449,6 +449,7 @@ void ObExecContext::reset_op_ctx()
 {
   reset_expr_op();
   op_kit_store_.destroy();
+  semantic_query_budget_.reset();
 }
 
 void ObExecContext::reset_op_env()

@@ -43,6 +43,31 @@ int SemanticInput::append(ObIAllocator &allocator, SemanticInputPart::Kind kind,
   return ret;
 }
 
+int SemanticInput::render_text(ObIAllocator &allocator, ObString &prompt) const
+{
+  int ret = OB_SUCCESS;
+  prompt.reset();
+  if (has_files_ || parts_.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("cannot render non-text semantic input", K(ret), K_(has_files));
+  } else if (parts_.count() == 1) {
+    prompt = parts_.at(0).value_;
+  } else {
+    ObJsonBuffer buffer(&allocator);
+    for (int64_t index = 0; OB_SUCC(ret) && index < parts_.count(); ++index) {
+      if (parts_.at(index).kind_ != SemanticInputPart::TEXT) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        ret = buffer.append(parts_.at(index).value_.ptr(), parts_.at(index).value_.length());
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ret = ob_write_string(allocator, buffer.string(), prompt);
+    }
+  }
+  return ret;
+}
+
 int SemanticInput::is_input_object(const ObIJsonBase &document, bool &found)
 {
   int ret = OB_SUCCESS;

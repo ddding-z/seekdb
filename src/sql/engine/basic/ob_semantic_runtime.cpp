@@ -1,6 +1,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/basic/ob_semantic_runtime.h"
 #include "sql/engine/basic/ob_semantic_media.h"
+#include "sql/engine/basic/ob_semantic_cache.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
@@ -41,10 +42,55 @@ SemanticQueryBudget::SemanticQueryBudget(uint64_t execution_id, int64_t memory_l
 
 SemanticQueryBudget::~SemanticQueryBudget()
 {
+  function_cache_.reset();
   if (memory_used() != 0 || active_tasks_.load() != 0) {
     LOG_ERROR_RET(OB_ERR_UNEXPECTED, "semantic query resources remain at destruction",
               K(execution_id_), K(memory_used_), "active_tasks", active_tasks_.load());
   }
+}
+
+int SemanticQueryBudget::function_cache(int64_t deadline, SemanticFunctionCache *&cache)
+{
+  int ret = failure();
+  std::lock_guard<std::mutex> guard(cache_mutex_);
+  if (OB_FAIL(ret)) {
+  } else if (deadline <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (function_cache_ && function_cache_->deadline() != deadline) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("parallel semantic cache users disagree on query deadline", K(ret), K(deadline));
+  } else if (!function_cache_) {
+    try {
+      function_cache_.reset(new SemanticFunctionCache(*this, deadline));
+    } catch (const std::bad_alloc &) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate semantic function cache failed", K(ret));
+    }
+  }
+  cache = OB_SUCC(ret) ? function_cache_.get() : nullptr;
+  return ret;
+}
+
+int SemanticQueryBudget::poll_function_cache(bool &progress)
+{
+  SemanticFunctionCache *cache = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(cache_mutex_);
+    cache = function_cache_.get();
+  }
+  return nullptr == cache ? OB_SUCCESS : cache->poll(progress);
+}
+
+bool SemanticQueryBudget::function_cache_ready() const
+{
+  std::lock_guard<std::mutex> guard(cache_mutex_);
+  return function_cache_ && function_cache_->is_ready();
+}
+
+bool SemanticQueryBudget::function_cache_pending() const
+{
+  std::lock_guard<std::mutex> guard(cache_mutex_);
+  return function_cache_ && function_cache_->has_pending();
 }
 
 int SemanticQueryBudget::reserve(int64_t bytes)
@@ -131,6 +177,13 @@ int SemanticExecutionState::acquire(ObExecContext &ctx, int64_t memory_limit,
   if (OB_SUCC(ret)) {
     auto &registry = runtime_registry();
     std::lock_guard<std::mutex> guard(registry.mutex_);
+    for (auto entry = registry.budgets_.begin(); entry != registry.budgets_.end();) {
+      if (entry->second.expired()) {
+        entry = registry.budgets_.erase(entry);
+      } else {
+        ++entry;
+      }
+    }
     try {
       auto local = registry.states_.find(&ctx);
       if (local != registry.states_.end()) {
@@ -204,7 +257,20 @@ int64_t SemanticExecutionState::query_count()
 {
   auto &registry = runtime_registry();
   std::lock_guard<std::mutex> guard(registry.mutex_);
+  for (auto entry = registry.budgets_.begin(); entry != registry.budgets_.end();) {
+    if (entry->second.expired()) {
+      entry = registry.budgets_.erase(entry);
+    } else {
+      ++entry;
+    }
+  }
   return registry.budgets_.size();
+}
+
+int SemanticExecutionState::function_cache(SemanticFunctionCache *&cache)
+{
+  ctx_->set_semantic_query_budget(budget_);
+  return budget_->function_cache(deadline_, cache);
 }
 
 int SemanticExecutionState::register_operator(void *operation, ReadyCheck ready, ReadyPoll poll)
@@ -270,7 +336,7 @@ void SemanticExecutionState::unregister_operator(const void *operation)
 
 int SemanticExecutionState::poll_ready_tasks(bool &progress)
 {
-  int ret = OB_SUCCESS;
+  int ret = budget_->poll_function_cache(progress);
   std::lock_guard<std::mutex> guard(mutex_);
   for (const Waiter &waiter : waiters_) {
     if (OB_SUCC(ret) && nullptr != waiter.poll_ &&
@@ -289,6 +355,7 @@ bool SemanticExecutionState::can_resume(const void *data)
   bool ready = state.budget().failure() != OB_SUCCESS ||
                ObTimeUtility::current_time() >= state.deadline_ ||
                (nullptr != session && (session->is_query_killed() || session->is_zombie()));
+  ready = ready || state.budget().function_cache_ready();
   std::lock_guard<std::mutex> guard(state.mutex_);
   for (const Waiter &waiter : state.waiters_) {
     if (!ready && waiter.ready_(waiter.operation_)) {

@@ -658,6 +658,121 @@ int SemanticExprUtils::prepare_request_input(const ObExpr &expr, ObEvalCtx &ctx,
   return ret;
 }
 
+namespace
+{
+bool semantic_cache_text_input(const ObRawExpr *expr)
+{
+  bool supported = false;
+  if (nullptr != expr) {
+    if (ob_is_string_type(expr->get_data_type())) {
+      supported = true;
+    } else if (expr->get_expr_type() == T_FUN_SYS_AI_INPUT ||
+               expr->get_expr_type() == T_OP_ROW) {
+      supported = expr->get_param_count() > 0;
+      for (int64_t index = 0; supported && index < expr->get_param_count(); ++index) {
+        supported = nullptr != expr->get_param_expr(index) &&
+            ob_is_string_type(expr->get_param_expr(index)->get_data_type());
+      }
+    } else if (expr->get_expr_type() == T_FUN_SYS_CAST &&
+               CM_IS_IMPLICIT_CAST(expr->get_cast_mode()) &&
+               expr->get_param_count() == 2) {
+      supported = semantic_cache_text_input(expr->get_param_expr(0));
+    }
+  }
+  return supported;
+}
+}
+
+bool SemanticExprUtils::supports_function_cache(const ObRawExpr &expr)
+{
+  const bool join = expr.get_expr_type() == T_FUN_SYS_AI_JOIN;
+  const int64_t required = join ? 4 : 2;
+  bool supported = is_semantic(expr.get_expr_type()) &&
+      (expr.get_param_count() == required || expr.get_param_count() == required + 1) &&
+      nullptr != expr.get_param_expr(0) &&
+      expr.get_param_expr(0)->is_static_scalar_const_expr();
+  if (supported && expr.get_param_count() > required) {
+    supported = nullptr != expr.get_param_expr(required) &&
+        expr.get_param_expr(required)->is_static_scalar_const_expr();
+  }
+  for (int64_t argument = 1; supported && argument < required; ++argument) {
+    supported = semantic_cache_text_input(expr.get_param_expr(argument));
+  }
+  return supported;
+}
+
+int SemanticExprUtils::prepare_cache_key(const ObExpr &expr, ObEvalCtx &ctx,
+                                         MultimodeAlloctor &allocator, ObString &key)
+{
+  int ret = OB_SUCCESS;
+  const uint32_t required = expr.type_ == T_FUN_SYS_AI_JOIN ? 4 : 2;
+  ObJsonBuffer buffer(&allocator);
+  for (uint32_t argument = 1; OB_SUCC(ret) && argument < required; ++argument) {
+    SemanticInput input;
+    bool ordered = false;
+    if (OB_FAIL(append_semantic_argument(expr, argument, ctx, allocator, input, ordered))) {
+    } else if (input.has_files_) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "semantic function caching currently supports text inputs only");
+    } else {
+      const uint64_t count = input.parts_.count();
+      // Length prefixes preserve argument roles and tuple boundaries even when text contains delimiters.
+      ret = buffer.append(reinterpret_cast<const char *>(&count), sizeof(count));
+      for (const auto &part : input.parts_) {
+        const uint64_t length = part.value_.length();
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(buffer.append(reinterpret_cast<const char *>(&length), sizeof(length)))) {
+        } else {
+          ret = buffer.append(part.value_.ptr(), part.value_.length());
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ret = ob_write_string(allocator, buffer.string(), key);
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to capture semantic function identity", K(ret), K(expr.type_));
+  }
+  return ret;
+}
+
+int SemanticExprUtils::parse_boolean_result(ObItemType type, ObIAllocator &allocator,
+                                            const ObString &result, bool &value)
+{
+  int ret = OB_SUCCESS;
+  ObIJsonBase *document = nullptr;
+  if (type != T_FUN_SYS_AI_FILTER && type != T_FUN_SYS_AI_JOIN) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (result.empty()) {
+    ret = OB_INVALID_DATA;
+  } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator, result,
+      ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, document,
+      ObJsonParser::JSN_STRICT_FLAG | ObJsonParser::JSN_UNIQUE_FLAG))) {
+    LOG_WARN("semantic boolean result is not valid JSON", K(ret), K(type));
+    if (ret == OB_ERR_INVALID_JSON_TEXT || ret == OB_ERR_DUPLICATE_KEY) {
+      ret = OB_INVALID_DATA;
+    }
+  } else if (nullptr == document || document->json_type() != ObJsonNodeType::J_OBJECT ||
+             document->element_count() != 1) {
+    ret = OB_INVALID_DATA;
+  } else {
+    ObJsonNode *field = static_cast<ObJsonObject *>(document)->get_value("value");
+    if (nullptr == field || field->json_type() != ObJsonNodeType::J_BOOLEAN) {
+      ret = OB_INVALID_DATA;
+    } else {
+      value = field->get_boolean();
+    }
+  }
+  if (ret == OB_INVALID_DATA) {
+    LOG_WARN("semantic result violates its boolean value JSON schema", K(ret), K(type));
+    FORWARD_USER_ERROR(ret, type == T_FUN_SYS_AI_JOIN
+        ? "AI_JOIN response must be a JSON object containing only a boolean value field"
+        : "AI_FILTER response must be a JSON object containing only a boolean value field");
+  }
+  return ret;
+}
+
 int SemanticExprUtils::set_result(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &datum,
                                  const ObString &result)
 {
@@ -670,32 +785,10 @@ int SemanticExprUtils::set_result(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &d
   } else if (expr.type_ == T_FUN_SYS_AI_FILTER || expr.type_ == T_FUN_SYS_AI_JOIN) {
     ObEvalCtx::TempAllocGuard guard(ctx);
     MultimodeAlloctor allocator(guard.get_allocator());
-    ObIJsonBase *document = nullptr;
-    if (result.empty()) {
-      ret = OB_INVALID_DATA;
-    } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator, result,
-        ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, document,
-        ObJsonParser::JSN_STRICT_FLAG | ObJsonParser::JSN_UNIQUE_FLAG))) {
-      LOG_WARN("semantic boolean result is not valid JSON", K(ret), K(expr.type_));
-      if (ret == OB_ERR_INVALID_JSON_TEXT || ret == OB_ERR_DUPLICATE_KEY) {
-        ret = OB_INVALID_DATA;
-      }
-    } else if (nullptr == document || document->json_type() != ObJsonNodeType::J_OBJECT ||
-               document->element_count() != 1) {
-      ret = OB_INVALID_DATA;
+    bool value = false;
+    if (OB_FAIL(parse_boolean_result(expr.type_, allocator, result, value))) {
     } else {
-      ObJsonNode *value = static_cast<ObJsonObject *>(document)->get_value("value");
-      if (nullptr == value || value->json_type() != ObJsonNodeType::J_BOOLEAN) {
-        ret = OB_INVALID_DATA;
-      } else {
-        datum.set_bool(value->get_boolean());
-      }
-    }
-    if (ret == OB_INVALID_DATA) {
-      LOG_WARN("semantic result violates its boolean value JSON schema", K(ret), K(expr.type_));
-      FORWARD_USER_ERROR(ret, expr.type_ == T_FUN_SYS_AI_JOIN
-          ? "AI_JOIN response must be a JSON object containing only a boolean value field"
-          : "AI_FILTER response must be a JSON object containing only a boolean value field");
+      datum.set_bool(value);
     }
   } else {
     ret = OB_INVALID_ARGUMENT;
