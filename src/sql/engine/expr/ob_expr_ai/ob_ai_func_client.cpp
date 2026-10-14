@@ -18,6 +18,7 @@
 #include "ob_ai_func_client.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "share/config/ob_server_config.h"
+#include "lib/allocator/ob_malloc.h"
 #include <algorithm>
 #include <limits>
 #include <cstdlib>
@@ -221,14 +222,18 @@ private:
 
 struct ObAIFuncClient::Request
 {
+  enum class ResultState { PENDING, READY, CONSUMED };
   Request(ObAIFuncClient &owner, ObIAllocator &allocator, int64_t index)
-    : owner_(owner), index_(index), body_(&allocator), response_(&allocator),
+    : owner_(owner), index_(index), payload_allocator_("AIIncPayload"), body_(&allocator),
+      response_(owner.incremental_results_ ? &payload_allocator_ : &allocator),
       handle_(nullptr), result_(nullptr), attempts_(0), retry_at_(0),
       retry_after_us_(0), callback_ret_(OB_SUCCESS), active_(false), done_(false),
-      queued_at_(ObTimeUtility::current_time()), started_at_(0) {}
+      queued_at_(ObTimeUtility::current_time()), started_at_(0),
+      result_state_(ResultState::PENDING) {}
   TO_STRING_KV(K_(index), K_(attempts), K_(active), K_(done));
   ObAIFuncClient &owner_;
   int64_t index_;
+  ObMalloc payload_allocator_;
   ObJsonBuffer body_;
   ObStringBuffer response_;
   CURL *handle_;
@@ -241,13 +246,16 @@ struct ObAIFuncClient::Request
   bool done_;
   int64_t queued_at_;
   int64_t started_at_;
+  std::atomic<ResultState> result_state_;
 };
 
 ObAIFuncClient::ObAIFuncClient()
   : allocator_(nullptr), url_(nullptr), header_list_(nullptr), curlm_(nullptr),
-    requests_(), is_finished_(false), async_mode_(false), admission_pending_(false),
+    requests_(), is_finished_(false), async_mode_(false), incremental_results_(false),
+    admission_pending_(false),
     next_admission_check_(0), async_done_(true),
-    cancel_ret_(OB_SUCCESS), request_session_(nullptr), max_retry_times_(3), abs_timeout_ts_(0),
+    cancel_ret_(OB_SUCCESS), incremental_ret_(OB_SUCCESS), ready_count_(0),
+    request_session_(nullptr), max_retry_times_(3), abs_timeout_ts_(0),
     timeout_sec_(60), max_parallel_(0), active_count_(0), completed_count_(0),
     batch_ret_(OB_SUCCESS), status_checker_(nullptr), status_context_(nullptr),
     response_validator_(nullptr),
@@ -283,6 +291,8 @@ void ObAIFuncClient::clean_up()
   release_buffer(buffered_bytes_);
   is_finished_.store(false);
   cancel_ret_.store(OB_SUCCESS);
+  incremental_ret_.store(OB_SUCCESS, std::memory_order_release);
+  ready_count_.store(0, std::memory_order_release);
 }
 
 int ObAIFuncClient::reserve_buffer(int64_t bytes)
@@ -323,6 +333,17 @@ void ObAIFuncClient::reset()
   allocator_ = nullptr;
   request_session_ = nullptr;
   batch_ret_ = OB_SUCCESS;
+  incremental_results_ = false;
+}
+
+void ObAIFuncClient::latch_incremental_error(int ret)
+{
+  if (incremental_results_ && OB_SUCCESS != ret) {
+    int expected = OB_SUCCESS;
+    if (incremental_ret_.compare_exchange_strong(expected, ret, std::memory_order_acq_rel)) {
+      cancel_ret_.store(ret, std::memory_order_release);
+    }
+  }
 }
 
 int ObAIFuncClient::init(ObIAllocator &allocator, const ObString &url, ObArray<ObString> &headers)
@@ -481,6 +502,7 @@ int ObAIFuncClient::send_post_batch_no_wait(ObArray<ObJsonObject *> &data_array)
   if (OB_FAIL(ret)) {
     clean_up();
     batch_ret_ = ret;
+    latch_incremental_error(ret);
     is_finished_.store(true);
   }
   return ret;
@@ -532,6 +554,28 @@ int ObAIFuncClient::start_request(Request &request)
   return ret;
 }
 
+int ObAIFuncClient::parse_response(ObIAllocator &allocator, const ObString &payload,
+                                   int64_t request_index, ObJsonObject *&response)
+{
+  int ret = OB_SUCCESS;
+  ObIJsonBase *json = nullptr;
+  response = nullptr;
+  if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator, payload,
+      ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, json))) {
+  } else if (nullptr == json || json->json_type() != ObJsonNodeType::J_OBJECT) {
+    ret = OB_ERR_INVALID_JSON_TEXT;
+  } else if (nullptr != response_validator_ &&
+             OB_FAIL(response_validator_->validate_response(allocator, static_cast<ObJsonObject *>(json),
+                                                             request_index))) {
+  } else {
+    response = static_cast<ObJsonObject *>(json);
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to parse or validate AI HTTP response", K(ret), K(request_index));
+  }
+  return ret;
+}
+
 int ObAIFuncClient::finish_request(Request &request, CURLcode result)
 {
   int ret = OB_SUCCESS;
@@ -567,23 +611,18 @@ int ObAIFuncClient::finish_request(Request &request, CURLcode result)
     ret = OB_CURL_ERROR;
     LOG_WARN("AI HTTP request failed", K(ret), K(http_code), K(request.index_));
   } else {
-    ObIJsonBase *json = nullptr;
-    if (OB_FAIL(ObJsonBaseFactory::get_json_base(allocator_, request.response_.string(),
-        ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, json))) {
-    } else if (nullptr == json || json->json_type() != ObJsonNodeType::J_OBJECT) {
-      ret = OB_ERR_INVALID_JSON_TEXT;
-    } else if (nullptr != response_validator_ &&
-               OB_FAIL(response_validator_->validate_response(*allocator_, static_cast<ObJsonObject *>(json),
-                                                               request.index_))) {
+    if (!incremental_results_ &&
+        OB_FAIL(parse_response(*allocator_, request.response_.string(), request.index_, request.result_))) {
     } else {
-      request.result_ = static_cast<ObJsonObject *>(json);
       request.done_ = true;
       ++completed_count_;
-      ObIJsonBase *usage = request.result_->get_value("usage");
-      if (nullptr != usage && usage->json_type() == ObJsonNodeType::J_OBJECT) {
-        ObIJsonBase *tokens = static_cast<ObJsonObject *>(usage)->get_value("total_tokens");
-        if (nullptr != tokens && tokens->json_type() == ObJsonNodeType::J_INT) {
-          total_tokens = tokens->get_int();
+      if (!incremental_results_) {
+        ObIJsonBase *usage = request.result_->get_value("usage");
+        if (nullptr != usage && usage->json_type() == ObJsonNodeType::J_OBJECT) {
+          ObIJsonBase *tokens = static_cast<ObJsonObject *>(usage)->get_value("total_tokens");
+          if (nullptr != tokens && tokens->json_type() == ObJsonNodeType::J_INT) {
+            total_tokens = tokens->get_int();
+          }
         }
       }
     }
@@ -595,6 +634,11 @@ int ObAIFuncClient::finish_request(Request &request, CURLcode result)
   if (request.done_ || OB_FAIL(ret)) {
     curl_easy_cleanup(request.handle_);
     request.handle_ = nullptr;
+  }
+  if (incremental_results_ && request.done_ && OB_SUCC(ret)) {
+    // The payload stays immutable until cleanup joins the network scheduler.
+    ready_count_.fetch_add(1, std::memory_order_release);
+    request.result_state_.store(Request::ResultState::READY, std::memory_order_release);
   }
   return ret;
 }
@@ -686,6 +730,13 @@ bool ObAIFuncClient::is_async_ready() const
                             : is_async_finished();
 }
 
+bool ObAIFuncClient::is_incremental_ready() const
+{
+  return ready_count_.load(std::memory_order_acquire) > 0 ||
+         incremental_ret_.load(std::memory_order_acquire) != OB_SUCCESS ||
+         is_finished_.load(std::memory_order_acquire) || is_async_ready();
+}
+
 bool ObAIFuncClient::drive_batch()
 {
   if (!is_finished_.load()) {
@@ -694,6 +745,7 @@ bool ObAIFuncClient::drive_batch()
     }
     if (OB_SUCCESS != batch_ret_ || completed_count_ == requests_.count()) {
       if (OB_SUCCESS != batch_ret_) {
+        latch_incremental_error(batch_ret_);
         for (int64_t index = 0; index < requests_.count(); ++index) {
           Request &request = *requests_.at(index);
           if (request.active_) {
@@ -717,14 +769,73 @@ int ObAIFuncClient::get_batch_result(ObArray<ObJsonObject *> &responses)
   if (admission_pending_ || (async_mode_ && !async_done_.load())) {
     return OB_EAGAIN;
   }
-  int ret = batch_ret_;
+  int ret = incremental_results_ ? incremental_ret_.load(std::memory_order_acquire) : OB_SUCCESS;
+  if (OB_SUCC(ret)) {
+    ret = batch_ret_;
+  }
   if (OB_SUCC(ret) && !is_finished_.load()) {
     ret = OB_EAGAIN;
   }
   for (int64_t index = 0; OB_SUCC(ret) && index < requests_.count(); ++index) {
-    if (OB_FAIL(responses.push_back(requests_.at(index)->result_))) {
+    Request &request = *requests_.at(index);
+    if (incremental_results_ && nullptr == request.result_ &&
+        OB_FAIL(parse_response(*allocator_, request.response_.string(), request.index_, request.result_))) {
+    } else if (OB_SUCC(ret) && OB_FAIL(responses.push_back(request.result_))) {
       responses.reset();
     }
+  }
+  if (incremental_results_ && OB_FAIL(ret) && ret != OB_EAGAIN) {
+    responses.reset();
+    latch_incremental_error(ret);
+  }
+  return ret;
+}
+
+int ObAIFuncClient::get_ready_batch_results(ObArray<int64_t> &positions,
+                                           ObArray<ObString> &responses, bool &finished)
+{
+  int ret = OB_SUCCESS;
+  positions.reset();
+  responses.reset();
+  finished = false;
+  if (!incremental_results_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("incremental AI results were not enabled before dispatch", K(ret));
+  } else if (OB_FAIL(poll_batch(finished))) {
+  } else {
+    for (int64_t index = 0; OB_SUCC(ret) && index < requests_.count(); ++index) {
+      Request &request = *requests_.at(index);
+      if (request.result_state_.load(std::memory_order_acquire) == Request::ResultState::READY) {
+        if (OB_FAIL(positions.push_back(request.index_))) {
+        } else if (OB_FAIL(responses.push_back(request.response_.string()))) {
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    positions.reset();
+    responses.reset();
+  }
+  return ret;
+}
+
+int ObAIFuncClient::consume_ready_batch_results(const ObArray<int64_t> &positions)
+{
+  int ret = incremental_ret_.load(std::memory_order_acquire);
+  for (int64_t index = 0; OB_SUCC(ret) && index < positions.count(); ++index) {
+    const int64_t position = positions.at(index);
+    if (position < 0 || position >= requests_.count() ||
+        requests_.at(position)->result_state_.load(std::memory_order_acquire) != Request::ResultState::READY) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("AI completion result is not ready for consumption", K(ret), K(position));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    for (int64_t index = 0; index < positions.count(); ++index) {
+      requests_.at(positions.at(index))->result_state_.store(Request::ResultState::CONSUMED,
+                                                            std::memory_order_release);
+    }
+    ready_count_.fetch_sub(positions.count(), std::memory_order_acq_rel);
   }
   return ret;
 }
@@ -746,7 +857,8 @@ int ObAIFuncClient::poll_batch(bool &finished, int64_t wait_ms)
       AIFuncScheduler::instance().wait_for(*this, std::min<int64_t>(wait_ms, 20));
     }
     finished = async_done_.load();
-    return finished ? batch_ret_ : OB_SUCCESS;
+    const int ret = incremental_results_ ? incremental_ret_.load(std::memory_order_acquire) : OB_SUCCESS;
+    return OB_SUCCESS != ret ? ret : (finished ? batch_ret_ : OB_SUCCESS);
   }
   finished = check_batch_finished();
   if (!finished && wait_ms > 0) {
@@ -756,7 +868,8 @@ int ObAIFuncClient::poll_batch(bool &finished, int64_t wait_ms)
     }
     finished = check_batch_finished();
   }
-  return batch_ret_;
+  const int ret = incremental_results_ ? incremental_ret_.load(std::memory_order_acquire) : OB_SUCCESS;
+  return OB_SUCCESS != ret ? ret : batch_ret_;
 }
 
 size_t ObAIFuncClient::write_callback(void *contents, size_t size, size_t nmemb, void *userp)

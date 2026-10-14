@@ -13,7 +13,7 @@ class LogSemantic : public ObLogicalOperator
 public:
   explicit LogSemantic(ObLogPlan &plan)
       : ObLogicalOperator(plan), query_task_count_(1), lifted_join_count_(0),
-        lift_stop_reason_(nullptr), function_cache_enabled_(false) {}
+        lift_stop_reason_(nullptr), function_cache_enabled_(false), row_async_enabled_(false) {}
   int add_expression(ObRawExpr *expr);
   int add_shared_expression(ObRawExpr *expr);
   int add_carried_expression(ObRawExpr *expr);
@@ -27,6 +27,8 @@ public:
   int64_t query_task_count() const { return query_task_count_; }
   void set_function_cache_enabled(bool enabled) { function_cache_enabled_ = enabled; }
   bool function_cache_enabled() const { return function_cache_enabled_; }
+  void set_row_async_enabled(bool enabled) { row_async_enabled_ = enabled; }
+  bool row_async_enabled() const { return row_async_enabled_; }
   const common::ObIArray<SemanticProxyConfig> &proxy_configs() const { return proxy_configs_; }
   int set_proxy_config(const ObRawExpr &expr, const SemanticProxyConfig &config);
   int64_t proxy_count() const;
@@ -53,6 +55,7 @@ private:
   int64_t lifted_join_count_;
   const char *lift_stop_reason_;
   bool function_cache_enabled_;
+  bool row_async_enabled_;
   common::ObSEArray<SemanticProxyConfig, 8> proxy_configs_;
 };
 

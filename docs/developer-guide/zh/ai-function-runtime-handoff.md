@@ -14,6 +14,7 @@
 | SQL worker 释放 | 符合准入条件的单语句 AI 根算子查询可挂起并从保留状态恢复，不重新执行整条 SQL |
 | 全局 SOLO | 收齐当前 AI 阶段的全部输入，完成一次列重排和行重排后才提交模型请求 |
 | AI_MAP / AI_FILTER | 显式逻辑和物理算子；独立表达式并发、依赖感知的跨批推进、严格布尔过滤 |
+| 可选行间异步 | 串行文本 MAP/FILTER 逐请求发布、脏行推进、有序前缀输出；默认关闭，见第 18 节 |
 | AI_JOIN | INNER JOIN ON 的显式语义连接；普通 SQL 候选对生成加有界异步判断，不做近似候选裁剪 |
 | AI_AGG | 真正跨行的文本聚合；SQL 分组、小组一次调用、有界确定性归约及共享异步运行时 |
 | 语义 PX | 经校验的 reduce-transmit / semantic / GI / scan 路径保留任务状态并释放物理 worker；同一查询共享预算 |
@@ -1101,3 +1102,91 @@ profile 绑定主模型/公开版本、instruction/options、embedding/query、�
 53 项校准/profile 测试、原生 scorer 到认证 FILTER SQL / 禁用后精确 SQL
 两条 mock 接线通过。未新增真实模型效果实验；不包含自动成本选路、自动采集、
 共享 FILTER 向量缓存、自适应拆批、mapper-assisted JOIN、ANN 或 PX proxy。
+
+## 18. 可选行间异步：逐请求完成与有序前缀
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('rowsets_max_rows',16) */
+       id, AI_MAP('extractor', AI_INPUT('总结：', content))
+FROM documents
+WHERE AI_FILTER('selector', AI_INPUT('是否相关？', content))
+LIMIT 5;
+```
+
+`enable_semantic_row_async` 默认 false，使用带引号的 true/false，大小写不敏感。
+EXPLAIN 在启用的原生阶段显示 `row_async=ORDERED_PREFIX`。显式启用时只支持
+串行文本 MAP/FILTER、静态模型和 options；FILE、AI_JOIN、AI_AGG、PX/exchange
+明确报错，不会悄悄退回整批发布。普通串行 SQL 连接不等于 AI_JOIN，仍可使用，
+但不能扩大原有 worker 挂起的安全边界。函数缓存、FILTER proxy、上提仍分别
+由原有开关控制；行间异步本身不近似答案，也不改变表达式求值需求。
+
+### 三层屏障的变化
+
+1. **HTTP 请求组**：保留共享网络线程和固定请求组，不为每行创建线程，也不强制
+   一行一个调度器 client；当前可准备的一组输入仍共用 client。完成通知只代表
+   最终校验成功的完整响应；重试和退避不能重复发布。
+   `AIFuncBatch::get_ready_results` 返回尚未消费的请求位置和结果，结果属于调用方
+   独立 allocator，SQL 消费不能与网络线程并发写同一个 arena。旧 `get_results`
+   仍保留整组完成的契约；embedding 的一个 HTTP 响应可能包含多个输入，继续
+   按原有响应索引一次回填，不声称逐向量返回。
+2. **语义行**：槽内增加固定容量的行状态、去重脏行队列和 prefix 游标。
+   完成请求只唤醒受影响行的表达式重算，未选中的 CASE/AND/OR 分支不能因为
+   “有空闲并发”而被提前调用。槽内原输入、已求值结果和共享/携带值继续按行
+   保存；状态检测和 eval frame 恢复仍有批级操作，不是所有管理成本都变成 O(1)。
+   嵌套 `AI_MAP('b', AI_MAP('a', prompt))` 可以推进 a 已完成的行，不必等同组
+   其他 a。缓存路径把完成响应逐 Entry 发布，proxy 先拒绝的 false 与转发主模型
+   的完成值均保持原语义，不能只让关闭 cache 的查询获得这项能力。
+3. **算子输出**：只交付从队首开始连续确定的输入前缀，拒绝行推进 prefix 而
+   不输出。空的已拒绝前缀不是 EOF。FILTER 的快前缀可以先进入独立 MAP；
+   FILTER 第 0 行若很慢，后面的快行仍不能越过它进入那个独立 MAP。
+   这不等于任意算子图融合、无序输出或隐式 row token 传播。
+
+所有输出 datum 仍借用槽内存，不能在返回前缀后立即 reset 槽。必须等剩余前缀
+消费完，或正常关闭/取消时先停止并 join 网络工作，再释放输入、结果和预算。
+没有可跨 rescan 存活的外部完成队列；当前请求组的固定位置只映射到当前槽。
+查询缓存拥有共享 Flight，不能因一个订阅行结束就取消其他订阅仍需要的请求。
+
+### 背压、LIMIT 与客户端可见性
+
+首版沿用 `ai_pipeline_slots`、SQL rowset 大小、查询共享 task/byte 预算和网络
+调度器准入。没有把 batch 偷改成 1，也没有新增独立于算子数的 query-wide HTTP
+请求额度 C。部分输出的槽仍可能被慢尾行钉住；HTTP 请求组不可动态追加。
+这些是后续滚动请求窗口和需求感知 lookahead 的工作，不应宣称已经实现。
+
+小增量数据仍在上游返回后立即提交，不等凑满 rowset。LIMIT 若已从前缀得到足够
+输出，可以正常结束并由查询 teardown 清理多余工作；FILTER 不能只读 K 个输入
+就假定能得到 K 个命中。首版仍可能预取现有有限窗口内的候选，尚无选择率驱动的
+请求限额/成本模型，也不支持持续订阅或跨查询保留增量状态。
+
+新增 MySQL 输出接线只对这个 opt-in 模式生效：安全挂起 SQL worker 前，若这一轮
+确实产生了新行，flush 已生成的 row packet，因此小前缀也能被 SSCursor 读到。
+不逐行强制 flush，不改变普通/默认关闭查询的缓冲策略。阻塞 sort/aggregate、
+不可挂起的父算子、缓冲型客户端仍可能隐藏可见进度。客户端读到前缀不代表查询
+成功；后续 provider/布尔校验/timeout/kill 仍须传播错误，发出行后不能重试整条
+查询。
+
+精确 gate 验证入口为
+[test_semantic_row_async.py](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_row_async.py)。
+同一 16 行输入批扣住慢响应，必须在释放 gate 前看到依赖请求、FILTER→MAP
+推进、LIMIT 完成或非缓冲客户端的小行；不能仅观察到 HTTP 乱序就声称逐行执行。
+同时覆盖慢首行的有限窗口和顺序、重复行、全拒绝前缀、guard、cache/proxy、
+retry、错误后部分输出、取消和同连接恢复。native 资源入口补充默认关闭、
+显式启用及原 task 背压不变的契约。
+
+### 本轮验收
+
+- Debug 构建通过；新增 **20/20 SQL/mock 契约**通过，包括两阶段 EXPLAIN 标记、
+  语义阶段在协调器串行执行但下方普通 SQL 子树有 PX 时仍明确拒绝。
+- 7 项扣住响应/客户端可见性关键用例，在额外 3 个全新私有部署重复运行，
+  **21/21 次通过**。
+- **84 项既有 SQL 回归**通过：MAP/FILTER runtime 39、cache/lift/JOIN 16、
+  表达式组合 10、旧 completion/embedding 12、JOIN proxy 3、定向本地 PX 4。
+- native 资源 **17 项重复 2 轮，共 34 次通过**；input/provider/proxy **20/20**
+  通过；fixture 自测 **11 + 27 = 38 项**通过。
+- 修改前 binary 的默认关闭整批屏障用例通过，而小前缀 SSCursor 和嵌套行依赖
+  两个新 oracle 按预期失败，避免仅凭 HTTP 乱序误判行间推进。
+
+以上为确定性功能验证，不代表真实模型延迟提升或 SemBench 质量结果；未宣称完成
+sanitizer、所有 rescan 和穷尽式故障注入验证。

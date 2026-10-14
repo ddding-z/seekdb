@@ -18,7 +18,8 @@ class SemanticFunctionCache;
 class SemanticQueryBudget
 {
 public:
-  SemanticQueryBudget(uint64_t execution_id, int64_t memory_limit, int64_t task_limit);
+  SemanticQueryBudget(uint64_t execution_id, int64_t memory_limit, int64_t task_limit,
+                      bool row_async_enabled = false);
   ~SemanticQueryBudget();
   int reserve(int64_t bytes);
   void release(int64_t bytes);
@@ -31,6 +32,7 @@ public:
   int64_t memory_used() const;
   int64_t memory_limit() const { return memory_limit_; }
   int64_t task_limit() const { return task_limit_; }
+  bool row_async_enabled() const { return row_async_enabled_; }
   int64_t *memory_counter() { return &memory_used_; }
   uint64_t execution_id() const { return execution_id_; }
   int function_cache(int64_t deadline, SemanticFunctionCache *&cache);
@@ -41,6 +43,7 @@ private:
   uint64_t execution_id_;
   int64_t memory_limit_;
   int64_t task_limit_;
+  bool row_async_enabled_;
   int64_t memory_used_;
   std::atomic<int64_t> active_tasks_;
   std::atomic<int> failure_;
@@ -54,7 +57,8 @@ public:
   using ReadyCheck = bool (*)(const void *);
   using ReadyPoll = int (*)(void *, bool &);
   static int acquire(ObExecContext &ctx, int64_t memory_limit, int64_t task_limit,
-                     std::shared_ptr<SemanticExecutionState> &state);
+                     std::shared_ptr<SemanticExecutionState> &state,
+                     bool row_async_enabled = false);
   static int64_t query_count();
   ~SemanticExecutionState();
   int register_operator(void *operation, ReadyCheck ready, ReadyPoll poll = nullptr);

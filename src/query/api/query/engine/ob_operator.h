@@ -249,6 +249,7 @@ public:
 
   uint32_t get_child_cnt() const { return child_cnt_; }
   bool has_semantic_operator() const;
+  bool has_row_async_semantic_operator() const;
   ObOpSpec **get_children() const { return children_; }
 
   int set_children_pointer(ObOpSpec **children, const uint32_t child_cnt);

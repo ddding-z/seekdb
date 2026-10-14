@@ -4,6 +4,93 @@ Legacy baseline validation (2026-09-29): the Debug build, all **105 SQL contract
 
 For the current architecture, code map, maintenance invariants and handoff checklist, see the [Chinese maintenance handoff](../../../../../docs/developer-guide/zh/ai-function-runtime-handoff.md).
 
+## Opt-in Ordered Row-Asynchronous MAP/FILTER
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('rowsets_max_rows',16) */
+       id, AI_MAP('extractor', AI_INPUT('Summarize: ', content))
+FROM documents
+WHERE AI_FILTER('selector', AI_INPUT('Relevant? ', content))
+LIMIT 5;
+```
+
+The new option defaults to **false**. It accepts quoted, case-insensitive
+`true`/`false`; invalid values and explicitly unsupported shapes fail rather
+than silently using the old publication path. EXPLAIN identifies enabled
+stages with `row_async=ORDERED_PREFIX`. Initial scope is serial native TEXT
+MAP/FILTER with static model/options, with or without query caching and the
+existing reject-only FILTER proxies. FILE, AI_JOIN, AI_AGG and PX/exchange
+plans are not enabled by this option. Ordinary SQL joins remain possible in
+serial plans, subject to their existing suspension guards.
+
+The HTTP scheduler still multiplexes fixed request groups. Only terminal,
+validated responses are published, once per request; retries are not results.
+SQL collects each ready response into isolated caller-owned memory, marks its
+row dirty, and reevaluates that row's demanded expressions without waiting for
+its siblings. A nested call for a later row can therefore start while an
+earlier row's inner call is held. This is not token streaming or a coroutine
+rewrite.
+
+The physical operator emits only its **contiguous completed input prefix**.
+Rejected rows advance that prefix without output; an all-rejected prefix is
+not EOF. FILTER can pass a true prefix to a separate MAP before a slow tail,
+but a slow FILTER head still prevents later rows from reaching that separate
+MAP. Input order, bag multiplicity, guarded branches and response indexes
+remain intact. Slot-owned output datums remain live until the next pull;
+partial output never resets a still-needed slot.
+
+The existing slot/task/byte limits and scheduler admission remain in force.
+This version does not shrink SQL batches to one, force a scheduler client per
+row, introduce appendable HTTP groups, or add an independent query-wide HTTP
+request-credit limit. A partly consumed slot remains pinned until its ordered
+tail drains. LIMIT can finish from a prefix and normal query teardown cancels
+unneeded work, but request lookahead is still the existing bounded window,
+not a new selectivity-aware LIMIT policy. Query-cache work remains owned by
+the query, not canceled merely because one subscriber finishes.
+
+On a safe SQL-worker suspension, newly generated row packets are flushed for
+this opt-in mode. Small prefixes are thus observable with an unbuffered
+client, not just inside the operator. Blocking sort/aggregate and a buffering
+client can still hide progress. An error after a visible prefix remains a SQL
+error; clients must consume the final status, and the server cannot retry
+after sending rows.
+
+Deterministic SQL/mock entry point (no real model or speedup claim):
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_row_async.py \
+  --binary build_debug/bin/src/observer/seekdb
+```
+
+`--list-cases` starts no services; repeat `--case` for focused selection.
+The suite holds sibling responses in an unchanged 16-row batch and checks
+downstream demand, LIMIT cancellation, bounded head-of-line lookahead,
+actual small-row SSCursor visibility, exact bag/counts, retries, cache/proxy
+composition, invalid settings, errors, deadline, kill and connection recovery.
+`--log-dir` retains only the owned deployment's logs in a new directory.
+
+Validation for this implementation:
+
+- Debug seekdb build and **20/20 SQL/mock contracts** passed, including
+  two-stage EXPLAIN markers and rejection of a serial semantic stage above
+  a parallel SQL subtree.
+- Seven held-request/client-visibility cases passed on three additional
+  fresh private deployments (**21/21 repeated executions**).
+- **84 existing SQL contracts** passed: MAP/FILTER runtime 39, cache/lift/JOIN
+  16, expression composition 10, legacy completion/embedding 12, JOIN proxy 3,
+  and targeted local PX 4.
+- Native resource contracts passed **17 cases twice (34 executions)**;
+  native input/provider/proxy contracts passed **20/20**. Fixture self-tests
+  passed **11 + 27 = 38**.
+
+With the pre-change binary, the default/off barrier control passed, while
+the new small-prefix and nested-dependency oracles failed as expected.
+These checks distinguish SQL row progress from HTTP completion order.
+Real-model latency, SemBench quality, sanitizer runs and exhaustive rescan
+or failure-injection coverage are not claimed by this validation.
+
 ## Per-FILTER Proxy Composition (2026-10-14)
 
 The earlier V0 sections below describe their historical single-call scope.

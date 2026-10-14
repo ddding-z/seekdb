@@ -34,9 +34,9 @@ SemanticRuntimeRegistry &runtime_registry()
 }
 
 SemanticQueryBudget::SemanticQueryBudget(uint64_t execution_id, int64_t memory_limit,
-                                         int64_t task_limit)
+                                         int64_t task_limit, bool row_async_enabled)
     : execution_id_(execution_id), memory_limit_(memory_limit), task_limit_(task_limit),
-      memory_used_(0), active_tasks_(0), failure_(OB_SUCCESS)
+      row_async_enabled_(row_async_enabled), memory_used_(0), active_tasks_(0), failure_(OB_SUCCESS)
 {
 }
 
@@ -157,7 +157,8 @@ SemanticExecutionState::SemanticExecutionState(ObExecContext &ctx,
 
 int SemanticExecutionState::acquire(ObExecContext &ctx, int64_t memory_limit,
                                     int64_t task_limit,
-                                    std::shared_ptr<SemanticExecutionState> &state)
+                                    std::shared_ptr<SemanticExecutionState> &state,
+                                    bool row_async_enabled)
 {
   int ret = OB_SUCCESS;
   uint64_t execution_id = OB_INVALID_ID;
@@ -192,7 +193,8 @@ int SemanticExecutionState::acquire(ObExecContext &ctx, int64_t memory_limit,
       if (state) {
         if (state->budget().execution_id() != execution_id ||
             state->budget().memory_limit() != memory_limit ||
-            state->budget().task_limit() != task_limit) {
+            state->budget().task_limit() != task_limit ||
+            state->budget().row_async_enabled() != row_async_enabled) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("inconsistent semantic execution context", K(ret), K(execution_id),
                    K(memory_limit), K(task_limit));
@@ -204,13 +206,15 @@ int SemanticExecutionState::acquire(ObExecContext &ctx, int64_t memory_limit,
           budget = query->second.lock();
         }
         if (budget && (budget->memory_limit() != memory_limit ||
-                       budget->task_limit() != task_limit)) {
+                       budget->task_limit() != task_limit ||
+                       budget->row_async_enabled() != row_async_enabled)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("parallel semantic workers disagree on query limits",
                    K(ret), K(execution_id), K(memory_limit), K(task_limit));
         } else {
           if (!budget) {
-            budget = std::make_shared<SemanticQueryBudget>(execution_id, memory_limit, task_limit);
+            budget = std::make_shared<SemanticQueryBudget>(
+                execution_id, memory_limit, task_limit, row_async_enabled);
             registry.budgets_[execution_id] = budget;
           }
           state.reset(new SemanticExecutionState(ctx, std::move(budget),

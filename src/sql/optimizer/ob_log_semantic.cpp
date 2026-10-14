@@ -175,7 +175,7 @@ int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_ite
   int ret = OB_SUCCESS;
   if (OB_FAIL(ObLogicalOperator::get_plan_item_info(plan_text, plan_item))) {
   } else if (lifted_join_count_ > 0 || nullptr != lift_stop_reason_ ||
-             function_cache_enabled_ || has_embedding_proxy()) {
+             function_cache_enabled_ || has_embedding_proxy() || row_async_enabled_) {
     BEGIN_BUF_PRINT;
     const bool placement = lifted_join_count_ > 0 || nullptr != lift_stop_reason_;
     if (placement && OB_FAIL(BUF_PRINTF("semantic_placement=%s, crossed_inner_joins=%ld",
@@ -213,6 +213,10 @@ int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_ite
           ret = BUF_PRINTF("]");
         }
       }
+    }
+    if (OB_SUCC(ret) && row_async_enabled_) {
+      ret = BUF_PRINTF("%srow_async=ORDERED_PREFIX",
+                       placement || function_cache_enabled_ || has_embedding_proxy() ? ", " : "");
     }
     END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
   }

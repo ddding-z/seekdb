@@ -664,11 +664,13 @@ int ObOptParamHint::add_opt_param_hint(const OptParamType param_type, const ObOb
   if (!is_param_val_valid(param_type, val)) {
     if (param_type == ENABLE_SEMANTIC_LIFT || param_type == ENABLE_SEMANTIC_CACHE ||
         param_type == ENABLE_SEMANTIC_PROXY || param_type == SEMANTIC_PROXY_MODEL ||
-        param_type == SEMANTIC_PROXY_QUERY || param_type == SEMANTIC_PROXY_THRESHOLD) {
+        param_type == SEMANTIC_PROXY_QUERY || param_type == SEMANTIC_PROXY_THRESHOLD ||
+        param_type == ENABLE_SEMANTIC_ROW_ASYNC) {
       ret = OB_INVALID_ARGUMENT;
       LOG_USER_ERROR(OB_INVALID_ARGUMENT,
           param_type == ENABLE_SEMANTIC_LIFT ? "enable_semantic_lift requires 'true' or 'false'" :
           param_type == ENABLE_SEMANTIC_CACHE ? "enable_semantic_cache requires 'true' or 'false'" :
+          param_type == ENABLE_SEMANTIC_ROW_ASYNC ? "enable_semantic_row_async requires 'true' or 'false'" :
           param_type == ENABLE_SEMANTIC_PROXY ? "enable_semantic_proxy requires 'true' or 'false'" :
           param_type == SEMANTIC_PROXY_MODEL ? "semantic_proxy_model requires a nonempty model name" :
           param_type == SEMANTIC_PROXY_QUERY ? "semantic_proxy_query requires nonempty retrieval text" :
@@ -711,6 +713,7 @@ bool ObOptParamHint::is_param_val_valid(const OptParamType param_type, const ObO
     case ENABLE_SEMANTIC_LIFT:
     case ENABLE_SEMANTIC_CACHE:
     case ENABLE_SEMANTIC_PROXY:
+    case ENABLE_SEMANTIC_ROW_ASYNC:
     case PRESERVE_ORDER_FOR_GROUPBY: {
       is_valid = val.is_varchar() && (0 == val.get_varchar().case_compare("true")
                                       || 0 == val.get_varchar().case_compare("false"));

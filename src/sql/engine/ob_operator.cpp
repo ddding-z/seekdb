@@ -21,6 +21,7 @@
 #include "query/runtime/ob_query_runtime_environment.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
 #include "sql/engine/basic/ob_semantic_runtime.h"
+#include "sql/engine/basic/ob_semantic_op.h"
 
 namespace oceanbase
 {
@@ -38,6 +39,18 @@ bool ObOpSpec::has_semantic_operator() const
   for (uint32_t index = 0; !present && index < child_cnt_; ++index) {
     if (nullptr != children_[index]) {
       present = children_[index]->has_semantic_operator();
+    }
+  }
+  return present;
+}
+
+bool ObOpSpec::has_row_async_semantic_operator() const
+{
+  bool present = (type_ == PHY_SEMANTIC_MAP || type_ == PHY_SEMANTIC_FILTER) &&
+                 static_cast<const SemanticSpec &>(*this).row_async_enabled_;
+  for (uint32_t index = 0; !present && index < child_cnt_; ++index) {
+    if (nullptr != children_[index]) {
+      present = children_[index]->has_row_async_semantic_operator();
     }
   }
   return present;

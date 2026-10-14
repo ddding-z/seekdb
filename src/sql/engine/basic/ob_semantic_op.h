@@ -19,7 +19,7 @@ public:
       : ObOpSpec(allocator, type), expressions_(allocator), semantic_exprs_(allocator),
         owned_exprs_(allocator), local_exprs_(allocator),
         shared_exprs_(allocator), carried_exprs_(allocator),
-        query_task_count_(1), filter_expr_count_(0), memoized_exprs_(allocator),
+        query_task_count_(1), filter_expr_count_(0), row_async_enabled_(false), memoized_exprs_(allocator),
         proxy_configs_(allocator) {}
   common::ObFixedArray<ObExpr *, common::ObIAllocator> expressions_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> semantic_exprs_;
@@ -31,6 +31,7 @@ public:
   common::ObFixedArray<ObExpr *, common::ObIAllocator> carried_exprs_;
   int64_t query_task_count_;
   int64_t filter_expr_count_;
+  bool row_async_enabled_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> memoized_exprs_;
   common::ObFixedArray<SemanticProxyConfig, common::ObIAllocator> proxy_configs_;
   bool has_embedding_proxy() const
@@ -97,6 +98,8 @@ private:
   int capture(Slot &slot);
   int capture_join_candidates(Slot &slot);
   int prepare(Slot &slot, bool &progress);
+  void mark_row_ready(Slot &slot, int64_t row);
+  bool slot_drained(const Slot &slot) const;
   int advance_media(Task &task, bool &progress);
   bool input_ready(const Task &task, int64_t position) const;
   bool has_pending_requests() const;

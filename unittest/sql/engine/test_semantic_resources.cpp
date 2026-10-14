@@ -199,6 +199,20 @@ void test_memory_thresholds()
   require_equal(ObAIFuncClient::pipeline_buffer_usage(), baseline, "independent owner cleanup");
 }
 
+void test_row_async_configuration()
+{
+  SemanticQueryBudget legacy(execution_id(), 31, 2);
+  SemanticQueryBudget incremental(execution_id(), 31, 2, true);
+  require(!legacy.row_async_enabled(), "legacy publication remains the default");
+  require(incremental.row_async_enabled(), "row publication is explicitly enabled per query");
+  require_equal(incremental.acquire_task(), OB_SUCCESS, "first incremental task credit");
+  require_equal(incremental.acquire_task(), OB_SUCCESS, "second incremental task credit");
+  require_equal(incremental.acquire_task(), OB_EAGAIN, "row publication retains task backpressure");
+  incremental.release_task();
+  incremental.release_task();
+  require_equal(incremental.active_tasks(), 0, "incremental credits are reusable after cleanup");
+}
+
 void test_global_accounting_rollback()
 {
   const int64_t baseline = ObAIFuncClient::pipeline_buffer_usage();
@@ -761,6 +775,27 @@ void test_semantic_join_detection()
   require(!root.has_semantic_operator(), "restoring ordinary tree clears semantic detection");
 }
 
+void test_row_async_spec_detection()
+{
+  ObArenaAllocator allocator("SemanticTest");
+  ObOpSpec root(allocator, PHY_SORT);
+  SemanticMapSpec map(allocator, PHY_SEMANTIC_MAP);
+  SemanticFilterSpec filter(allocator, PHY_SEMANTIC_FILTER);
+  ObOpSpec *root_children[] = {&map};
+  ObOpSpec *map_children[] = {&filter};
+  require_equal(root.set_children_pointer(root_children, 1), OB_SUCCESS, "bind row async root");
+  require_equal(map.set_children_pointer(map_children, 1), OB_SUCCESS, "bind row async stages");
+  require(root.has_semantic_operator(), "default stages still have semantic execution");
+  require(!root.has_row_async_semantic_operator(), "default stages do not flush row prefixes");
+  filter.row_async_enabled_ = true;
+  require(root.has_row_async_semantic_operator(), "enabled filter is found through ancestors");
+  filter.row_async_enabled_ = false;
+  map.row_async_enabled_ = true;
+  require(root.has_row_async_semantic_operator(), "enabled map is found through ancestors");
+  map.row_async_enabled_ = false;
+  require(!root.has_row_async_semantic_operator(), "disabled stages restore default buffering");
+}
+
 void test_sort_suspension_capability()
 {
   ObArenaAllocator allocator("SemanticTest");
@@ -803,6 +838,7 @@ struct TestCase
 
 const TestCase TESTS[] = {
   {"memory_thresholds", test_memory_thresholds},
+  {"row_async_configuration", test_row_async_configuration},
   {"global_accounting_rollback", test_global_accounting_rollback},
   {"client_shared_counter", test_client_shared_counter},
   {"task_admission_boundaries", test_task_admission_boundaries},
@@ -817,6 +853,7 @@ const TestCase TESTS[] = {
   {"suspension_scope_thread_isolation", test_suspension_scope_thread_isolation},
   {"semantic_join_bindings", test_semantic_join_bindings},
   {"semantic_join_detection", test_semantic_join_detection},
+  {"row_async_spec_detection", test_row_async_spec_detection},
   {"sort_suspension_capability", test_sort_suspension_capability},
 };
 } // namespace

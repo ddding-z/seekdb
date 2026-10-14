@@ -5535,6 +5535,7 @@ public:
     int ret = OB_SUCCESS;
     bool cache_enabled = false;
     bool proxy_enabled = false;
+    bool row_async_enabled = false;
     const ObOptParamHint &options = plan_.get_optimizer_context().get_global_hint().opt_params_;
     if (OB_FAIL(options.get_bool_opt_param(
         ObOptParamHint::ENABLE_SEMANTIC_CACHE, cache_enabled))) {
@@ -5542,6 +5543,9 @@ public:
     } else if (OB_FAIL(options.get_bool_opt_param(
         ObOptParamHint::ENABLE_SEMANTIC_PROXY, proxy_enabled))) {
       LOG_WARN("failed to read embedding proxy option", K(ret));
+    } else if (OB_FAIL(options.get_bool_opt_param(
+        ObOptParamHint::ENABLE_SEMANTIC_ROW_ASYNC, row_async_enabled))) {
+      LOG_WARN("failed to read row asynchronous execution option", K(ret));
     }
     ObSEArray<ObRawExpr *, 16> calls;
     for (LogSemantic *stage : stages_) {
@@ -5560,9 +5564,31 @@ public:
     for (LogSemantic *stage : stages_) {
       stage->set_query_task_count(calls.count());
       stage->set_function_cache_enabled(cache_enabled);
+      stage->set_row_async_enabled(row_async_enabled);
     }
     for (ObLogGroupBy *group : aggregate_stages_) {
       group->set_semantic_query_task_count(calls.count());
+    }
+    if (OB_SUCC(ret) && row_async_enabled && bind_proxy) {
+      bool serial = true;
+      if (!aggregate_stages_.empty()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "row asynchronous execution does not support AI_AGG");
+      } else if (OB_FAIL(check_solo_plan(&root, serial))) {
+      } else if (!serial) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "row asynchronous execution requires serial execution");
+      }
+      for (int64_t index = 0; OB_SUCC(ret) && index < calls.count(); ++index) {
+        const ObRawExpr &call = *calls.at(index);
+        if ((call.get_expr_type() != T_FUN_SYS_AI_MAP &&
+             call.get_expr_type() != T_FUN_SYS_AI_FILTER) ||
+            !SemanticExprUtils::supports_function_cache(call)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                         "row asynchronous execution supports static text MAP/FILTER calls only");
+        }
+      }
     }
     if (OB_SUCC(ret) && proxy_enabled && bind_proxy) {
       bool serial = true;
@@ -5889,12 +5915,19 @@ int ObSelectLogPlan::candi_allocate_semantic(bool projection)
     present = semantic_plan_present(*candidates_.candidate_plans_.at(index).plan_tree_);
   }
   bool proxy_enabled = false;
+  bool row_async_enabled = false;
   if (OB_SUCC(ret) && OB_FAIL(get_optimizer_context().get_global_hint().opt_params_
       .get_bool_opt_param(ObOptParamHint::ENABLE_SEMANTIC_PROXY, proxy_enabled))) {
     LOG_WARN("failed to read embedding proxy option", K(ret));
+  } else if (OB_SUCC(ret) && OB_FAIL(get_optimizer_context().get_global_hint().opt_params_
+      .get_bool_opt_param(ObOptParamHint::ENABLE_SEMANTIC_ROW_ASYNC, row_async_enabled))) {
+    LOG_WARN("failed to read row asynchronous execution option", K(ret));
   } else if (OB_SUCC(ret) && projection && proxy_enabled && !present) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "embedding proxy requires a native text AI_FILTER or AI_JOIN");
+  } else if (OB_SUCC(ret) && projection && row_async_enabled && !present) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "row asynchronous execution requires native text MAP/FILTER calls");
   }
   if (OB_SUCC(ret) && present) {
     const ObSelectStmt &stmt = *get_stmt();
@@ -5921,6 +5954,7 @@ int ObSelectLogPlan::place_semantic_stages()
   int ret = OB_SUCCESS;
   bool enabled = false;
   bool proxy_enabled = false;
+  bool row_async_enabled = false;
   bool serial = true;
   ObLogicalOperator *root = nullptr;
   if (OB_FAIL(get_optimizer_context().get_global_hint().opt_params_.get_bool_opt_param(
@@ -5929,15 +5963,21 @@ int ObSelectLogPlan::place_semantic_stages()
   } else if (OB_FAIL(get_optimizer_context().get_global_hint().opt_params_.get_bool_opt_param(
       ObOptParamHint::ENABLE_SEMANTIC_PROXY, proxy_enabled))) {
     LOG_WARN("failed to read embedding proxy option", K(ret));
-  } else if (!enabled && !proxy_enabled) {
+  } else if (OB_FAIL(get_optimizer_context().get_global_hint().opt_params_.get_bool_opt_param(
+      ObOptParamHint::ENABLE_SEMANTIC_ROW_ASYNC, row_async_enabled))) {
+    LOG_WARN("failed to read row asynchronous execution option", K(ret));
+  } else if (!enabled && !proxy_enabled && !row_async_enabled) {
   } else if (OB_FAIL(candidates_.get_best_plan(root))) {
   } else if (OB_ISNULL(root)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("missing selected plan for semantic placement", K(ret));
-  } else if (proxy_enabled && OB_FAIL(check_solo_plan(root, serial))) {
-  } else if (proxy_enabled && !serial) {
+  } else if ((proxy_enabled || row_async_enabled) &&
+             OB_FAIL(check_solo_plan(root, serial))) {
+  } else if ((proxy_enabled || row_async_enabled) && !serial) {
     ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "embedding proxy V0 requires serial execution");
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, proxy_enabled
+        ? "embedding proxy V0 requires serial execution"
+        : "row asynchronous execution requires serial execution");
   } else if (!enabled) {
   } else if (semantic_plan_present(*root)) {
     // Select before mutation: candidate plans can share operator subtrees.

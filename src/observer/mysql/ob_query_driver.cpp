@@ -20,6 +20,7 @@
 #include "ob_mysql_result_set.h"
 #include "query/protocol/ob_mysql_packet_sender.h"
 #include "sql/engine/ob_physical_plan.h"
+#include "query/engine/ob_operator.h"
 #include "obsm_row.h"
 #include "rpc/obmysql/packet/ompk_eof.h"
 #include "rpc/obmysql/packet/ompk_row.h"
@@ -140,6 +141,10 @@ int ObQueryDriver::response_query_result(ObResultSet &result,
   const ObNewRow *result_row = NULL;
   bool is_cac_found_rows =  result.is_calc_found_rows();
   int64_t &row_num = response_row_count_;
+  const int64_t starting_rows = row_num;
+  const ObPhysicalPlan *plan = result.get_physical_plan();
+  const bool row_async = nullptr != plan && nullptr != plan->get_root_op_spec() &&
+                        plan->get_root_op_spec()->has_row_async_semantic_operator();
   ObSqlCtx *sql_ctx = result.get_exec_context().get_sql_ctx();
   bool is_packed = result.get_physical_plan() ? result.get_physical_plan()->is_packed() : false;
   MYSQL_PROTOCOL_TYPE protocol_type = is_ps_protocol ? MYSQL_PROTOCOL_TYPE::BINARY : MYSQL_PROTOCOL_TYPE::TEXT;
@@ -245,9 +250,19 @@ int ObQueryDriver::response_query_result(ObResultSet &result,
   }
   if (OB_EAGAIN == ret && nullptr != lib::RequestAwait::current() &&
       lib::RequestAwait::current()->is_pending()) {
-    response_suspended_ = true;
     can_retry = false;
-    return ret;
+    if (row_num > starting_rows && row_async) {
+      const int flush_ret = sender_.flush_buffer(false);
+      if (flush_ret != OB_SUCCESS) {
+        ret = flush_ret;
+        lib::RequestAwait::current()->reset_pending();
+        LOG_WARN("flush incremental semantic rows failed", K(ret), K(row_num));
+      }
+    }
+    if (ret == OB_EAGAIN) {
+      response_suspended_ = true;
+      return ret;
+    }
   }
   if (OB_ITER_END == ret) {
     ret = OB_SUCCESS;

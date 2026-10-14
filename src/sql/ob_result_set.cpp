@@ -76,7 +76,8 @@ int pin_semantic_cache_query(ObExecContext &ctx, const ObOpSpec *root)
       share::SYS_VAR_AI_PIPELINE_MEMORY_LIMIT, memory))) {
   } else if (slots <= 0 || tasks > INT64_MAX / slots) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(SemanticExecutionState::acquire(ctx, memory, slots * tasks, state))) {
+  } else if (OB_FAIL(SemanticExecutionState::acquire(ctx, memory, slots * tasks, state,
+                         nullptr != root && root->has_row_async_semantic_operator()))) {
   } else {
     // The coordinator owns this lease even when all semantic operators execute inside local PX workers.
     ctx.set_semantic_query_budget(state->budget_handle());

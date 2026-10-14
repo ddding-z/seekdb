@@ -1074,10 +1074,17 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
     }
   }
   spec.query_task_count_ = op.query_task_count();
+  spec.row_async_enabled_ = op.row_async_enabled();
   spec.filter_expr_count_ = (op.get_type() == log_op_def::LOG_SEMANTIC_FILTER ||
                             op.get_type() == log_op_def::LOG_SEMANTIC_JOIN)
       ? op.expressions().count() : 0;
-  if (OB_SUCC(ret) && !op.proxy_configs().empty() &&
+  if (OB_SUCC(ret) && spec.row_async_enabled_ &&
+      (op.get_parallel() != 1 ||
+       (op.get_type() != log_op_def::LOG_SEMANTIC_MAP &&
+        op.get_type() != log_op_def::LOG_SEMANTIC_FILTER))) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "row asynchronous execution requires serial text MAP/FILTER stages");
+  } else if (OB_SUCC(ret) && !op.proxy_configs().empty() &&
       op.proxy_configs().count() != op.semantic_exprs().count()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("embedding proxy bindings do not match generated calls", K(ret));

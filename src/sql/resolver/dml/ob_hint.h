@@ -157,6 +157,7 @@ struct ObOptParamHint
     DEF(SEMANTIC_PROXY_MODEL,)                      \
     DEF(SEMANTIC_PROXY_QUERY,)                      \
     DEF(SEMANTIC_PROXY_THRESHOLD,)                  \
+    DEF(ENABLE_SEMANTIC_ROW_ASYNC,)                 \
 
 
   DECLARE_ENUM(OptParamType, opt_param, OPT_PARAM_TYPE_DEF, static);

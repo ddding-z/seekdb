@@ -402,7 +402,7 @@ struct SemanticFunctionCache::Impl
         : budget_(budget), deadline_(deadline), arena_("SemanticMemo"),
           allocator_(arena_), batch_(allocator_), busy_(false), phase_(QUEUED),
           bytes_(0), credit_(false), max_parallel_(1), kind_(COMPLETION),
-          includes_query_(false)
+          includes_query_(false), completed_count_(0)
     {
     }
     ~Flight()
@@ -442,6 +442,7 @@ struct SemanticFunctionCache::Impl
     ObArray<ObString> prompts_;
     RequestKind kind_;
     bool includes_query_;
+    int64_t completed_count_;
     ObArray<ObString> documents_;
     ObArray<ObString> completion_prompts_;
     ObArray<int64_t> completion_positions_;
@@ -1068,6 +1069,65 @@ struct SemanticFunctionCache::Impl
     }
   }
 
+  int publish_completions(Flight &flight, const ObIArray<ObString> &results,
+                           const ObIArray<int64_t> *positions,
+                           ObIAllocator &allocator, bool &progress)
+  {
+    int ret = OB_SUCCESS;
+    const bool proxy = flight.binding_->proxy_.enabled_;
+    const int64_t expected_count = proxy ? flight.completion_positions_.count()
+                                        : static_cast<int64_t>(flight.entries_.size());
+    if ((nullptr == positions && results.count() != expected_count) ||
+        (nullptr != positions && positions->count() != results.count()))
+    {
+      ret = OB_INVALID_DATA;
+      LOG_WARN("cached semantic response count differs from submitted inputs", K(ret));
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && index < results.count(); ++index)
+    {
+      const int64_t request = nullptr == positions ? index : positions->at(index);
+      if (request < 0 || request >= expected_count)
+      {
+        ret = OB_INVALID_DATA;
+        LOG_WARN("cached semantic completion has invalid position", K(ret), K(request));
+      }
+      else
+      {
+        const ObItemType type = flight.binding_->type_;
+        bool value = false;
+        if (type != T_FUN_SYS_AI_MAP &&
+            OB_FAIL(SemanticExprUtils::parse_boolean_result(
+                type, allocator, results.at(index), value)))
+        {
+        }
+        else
+        {
+          const int64_t position = proxy ? flight.completion_positions_.at(request) : request;
+          std::lock_guard<std::mutex> guard(mutex_);
+          Entry &entry = *flight.entries_.at(position);
+          if (entry.state() != Entry::PENDING)
+          {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("cached semantic completion was published more than once", K(ret), K(request));
+          }
+          else if (OB_FAIL(store_result_locked(entry, results.at(index))))
+          {
+          }
+          else
+          {
+            ++flight.completed_count_;
+            if (nullptr != positions)
+            {
+              entry.state_.store(Entry::COMPLETE, std::memory_order_release);
+              progress = true;
+            }
+          }
+        }
+      }
+    }
+    return ret;
+  }
+
   int drive(const std::shared_ptr<Flight> &flight, bool &progress)
   {
     int ret = OB_SUCCESS;
@@ -1130,6 +1190,10 @@ struct SemanticFunctionCache::Impl
           }
           else
           {
+            if (budget_.row_async_enabled())
+            {
+              flight->batch_.set_incremental_results();
+            }
             ObJsonObject *config = nullptr;
             if (nullptr != flight->binding_->config_ &&
                 nullptr == (config = static_cast<ObJsonObject *>(
@@ -1171,6 +1235,32 @@ struct SemanticFunctionCache::Impl
         bool finished = false;
         ObArray<ObString> results;
         if (OB_SUCC(ret) && flight->phase_.load() == Flight::RUNNING &&
+            flight->kind_ == Flight::COMPLETION && budget_.row_async_enabled())
+        {
+          ObArenaAllocator ready_allocator("SemanticReady");
+          ObArray<int64_t> positions;
+          if (OB_FAIL(flight->batch_.get_ready_results(
+              ready_allocator, positions, results, finished)))
+          {
+          }
+          else if (OB_FAIL(publish_completions(
+              *flight, results, &positions, ready_allocator, progress)))
+          {
+          }
+          else if (finished)
+          {
+            const int64_t expected_count = flight->binding_->proxy_.enabled_
+                ? flight->completion_positions_.count()
+                : static_cast<int64_t>(flight->entries_.size());
+            if (flight->completed_count_ != expected_count)
+            {
+              ret = OB_INVALID_DATA;
+              LOG_WARN("cached semantic flight finished before publishing all results", K(ret));
+            }
+            terminal = true;
+          }
+        }
+        else if (OB_SUCC(ret) && flight->phase_.load() == Flight::RUNNING &&
             OB_FAIL(flight->batch_.poll(finished)))
         {
         }
@@ -1192,36 +1282,7 @@ struct SemanticFunctionCache::Impl
           }
           else
           {
-            const bool proxy = flight->binding_->proxy_.enabled_;
-            const int64_t expected_count =
-                proxy ? flight->completion_positions_.count()
-                      : static_cast<int64_t>(flight->entries_.size());
-            if (results.count() != expected_count)
-            {
-              ret = OB_INVALID_DATA;
-              LOG_WARN(
-                  "cached semantic response count differs from unique inputs",
-                  K(ret));
-            }
-            for (int64_t index = 0; OB_SUCC(ret) && index < results.count();
-                 ++index)
-            {
-              const ObItemType type = flight->binding_->type_;
-              bool value = false;
-              if (type != T_FUN_SYS_AI_MAP &&
-                  OB_FAIL(SemanticExprUtils::parse_boolean_result(
-                      type, flight->allocator_, results.at(index), value)))
-              {
-              }
-              else
-              {
-                const int64_t position =
-                    proxy ? flight->completion_positions_.at(index) : index;
-                std::lock_guard<std::mutex> guard(mutex_);
-                ret = store_result_locked(*flight->entries_.at(position),
-                                          results.at(index));
-              }
-            }
+            ret = publish_completions(*flight, results, nullptr, flight->allocator_, progress);
             terminal = true;
           }
         }

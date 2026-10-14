@@ -78,7 +78,17 @@ public:
   int get_batch_result(ObArray<ObJsonObject *> &responses);
 private:
   friend class AIFuncScheduler;
+  friend class AIFuncBatch;
+  friend class ObAIFuncModel;
   struct Request;
+  void set_incremental_results(bool enabled) { incremental_results_ = enabled; }
+  bool is_incremental_ready() const;
+  int get_ready_batch_results(ObArray<int64_t> &positions, ObArray<ObString> &responses,
+                             bool &finished);
+  int consume_ready_batch_results(const ObArray<int64_t> &positions);
+  void latch_incremental_error(int ret);
+  int parse_response(ObIAllocator &allocator, const ObString &payload,
+                     int64_t request_index, ObJsonObject *&response);
   bool drive_batch();
   void cancel_async();
   int error_handle(CURLcode res);
@@ -104,10 +114,13 @@ private:
   // atomic boolean value, used to check if the batch task is finished
   std::atomic<bool> is_finished_;
   bool async_mode_;
+  bool incremental_results_;
   bool admission_pending_;
   int64_t next_admission_check_;
   std::atomic<bool> async_done_;
   std::atomic<int> cancel_ret_;
+  std::atomic<int> incremental_ret_;
+  std::atomic<int64_t> ready_count_;
   sql::ObSQLSessionInfo *request_session_;
   int64_t max_retry_times_;
   int64_t abs_timeout_ts_;
@@ -136,11 +149,22 @@ class AIFuncBatch
 public:
   explicit AIFuncBatch(ObIAllocator &allocator)
       : allocator_(allocator), provider_(nullptr), batched_response_(false),
-        nonblocking_admission_(false), complete_text_output_(false) {}
+        nonblocking_admission_(false), incremental_results_(false),
+        complete_text_output_(false) {}
   int poll(bool &finished, int64_t wait_ms = 0) { return client_.poll_batch(finished, wait_ms); }
-  bool is_ready() const { return client_.is_async_ready(); }
+  bool is_ready() const
+  {
+    return incremental_results_ && !batched_response_
+        ? client_.is_incremental_ready() : client_.is_async_ready();
+  }
   bool is_waiting_for_admission() const { return client_.is_waiting_for_admission(); }
   void set_nonblocking_admission() { nonblocking_admission_ = true; }
+  // Configure before starting a completion batch; retained across cancel().
+  void set_incremental_results() { incremental_results_ = true; }
+  bool incremental_results() const { return incremental_results_; }
+  // Strings belong to result_allocator; finished covers the entire request group.
+  int get_ready_results(ObIAllocator &result_allocator, ObArray<int64_t> &positions,
+                        ObArray<ObString> &results, bool &finished);
   int get_results(ObArray<ObString> &results);
   void cancel()
   {
@@ -159,10 +183,14 @@ public:
   void require_complete_text_output() { complete_text_output_ = true; }
 private:
   friend class ObAIFuncModel;
+  int append_request_results(ObIAllocator &result_allocator, ObJsonObject *response,
+                             int64_t input_count, ObArray<ObString> &results,
+                             bool copy_text);
   ObIAllocator &allocator_;
   ObAIFuncBase *provider_;
   bool batched_response_;
   bool nonblocking_admission_;
+  bool incremental_results_;
   bool complete_text_output_;
   ObArray<int64_t> input_counts_;
   ObAIFuncClient client_;
