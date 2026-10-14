@@ -19,6 +19,8 @@
 #include "ob_log_ai_func.h"
 #include "ob_log_semantic.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
+#include "sql/engine/expr/ob_expr_json_func_helper.h"
+#include "sql/ob_sql_utils.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_log_table_scan.h"
 #include "sql/optimizer/ob_log_join.h"
@@ -5039,6 +5041,97 @@ bool can_project_semantic_before_sort(const ObSelectStmt &stmt)
   return supported;
 }
 
+const ObRawExpr *semantic_proxy_unwrap_cast(const ObRawExpr *expr)
+{
+  while (nullptr != expr && expr->get_expr_type() == T_FUN_SYS_CAST &&
+         CM_IS_IMPLICIT_CAST(expr->get_cast_mode()) && expr->get_param_count() == 2) {
+    expr = expr->get_param_expr(0);
+  }
+  return expr;
+}
+
+bool semantic_proxy_filter_supported(const LogSemantic &stage, const ObRawExpr &call)
+{
+  bool supported = stage.get_type() == LOG_SEMANTIC_FILTER &&
+      stage.shared_exprs().empty() && stage.carried_exprs().empty() &&
+      call.get_expr_type() == T_FUN_SYS_AI_FILTER &&
+      SemanticExprUtils::supports_function_cache(call);
+  bool positive = false;
+  for (int64_t index = 0; supported && !positive &&
+       index < stage.expressions().count(); ++index) {
+    const ObRawExpr *predicate = stage.expressions().at(index);
+    if (nullptr != predicate && predicate->get_expr_type() == T_OP_BOOL &&
+        predicate->get_param_count() == 1) {
+      predicate = predicate->get_param_expr(0);
+    }
+    positive = semantic_proxy_unwrap_cast(predicate) == &call;
+  }
+  supported = supported && positive;
+  const ObRawExpr *input = supported
+      ? semantic_proxy_unwrap_cast(call.get_param_expr(1)) : nullptr;
+  supported = supported && nullptr != input &&
+      input->get_expr_type() == T_FUN_SYS_AI_INPUT && input->get_param_count() == 2;
+  if (supported) {
+    const ObRawExpr *instruction = input->get_param_expr(0);
+    const ObRawExpr *document = semantic_proxy_unwrap_cast(input->get_param_expr(1));
+    supported = nullptr != instruction && instruction->is_static_scalar_const_expr() &&
+        ob_is_string_type(instruction->get_data_type()) && nullptr != document &&
+        document->is_column_ref_expr() && ob_is_string_type(document->get_data_type());
+  }
+  return supported;
+}
+
+int semantic_proxy_filter_options(ObSelectLogPlan &plan, const ObRawExpr &call,
+                                   SemanticProxyConfig &config, bool &has_threshold)
+{
+  int ret = OB_SUCCESS;
+  if (call.get_param_count() == 3) {
+    ObExecContext *exec_ctx = plan.get_optimizer_context().get_exec_ctx();
+    ObObj value;
+    bool got_value = false;
+    ObIJsonBase *options = nullptr;
+    const ObLobReadOptions *lob_options = nullptr;
+    if (OB_ISNULL(exec_ctx)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(ObSQLUtils::calc_const_or_calculable_expr(
+        exec_ctx, call.get_param_expr(2), value, got_value, plan.get_allocator()))) {
+    } else if (!got_value || value.is_null()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "AI_FILTER proxy options must be a constant JSON object");
+    } else if (OB_FAIL(exec_ctx->get_lob_read_options(lob_options))) {
+    } else if (OB_FAIL(ObJsonExprHelper::transform_convertible_2jsonBase(
+        value, value.get_type(), &plan.get_allocator(), value.get_collation_type(), options,
+        ObConv2JsonParam(false, value.has_lob_header(), false, false, true), lob_options))) {
+    } else if (nullptr == options || options->json_type() != ObJsonNodeType::J_OBJECT) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "AI_FILTER proxy options must be a constant JSON object");
+    } else {
+      ret = SemanticEmbeddingProxy::parse_filter_options(
+          plan.get_allocator(), *static_cast<ObJsonObject *>(options), config, has_threshold);
+    }
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to read constant per-FILTER proxy options", K(ret));
+  }
+  return ret;
+}
+
+bool semantic_proxy_join_supported(const LogSemantic &stage, const ObRawExpr &call)
+{
+  bool supported = stage.get_type() == LOG_SEMANTIC_JOIN &&
+      stage.expressions().count() == 1 && stage.shared_exprs().empty() &&
+      stage.carried_exprs().empty() && call.get_expr_type() == T_FUN_SYS_AI_JOIN &&
+      SemanticExprUtils::supports_function_cache(call) &&
+      nullptr != call.get_param_expr(1) &&
+      call.get_param_expr(1)->is_static_scalar_const_expr();
+  const ObRawExpr *predicate = supported ? stage.expressions().at(0) : nullptr;
+  if (nullptr != predicate && predicate->get_expr_type() == T_OP_BOOL &&
+      predicate->get_param_count() == 1) {
+    predicate = predicate->get_param_expr(0);
+  }
+  return supported && semantic_proxy_unwrap_cast(predicate) == &call;
+}
+
 int semantic_lift_expression_safe(ObRawExpr *expr, bool semantic_recipe,
                                   bool semantic_input, bool &safe,
                                   bool cached_recipe = false)
@@ -5437,13 +5530,18 @@ public:
     return ret;
   }
 
-  int assign_query_limits()
+  int assign_query_limits(ObLogicalOperator &root, bool bind_proxy)
   {
     int ret = OB_SUCCESS;
     bool cache_enabled = false;
-    if (OB_FAIL(plan_.get_optimizer_context().get_global_hint().opt_params_.get_bool_opt_param(
+    bool proxy_enabled = false;
+    const ObOptParamHint &options = plan_.get_optimizer_context().get_global_hint().opt_params_;
+    if (OB_FAIL(options.get_bool_opt_param(
         ObOptParamHint::ENABLE_SEMANTIC_CACHE, cache_enabled))) {
       LOG_WARN("failed to read semantic function cache option", K(ret));
+    } else if (OB_FAIL(options.get_bool_opt_param(
+        ObOptParamHint::ENABLE_SEMANTIC_PROXY, proxy_enabled))) {
+      LOG_WARN("failed to read embedding proxy option", K(ret));
     }
     ObSEArray<ObRawExpr *, 16> calls;
     for (LogSemantic *stage : stages_) {
@@ -5465,6 +5563,104 @@ public:
     }
     for (ObLogGroupBy *group : aggregate_stages_) {
       group->set_semantic_query_task_count(calls.count());
+    }
+    if (OB_SUCC(ret) && proxy_enabled && bind_proxy) {
+      bool serial = true;
+      const bool join = calls.count() == 1 && calls.at(0)->get_expr_type() == T_FUN_SYS_AI_JOIN;
+      int64_t filters = 0;
+      SemanticProxyConfig defaults;
+      ObObj model;
+      ObObj query;
+      ObObj threshold;
+      bool has_threshold = false;
+      if (!cache_enabled) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                       "enable_semantic_proxy requires enable_semantic_cache='true'");
+      } else if (!aggregate_stages_.empty() ||
+                 (join && (stages_.count() != 1 ||
+                           !semantic_proxy_join_supported(*stages_.at(0), *calls.at(0))))) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+            "embedding proxy supports positive text FILTERs with independent MAP output, or one AI_JOIN");
+      }
+      for (LogSemantic *stage : stages_) {
+        for (int64_t index = 0; OB_SUCC(ret) && !join &&
+             index < stage->semantic_exprs().count(); ++index) {
+          const ObRawExpr &call = *stage->semantic_exprs().at(index);
+          if (stage->get_type() == LOG_SEMANTIC_MAP &&
+              call.get_expr_type() == T_FUN_SYS_AI_MAP) {
+          } else if (semantic_proxy_filter_supported(*stage, call)) {
+            ++filters;
+          } else {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                "embedding proxy requires positive text FILTER predicates and independent MAP output");
+          }
+        }
+      }
+      if (OB_SUCC(ret) && !join && filters == 0) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "embedding proxy requires an AI_FILTER predicate or one AI_JOIN");
+      } else if (OB_SUCC(ret) && OB_FAIL(check_solo_plan(&root, serial))) {
+      } else if (!serial) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "embedding proxy V0 requires serial execution");
+      } else if (OB_SUCC(ret) &&
+                 OB_FAIL(options.get_opt_param(ObOptParamHint::SEMANTIC_PROXY_MODEL, model))) {
+      } else if (OB_SUCC(ret) &&
+                 OB_FAIL(options.get_opt_param(ObOptParamHint::SEMANTIC_PROXY_QUERY, query))) {
+      } else if (OB_SUCC(ret) &&
+                 OB_FAIL(options.get_opt_param(ObOptParamHint::SEMANTIC_PROXY_THRESHOLD, threshold))) {
+      } else if (OB_SUCC(ret) && !model.is_nop_value() &&
+                 (!model.is_varchar() || model.get_varchar().empty())) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "embedding proxy model must be a nonempty string");
+      } else if (OB_SUCC(ret) && join && !query.is_nop_value()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                       "AI_JOIN embedding proxy scores left/right inputs; omit semantic_proxy_query");
+      } else if (OB_SUCC(ret) && !query.is_nop_value() &&
+                 (!query.is_varchar() || query.get_varchar().empty())) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "embedding proxy query must be a nonempty string");
+      } else if (OB_SUCC(ret) && !threshold.is_nop_value() &&
+                 OB_FAIL(options.get_semantic_proxy_threshold(defaults.threshold_))) {
+      }
+      if (OB_SUCC(ret)) {
+        defaults.enabled_ = true;
+        defaults.model_ = model.is_nop_value() ? ObString() : model.get_varchar();
+        defaults.query_ = query.is_nop_value() ? ObString() : query.get_varchar();
+        has_threshold = !threshold.is_nop_value();
+        if (join) {
+          if (defaults.model_.empty() || !has_threshold) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "AI_JOIN proxy requires model and threshold hints");
+          } else {
+            ret = stages_.at(0)->set_proxy_config(*calls.at(0), defaults);
+          }
+        } else {
+          for (LogSemantic *stage : stages_) {
+            for (int64_t index = 0; OB_SUCC(ret) && stage->get_type() == LOG_SEMANTIC_FILTER &&
+                 index < stage->semantic_exprs().count(); ++index) {
+              const ObRawExpr &call = *stage->semantic_exprs().at(index);
+              SemanticProxyConfig config = defaults;
+              bool call_has_threshold = has_threshold;
+              if (OB_FAIL(semantic_proxy_filter_options(plan_, call, config, call_has_threshold))) {
+              } else if (config.model_.empty() || config.query_.empty() || !call_has_threshold) {
+                ret = OB_INVALID_ARGUMENT;
+                LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                    "AI_FILTER proxy requires model, query and threshold in semantic_proxy options or hints");
+              } else {
+                ret = stage->set_proxy_config(call, config);
+              }
+            }
+          }
+        }
+      }
+      if (OB_FAIL(ret)) {
+        LOG_WARN("cannot bind experimental embedding proxy", K(ret));
+      }
     }
     return ret;
   }
@@ -5692,6 +5888,14 @@ int ObSelectLogPlan::candi_allocate_semantic(bool projection)
   for (int64_t index = 0; !present && index < candidates_.candidate_plans_.count(); ++index) {
     present = semantic_plan_present(*candidates_.candidate_plans_.at(index).plan_tree_);
   }
+  bool proxy_enabled = false;
+  if (OB_SUCC(ret) && OB_FAIL(get_optimizer_context().get_global_hint().opt_params_
+      .get_bool_opt_param(ObOptParamHint::ENABLE_SEMANTIC_PROXY, proxy_enabled))) {
+    LOG_WARN("failed to read embedding proxy option", K(ret));
+  } else if (OB_SUCC(ret) && projection && proxy_enabled && !present) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "embedding proxy requires a native text AI_FILTER or AI_JOIN");
+  }
   if (OB_SUCC(ret) && present) {
     const ObSelectStmt &stmt = *get_stmt();
     if (stmt.is_set_stmt() || stmt.has_window_function() || stmt.has_for_update() ||
@@ -5705,7 +5909,7 @@ int ObSelectLogPlan::candi_allocate_semantic(bool projection)
       SemanticPlanLowering lowering(*this);
       if (OB_FAIL(lowering.lower(root))) {
       } else if (projection && OB_FAIL(lowering.add_projection(root, selects))) {
-      } else if (OB_FAIL(lowering.assign_query_limits())) {
+      } else if (OB_FAIL(lowering.assign_query_limits(*root, projection))) {
       }
     }
   }
@@ -5716,15 +5920,25 @@ int ObSelectLogPlan::place_semantic_stages()
 {
   int ret = OB_SUCCESS;
   bool enabled = false;
+  bool proxy_enabled = false;
+  bool serial = true;
   ObLogicalOperator *root = nullptr;
   if (OB_FAIL(get_optimizer_context().get_global_hint().opt_params_.get_bool_opt_param(
       ObOptParamHint::ENABLE_SEMANTIC_LIFT, enabled))) {
     LOG_WARN("failed to read semantic placement option", K(ret));
-  } else if (!enabled) {
+  } else if (OB_FAIL(get_optimizer_context().get_global_hint().opt_params_.get_bool_opt_param(
+      ObOptParamHint::ENABLE_SEMANTIC_PROXY, proxy_enabled))) {
+    LOG_WARN("failed to read embedding proxy option", K(ret));
+  } else if (!enabled && !proxy_enabled) {
   } else if (OB_FAIL(candidates_.get_best_plan(root))) {
   } else if (OB_ISNULL(root)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("missing selected plan for semantic placement", K(ret));
+  } else if (proxy_enabled && OB_FAIL(check_solo_plan(root, serial))) {
+  } else if (proxy_enabled && !serial) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "embedding proxy V0 requires serial execution");
+  } else if (!enabled) {
   } else if (semantic_plan_present(*root)) {
     // Select before mutation: candidate plans can share operator subtrees.
     SemanticPlanLowering placement(*this);

@@ -69,6 +69,9 @@ public:
   static bool supports_function_cache(const ObRawExpr &expr);
   static int prepare_cache_key(const ObExpr &expr, ObEvalCtx &ctx,
                                MultimodeAlloctor &allocator, common::ObString &key);
+  static int prepare_join_proxy_input(const ObExpr &expr, ObEvalCtx &ctx,
+                                     MultimodeAlloctor &allocator,
+                                     common::ObString &left, common::ObString &right);
   static int parse_boolean_result(ObItemType type, common::ObIAllocator &allocator,
                                   const common::ObString &result, bool &value);
   static int set_result(const ObExpr &expr, ObEvalCtx &ctx, common::ObDatum &datum,

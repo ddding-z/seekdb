@@ -891,4 +891,213 @@ INFO 查询摘要统计 distinct keys、ready hits、进行中合并、实际提
 composition 10、实际 PX 4 另通过，共 52 项既有 SQL 回归。没有重跑全部历史
 legacy suites，也没有真实模型/云存储/GPU 性能证据。普通 LIMIT drain 不会
 关闭其语义 child，本轮没有为了测试而改动该行为；专项没有独立证明提前关闭
-producer 后 FAILED future 的消费时序。所有私有 DB/mock 均已清理，本轮未提交。
+producer 后 FAILED future 的消费时序。所有私有 DB/mock 均已清理；该缓存版本
+已提交为 `465bbab6c`。
+
+## 14. 实验性 FILTER embedding proxy V0（2026-10-13）
+
+这是显式选择的近似执行，不是结果等价的上提优化。低相似度也可能满足主模型
+判断，因此可能漏行；不提供自动阈值校准或召回率保证。默认关闭，不做高分直接
+接受，不新增逻辑算子或成本模型。
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('enable_semantic_cache', 'true')
+           OPT_PARAM('enable_semantic_lift', 'true')
+           OPT_PARAM('enable_semantic_proxy', 'true')
+           OPT_PARAM('semantic_proxy_model', 'embed_model')
+           OPT_PARAM('semantic_proxy_query', 'database deadlocks')
+           OPT_PARAM('semantic_proxy_threshold', '0.25') */
+       id
+FROM documents
+WHERE AI_FILTER('judge_model',
+               AI_INPUT('Does this text discuss database deadlocks? ', content));
+```
+
+`semantic_proxy_model` 必须指向已注册的 dense embedding 模型；主判断模型
+仍为 completion 模型。开启时 model/query/threshold 三个参数都必须提供，
+threshold 必须为带引号、有限且位于 [-1,1] 的数字。示例 0.25 不是推荐阈值。
+必须同时显式开启函数缓存，上提开关可选。检索描述由用户填写，不从 prompt
+自动猜测，也不把完整判断指令和正文一起作为文档 embedding 输入。
+
+V0 只支持一个语义阶段中的单个正向文本 FILTER，形如
+`AI_FILTER(常量模型, AI_INPUT(固定文字指令, 文本列))`，options 仍可为常量。
+共享/投影 FILTER、NOT/OR/CASE/比较配方、额外语义调用、FILE、AI_AGG 以及
+并行/exchange 计划均明确报不支持。正文为空明确报错；正常输入校验，包括
+SQL NULL 行为，仍在缓存 lookup 前发生，不静默绕过 proxy。
+
+执行顺序为普通关系计算及已有放置规则 → 函数缓存命中/进行中合并 → 唯一
+miss 的异步批量 embedding → cosine 路由。每条查询绑定只提交一次检索描述
+embedding，其他批次等待其结果；文档只取 AI_INPUT 的第二段正文。
+分数严格小于 threshold 时发布 `{"value":false}`；相等或更高时仍请求原
+AI_FILTER 模型。主模型 prompt/options 不变，响应继续通过共用严格布尔解析器。
+原行位置和 SQL bag 保留，不能依靠相似度排序后的数组下标恢复行。
+
+评分复用 seekdb 原生 raw cosine 内核及其 CPU 分派；构建和硬件允许时使用
+AVX2/AVX512，不再单独维护点积/范数循环，也不替换成归一化的 SQL similarity
+接口。保留维度、有限值、非零输入和有限结果检查，内核错误直接传播，不回退
+到自写标量评分。分数仍限制在 [-1,1]，支持非归一化向量，严格小于阈值才拒绝。
+原生浮点累加顺序可能使阈值附近出现微小差异，不保证与旧循环逐位一致。
+本次只复用向量计算，不读取已有 VECTOR 列，不建立或使用 ANN 索引，也不减少
+embedding 请求数量。
+
+缓存绑定额外包含 proxy 模型、检索描述和阈值，近似拒绝不混入普通模型调用的
+缓存身份。两个模型/端点都在 demand 时捕获并由查询持有。查询向量计入缓存
+永久配额，临时 JSON/向量解析、请求和响应计入原查询预算；文档向量评分后
+释放。错误数量/维度、非数字/非有限/零向量、provider 错误和资源不足明确
+传播，不当作低分 false，也不回退为成功结果。
+
+EXPLAIN 新增 `embedding_proxy=REJECT_ONLY, approximate=true, threshold=...`。
+原 INFO 缓存摘要另含 query/document embedding 输入数、proxy 拒绝/转交的
+不同调用数；submitted 主模型调用数不含直接拒绝，不是 HTTP 重试次数。
+不打印 prompt、检索原文、向量或凭据。
+
+源码入口为 [向量解析/评分](../../../src/sql/engine/basic/ob_semantic_proxy.cpp)、
+[查询级路由与缓存](../../../src/sql/engine/basic/ob_semantic_cache.cpp)、
+[输入绑定](../../../src/sql/engine/basic/ob_semantic_op.cpp) 和
+[适用范围检查](../../../src/sql/optimizer/ob_select_log_plan.cpp)。
+少量本地 [SQL/mock 冒烟](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_proxy.py)
+只检查路由、关闭行为、适用范围和错误，不使用真实模型，不试阈值/准确率/性能
+效果；运行方式见 [RUNTIME_TESTS.md](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md#experimental-filter-embedding-proxy-v0-2026-10-13)。
+Debug 构建、3/3 SQL/mock 冒烟及 18/18 原生输入/provider/评分契约通过。
+原生集合新增 3 个 proxy 评分用例，覆盖非归一化 raw cosine、非对齐输入和
+维度尾部、阈值边界、非法向量与数值失败。入口为
+`test_semantic_input.py --build-dir build_debug`；没有重跑全部历史回归或做效果实验。
+这版不包含 ANN、预计算向量、跨查询向量缓存或自动校准；JOIN 扩展见下一节。
+
+## 15. 实验性 AI_JOIN embedding proxy V0
+
+JOIN 复用 cache/proxy/model/threshold 开关，但不需要检索描述。为避免静默
+忽略用户配置，JOIN 提供 `semantic_proxy_query` 时明确报参数错误。
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('enable_semantic_cache', 'true')
+           OPT_PARAM('enable_semantic_proxy', 'true')
+           OPT_PARAM('semantic_proxy_model', 'embed_model')
+           OPT_PARAM('semantic_proxy_threshold', '0.5') */
+       l.id, r.id
+FROM left_inputs l
+JOIN right_inputs r ON l.group_id = r.group_id
+  AND AI_JOIN('judge_model', 'Describe the same issue', l.content, r.content);
+```
+
+执行顺序为原 SQL INNER JOIN 候选对 → 原 pair-result 缓存及进行中合并 →
+左右两侧 embedding → 原生 raw cosine。严格低于阈值时拒绝该对，相等或
+更高时仍交给原 AI_JOIN 模型。只做近似低分拒绝，不保证任意规则的召回率。
+普通 SQL 候选边界、行位置和重复 bag 不变；不建索引、不做 Top-K、
+不按相似度重排候选，也不做 AI_JOIN 上提。示例阈值不是推荐值。
+
+V0 支持 INNER JOIN ON 中的单个正向原生 AI_JOIN、静态文本规则、常量
+模型/options，以及标量文本或有序全文本 AI_INPUT/ROW 两侧；不支持独立的
+外层 WHERE AI_JOIN。仍要求 serial 和函数缓存，不支持
+额外语义调用、复杂布尔/比较配方、FILE、AI_AGG 或 parallel/exchange 计划。
+分别从原始左右参数渲染 embedding 文本，不解析主模型 prompt 来反推两侧；
+有序文本沿用原生 render_text 的拼接行为。规则不参与 embedding，但原规则、
+左右角色、tuple 边界和 options 仍保留在有方向的 pair-result 缓存身份中；
+主模型 prompt 不变。
+
+新增查询级 side-vector future，键为冻结 embedding 模型身份及精确的渲染
+文本字节。相同文本可以跨候选对、跨批次、跨左右角色复用，也合并进行中的
+请求；不同 tuple 即使渲染文本相同，也只共享向量，不共享最终 pair 答案。
+只有新认领的侧文本进入异步 embedding 批次。候选对等待其向量 future，
+复用已有 flight 的 wave credit，不为每个侧输入额外申请 credit。
+
+侧文本键、元数据及向量计入原来的半查询非淘汰缓存配额，查询结束统一释放。
+临时解析和请求/响应仍受查询预算约束；不淘汰后重新 embedding，不 spill，
+不跨查询复用。非法向量、provider 错误、quota、取消和 deadline 均传播到
+依赖的候选对，不当作低分 false，也不回退成成功的主模型请求。
+
+EXPLAIN 保留 `candidate_policy=ALL_SQL_CANDIDATES`，另标记
+`embedding_proxy=REJECT_ONLY, proxy_input=LEFT_RIGHT_TEXT, approximate=true,
+threshold=...`。缓存摘要增加 JOIN 不同侧输入的 embedding 数、已完成向量
+命中和进行中向量合并计数，不打印原文、规则、向量或凭据。
+
+新增少量本地 [JOIN SQL/mock 冒烟](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_join_proxy.py)；
+运行方式见 [RUNTIME_TESTS.md](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md#experimental-ai_join-embedding-proxy-v0)。
+最终 Debug 构建、JOIN SQL/mock 3/3、既有 FILTER proxy 回归 3/3 及原生
+输入/provider/评分 18/18 通过。固定 mock 检查进行中向量合并、跨批次复用、
+非对称 pair 答案、重复 bag、阈值相等时转交、乱序响应索引、有序侧文本、
+非法参数/不支持形式零 provider 工作，以及 embedding 失败后独立查询恢复。
+路由 fixture 有 15 个 SQL 候选、10 个不同有向 pair：开启 proxy 时只有
+5 个不同侧文本 embedding、8 个 pair 转交主模型；关闭时为零 embedding、
+10 个不同 pair 主模型请求。这些只是功能路由及计数契约，不是效果证据。
+不做真实模型、准确率、吞吐、延迟、阈值或 SemBench 效果实验。
+
+## 16. 每个 FILTER 的 proxy 配置与组合（2026-10-14）
+
+第 14、15 节保留 V0 的历史边界。当前实现已支持多个独立正向 FILTER
+分别使用 proxy，以及先 FILTER、仅对留下的行执行独立 AI_MAP。
+JOIN 仍只支持单个语义调用，不因此开放 JOIN + FILTER/MAP。
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('rowsets_max_rows',8)
+           OPT_PARAM('enable_semantic_cache','true')
+           OPT_PARAM('enable_semantic_proxy','true') */
+       id, AI_MAP('judge_model', AI_INPUT('Extract a short title: ', content),
+                  '{"temperature":0}') AS title
+FROM documents
+WHERE AI_FILTER('judge_model', AI_INPUT('Discusses database deadlocks? ', content),
+                '{"temperature":0,"semantic_proxy":{"model":"embed_model","query":"database deadlocks","threshold":0.4}}')
+  AND AI_FILTER('judge_model', AI_INPUT('Discusses transactions? ', content),
+                '{"temperature":0,"semantic_proxy":{"model":"embed_model","query":"database transactions","threshold":0.3}}');
+```
+
+示例阈值仅展示接口，不是推荐值。每个 FILTER 的常量 options 中可包含
+`semantic_proxy.model/query/threshold`，缺省字段继承对应 query hint。
+该字段只属于 seekdb，送往主模型之前删除；其他 generation options 不变。
+未打开总开关时仍是精确路径。未知字段、非法类型、非有限/越界阈值和在
+MAP/JOIN/AGG options 中使用该字段均明确报错，不静默忽略。
+示例显式使用较小 rowset；调用者仍须按 embedding 服务的输入上限设置批量，
+当前没有自动按 provider cap 拆批。
+
+逻辑/物理配置数组与语义表达式一一对应，任务携带自己的配置，不能再假设
+整个算子只有一个 proxy。EXPLAIN、codegen、序列化和函数缓存身份同步保留
+这种绑定。配置的调试打印只含 enabled/threshold，不含检索原文或模型输入。
+FILTER 文档向量仍在评分后释放，没有通用的跨 FILTER 文档向量复用。
+
+仍要求 serial/cache，且不支持共享或投影 FILTER、NOT/OR/CASE/比较配方、
+FILE、AI_AGG 或 PX proxy。多个 FILTER 分别满足召回目标，不代表最终 AND
+组合也满足同一个目标；必须另外验证组合查询输出。上提改变关系候选范围
+时也必须重新核对校准 scope。
+
+Debug 构建、FILTER SQL/mock 5/5、JOIN SQL/mock 3/3、原生输入/provider/
+options/评分 20/20 通过。本次没有新增真实模型性能结论。
+
+## 17. 外置保守校准与原生评分一致性
+
+工作区新增 [校准和实验入口](../../../../experiments/sembench/README.md#10-原生评分独立验证的-reject-only-proxy-校准)。
+当前是显式外置工具，不是优化器在查询中自动抽样/学习。入口消费已采集的
+oracle 标签与 embedding 向量；不自动启动服务、注册端点或采集证据。
+
+先从整个固定总体按 ID 无放回抽样，划分互不重叠的 learning、validation、
+evaluation。只在 learning 上选最高的可行经验阈值；冻结后以 validation
+的单侧 Clopper–Pearson recall 下界认证，不用验证漏报继续调参。默认
+recall 0.95 / failure probability 0.05，即使零漏报也至少需要 59 个
+不同验证正例。没有正例、证据不足、没有负例剪枝、分数无信息或认证失败，
+都会输出禁用策略、null 生效阈值和明确原因，仍走原主模型。
+
+[原生评分 helper](../../../tools/deploy/mysql_test/test_suite/ai_function/semantic_proxy_score.cpp)
+链接同一次 Debug 构建的向量解析/cosine 对象，保留 float32 转换、CPU 分派和
+严格小于阈值的边界。manifest 校验 scorer/seekdb hash、内核版本和 CPU flags，
+不以 Python double cosine 或旧实验评分代替。JSONL 保留字符串/有向 pair ID，
+输入/内核错误明确失败。向量流式传递，profile 保存 ID/score/label，不长期
+保留整份向量矩阵。
+
+profile 绑定主模型/公开版本、instruction/options、embedding/query、输入配方、
+候选 scope 与 score contract。无凭据、版本化完整性校验、原子无覆盖保存；
+完整性不是身份认证，标签/向量 provenance 和 provider identity 仍须可信、
+冻结并由调用者如实声明。分布漂移、重复验证挑 seed、共享实体的 pair 相关性
+或 AND/聚合组合都不能据此宣称一般性的 recall 保证。
+
+实验工具导出 per-FILTER options 或原 JOIN hints，连接指定 Unix socket 后
+用 SO_PEERCRED / 运行二进制 hash 核验服务器。对照固定相同 lift 和 batch，
+核对 scope/计划、精确基线稳定性、冻结 oracle、重复 bag、配对 recall、MAP 值
+以及自连接非自匹配正例。未知采集成本不推断为零，失败不产出有效 speedup。
+一次绑定一个 calibrated FILTER/JOIN；完整聚合或多 FILTER 的最终质量仍需
+另外的 oracle。
+
+53 项校准/profile 测试、原生 scorer 到认证 FILTER SQL / 禁用后精确 SQL
+两条 mock 接线通过。未新增真实模型效果实验；不包含自动成本选路、自动采集、
+共享 FILTER 向量缓存、自适应拆批、mapper-assisted JOIN、ANN 或 PX proxy。

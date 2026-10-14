@@ -236,6 +236,7 @@ SQL_UNITY_GROUPS = [
             "src/sql/engine/basic/ob_semantic_op.cpp",
             "src/sql/engine/basic/ob_semantic_runtime.cpp",
             "src/sql/engine/basic/ob_semantic_cache.cpp",
+            "src/sql/engine/basic/ob_semantic_proxy.cpp",
             "src/sql/engine/basic/ob_semantic_aggregation.cpp",
             "src/sql/engine/basic/ob_semantic_media.cpp",
             "src/sql/engine/basic/ob_monitoring_dump_op.cpp",

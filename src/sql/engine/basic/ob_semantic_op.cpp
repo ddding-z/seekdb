@@ -55,7 +55,7 @@ SemanticRequestMemory request_memory(const SemanticInput &input)
 
 OB_SERIALIZE_MEMBER((SemanticSpec, ObOpSpec), expressions_, semantic_exprs_, owned_exprs_,
                     local_exprs_, shared_exprs_, carried_exprs_, query_task_count_, filter_expr_count_,
-                    memoized_exprs_);
+                    memoized_exprs_, proxy_configs_);
 OB_SERIALIZE_MEMBER((SemanticMapSpec, SemanticSpec));
 OB_SERIALIZE_MEMBER((SemanticFilterSpec, SemanticSpec));
 OB_SERIALIZE_MEMBER((SemanticJoinSpec, SemanticSpec), join_exprs_);
@@ -114,12 +114,15 @@ struct SemanticOp::Dispatch
 struct SemanticOp::Task
 {
   enum RowState : uint8_t { UNREQUESTED, QUEUED, IN_FLIGHT, COMPLETE, CACHE_WAIT };
-  Task(const ObExpr *expr, int64_t max_parallel, bool memoized)
+  Task(const ObExpr *expr, int64_t max_parallel, bool memoized,
+       const SemanticProxyConfig *proxy)
       : expression_(expr), request_arena_("SemanticReq"), request_allocator_(request_arena_),
         dispatches_(nullptr), states_(nullptr), results_(nullptr), config_(nullptr), info_(nullptr),
         input_bytes_(0), in_flight_rows_(0), max_parallel_(max_parallel), credit_(false),
         memoized_(memoized), cache_keys_(nullptr), cache_prompts_(nullptr),
-        cache_handles_(nullptr), cache_binding_id_(0) {}
+        cache_handles_(nullptr), cache_binding_id_(0), proxy_config_(proxy),
+        join_proxy_(nullptr != proxy && expr->type_ == T_FUN_SYS_AI_JOIN),
+        proxy_lefts_(nullptr), proxy_rights_(nullptr) {}
   ~Task()
   {
     while (nullptr != dispatches_) {
@@ -157,6 +160,10 @@ struct SemanticOp::Task
   ObString *cache_prompts_;
   SemanticFunctionCache::Handle *cache_handles_;
   uint64_t cache_binding_id_;
+  const SemanticProxyConfig *proxy_config_;
+  bool join_proxy_;
+  ObString *proxy_lefts_;
+  ObString *proxy_rights_;
 };
 
 struct SemanticOp::Slot
@@ -211,6 +218,33 @@ int SemanticOp::validate_shared_expressions() const
   return ret;
 }
 
+int SemanticOp::validate_proxy_configs() const
+{
+  int ret = OB_SUCCESS;
+  const SemanticSpec &spec = semantic_spec();
+  if (!spec.proxy_configs_.empty() &&
+      spec.proxy_configs_.count() != spec.semantic_exprs_.count()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("embedding proxy bindings do not match runtime calls", K(ret));
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && index < spec.proxy_configs_.count(); ++index) {
+    if (!spec.proxy_configs_.at(index).enabled_) {
+      continue;
+    }
+    const ObExpr *expr = spec.semantic_exprs_.at(index);
+    const bool join = spec_.type_ == PHY_SEMANTIC_JOIN;
+    if ((spec_.type_ != PHY_SEMANTIC_FILTER && !join) || nullptr == expr ||
+        expr->type_ != (join ? T_FUN_SYS_AI_JOIN : T_FUN_SYS_AI_FILTER) ||
+        !contains_expression(spec.memoized_exprs_, expr) ||
+        (join && (spec.semantic_exprs_.count() != 1 || spec.query_task_count_ != 1))) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "embedding proxy requires memoized text FILTER calls or one AI_JOIN");
+      LOG_WARN("unsupported embedding proxy runtime binding", K(ret));
+    }
+  }
+  return ret;
+}
+
 int SemanticOp::inner_open()
 {
   int ret = OB_SUCCESS;
@@ -225,6 +259,7 @@ int SemanticOp::inner_open()
              (!is_filter() && spec.filter_expr_count_ != 0)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid semantic filter condition count", K(ret), K(spec.filter_expr_count_));
+  } else if (OB_FAIL(validate_proxy_configs())) {
   } else if (OB_FAIL(validate_shared_expressions())) {
   } else if (spec_.type_ == PHY_SEMANTIC_JOIN &&
              OB_FAIL(static_cast<const SemanticJoinSpec &>(spec_).validate_bindings())) {
@@ -430,7 +465,9 @@ int64_t SemanticOp::slot_metadata_bytes(int64_t size) const
       expressions * (sizeof(ObDatum) + sizeof(uint8_t)) + sizeof(int64_t) +
       tasks * (sizeof(uint8_t) + sizeof(ObString))) +
       tasks * (sizeof(Task) + sizeof(Task *)) +
-      size * memoized * (2 * sizeof(ObString) + sizeof(SemanticFunctionCache::Handle));
+      size * memoized * (2 * sizeof(ObString) + sizeof(SemanticFunctionCache::Handle)) +
+      (semantic_spec().has_embedding_proxy() && spec_.type_ == PHY_SEMANTIC_JOIN
+          ? size * 2 * sizeof(ObString) : 0);
 }
 
 int SemanticOp::allocate_slot(Slot &slot, int64_t size)
@@ -458,8 +495,11 @@ int SemanticOp::allocate_slot(Slot &slot, int64_t size)
     }
     for (int64_t index = 0; OB_SUCC(ret) && index < tasks; ++index) {
       const ObExpr *expr = semantic_spec().semantic_exprs_.at(index);
+      const SemanticProxyConfig *proxy = semantic_spec().proxy_configs_.empty() ||
+          !semantic_spec().proxy_configs_.at(index).enabled_
+          ? nullptr : &semantic_spec().proxy_configs_.at(index);
       auto *task = OB_NEWx(Task, &allocator, expr, size,
-          contains_expression(semantic_spec().memoized_exprs_, expr));
+          contains_expression(semantic_spec().memoized_exprs_, expr), proxy);
       if (OB_ISNULL(task)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else {
@@ -490,6 +530,18 @@ int SemanticOp::allocate_slot(Slot &slot, int64_t size)
               } else {
                 for (int64_t row = 0; row < size; ++row) {
                   new (&task->cache_handles_[row]) SemanticFunctionCache::Handle();
+                }
+              }
+              if (OB_SUCC(ret) && task->join_proxy_) {
+                task->proxy_lefts_ = static_cast<ObString *>(allocator.alloc(size * sizeof(ObString)));
+                task->proxy_rights_ = static_cast<ObString *>(allocator.alloc(size * sizeof(ObString)));
+                if (nullptr == task->proxy_lefts_ || nullptr == task->proxy_rights_) {
+                  ret = OB_ALLOCATE_MEMORY_FAILED;
+                } else {
+                  for (int64_t row = 0; row < size; ++row) {
+                    new (&task->proxy_lefts_[row]) ObString();
+                    new (&task->proxy_rights_[row]) ObString();
+                  }
                 }
               }
             }
@@ -753,6 +805,8 @@ int SemanticOp::evaluate(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &result)
       MultimodeAlloctor input_allocator(input_guard.get_allocator());
       ObString model;
       ObString cache_key;
+      ObString proxy_left;
+      ObString proxy_right;
       SemanticInput input;
       ObJsonObject *config = nullptr;
       const bool first_request = task->rows_.empty();
@@ -761,12 +815,15 @@ int SemanticOp::evaluate(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &result)
                                                           model, input, config, first_request))) {
       } else if (task->memoized_ && OB_FAIL(SemanticExprUtils::prepare_cache_key(
           expr, ctx, input_allocator, cache_key))) {
+      } else if (task->join_proxy_ && OB_FAIL(SemanticExprUtils::prepare_join_proxy_input(
+          expr, ctx, input_allocator, proxy_left, proxy_right))) {
       } else {
         const uint64_t config_bytes = nullptr == config ? 0 : config->get_serialize_size();
         bytes = input.owned_bytes_ + sizeof(SemanticInput) +
                 input.parts_.count() * sizeof(SemanticInputPart) +
                 (first_request ? model.length() : 0) + cache_key.length() +
-                (task->memoized_ && input.parts_.count() > 1 ? input.owned_bytes_ : 0);
+                (task->memoized_ && input.parts_.count() > 1 ? input.owned_bytes_ : 0) +
+                proxy_left.length() + proxy_right.length();
         if (bytes > ObAIFuncClient::MAX_BATCH_BYTES ||
             config_bytes > static_cast<uint64_t>(ObAIFuncClient::MAX_BATCH_BYTES - bytes)) {
           ret = OB_SIZE_OVERFLOW;
@@ -794,6 +851,12 @@ int SemanticOp::evaluate(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &result)
           if (OB_FAIL(ob_write_string(task->request_allocator_, cache_key, task->cache_keys_[row]))) {
           } else {
             ret = owned_input->render_text(task->request_allocator_, task->cache_prompts_[row]);
+          }
+        }
+        if (OB_SUCC(ret) && task->join_proxy_) {
+          if (OB_FAIL(ob_write_string(task->request_allocator_, proxy_left, task->proxy_lefts_[row]))) {
+          } else {
+            ret = ob_write_string(task->request_allocator_, proxy_right, task->proxy_rights_[row]);
           }
         }
         if (OB_FAIL(ret)) {
@@ -1041,20 +1104,45 @@ int SemanticOp::submit_cached_tasks(Slot &slot, Task &task, bool &progress)
   ObArray<int64_t> rows;
   ObArray<ObString> keys;
   ObArray<ObString> prompts;
+  ObArray<ObString> documents;
+  ObArray<ObString> right_documents;
+  const SemanticProxyConfig *proxy = task.proxy_config_;
   std::vector<SemanticFunctionCache::Handle> handles;
-  for (int64_t row : task.rows_) {
+  for (int64_t position = 0; OB_SUCC(ret) && position < task.rows_.count(); ++position) {
+    const int64_t row = task.rows_.at(position);
     if (OB_FAIL(ret) || task.states_[row] != Task::QUEUED) {
     } else if (OB_FAIL(rows.push_back(row))) {
     } else if (OB_FAIL(keys.push_back(task.cache_keys_[row]))) {
     } else {
       ret = prompts.push_back(task.cache_prompts_[row]);
     }
+    if (OB_SUCC(ret) && nullptr != proxy && task.states_[row] == Task::QUEUED) {
+      const SemanticInput &input = *task.inputs_.at(position);
+      if (task.join_proxy_) {
+        if (OB_FAIL(documents.push_back(task.proxy_lefts_[row]))) {
+        } else {
+          ret = right_documents.push_back(task.proxy_rights_[row]);
+        }
+      } else if (input.has_files_ || input.parts_.count() != 2 ||
+          input.parts_.at(1).kind_ != SemanticInputPart::TEXT) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("embedding proxy lost its ordered text input binding", K(ret));
+      } else if (input.parts_.at(1).value_.empty()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "embedding proxy document must not be empty");
+        LOG_WARN("empty embedding proxy document", K(ret));
+      } else {
+        ret = documents.push_back(input.parts_.at(1).value_);
+      }
+    }
   }
   if (OB_FAIL(ret) || rows.empty()) {
   } else if (nullptr == function_cache_) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(function_cache_->submit(task.expression_->type_, task.model_, task.config_,
-      keys, prompts, task.max_parallel_, task.cache_binding_id_, handles, progress))) {
+      keys, prompts, task.max_parallel_, task.cache_binding_id_, handles, progress,
+      proxy, nullptr != proxy ? &documents : nullptr,
+      task.join_proxy_ ? &right_documents : nullptr))) {
   } else {
     for (int64_t index = 0; index < rows.count(); ++index) {
       if (handles.at(index)) {
@@ -1390,8 +1478,22 @@ bool SemanticOp::can_resume(const void *data)
                   task.cache_handles_[row]->state() != SemanticFunctionCache::Entry::PENDING;
             } else if (task.states_[row] == Task::QUEUED) {
               const int64_t config_bytes = nullptr == task.config_ ? 0 : task.config_->get_serialize_size();
+              int64_t proxy_bytes = 0;
+              if (task.join_proxy_) {
+                proxy_bytes = 6 * (task.proxy_lefts_[row].length() +
+                                  task.proxy_rights_[row].length()) + 8192;
+              } else if (nullptr != task.proxy_config_) {
+                const auto &parts = task.inputs_.at(position)->parts_;
+                if (parts.count() != 2 || parts.at(1).value_.empty()) {
+                  ready = true;
+                  continue;
+                }
+                proxy_bytes = 6 * (parts.at(1).value_.length() +
+                    task.proxy_config_->query_.length()) + 4096;
+              }
               ready = operation.function_cache_ && operation.function_cache_->can_submit(
-                  task.cache_binding_id_, task.cache_keys_[row], task.cache_prompts_[row], config_bytes);
+                  task.cache_binding_id_, task.cache_keys_[row], task.cache_prompts_[row],
+                  config_bytes, proxy_bytes);
             }
             continue;
           }

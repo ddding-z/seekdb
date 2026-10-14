@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "ob_hint.h"
 #include "sql/optimizer/ob_log_plan.h"
+#include <cmath>
 
 namespace oceanbase
 {
@@ -625,17 +626,55 @@ int ObOptParamHint::merge_opt_param_hint(const ObOptParamHint &other)
   return ret;
 }
 
+namespace
+{
+bool parse_semantic_proxy_threshold(const ObObj &value, double &threshold)
+{
+  bool valid = false;
+  if (value.is_varchar() && !value.get_varchar().empty()) {
+    const ObString text = value.get_varchar();
+    char *end = nullptr;
+    int error = 0;
+    threshold = ObCharset::strntod(text.ptr(), text.length(), &end, &error);
+    valid = error == 0 && end == text.ptr() + text.length() &&
+        std::isfinite(threshold) && threshold >= -1 && threshold <= 1;
+  }
+  return valid;
+}
+}
+
+int ObOptParamHint::get_semantic_proxy_threshold(double &val) const
+{
+  int ret = OB_SUCCESS;
+  ObObj value;
+  if (OB_FAIL(get_opt_param(SEMANTIC_PROXY_THRESHOLD, value))) {
+  } else if (!parse_semantic_proxy_threshold(value, val)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                   "semantic_proxy_threshold requires a quoted finite number in [-1,1]");
+    LOG_WARN("missing or invalid semantic proxy threshold", K(ret));
+  }
+  return ret;
+}
+
 int ObOptParamHint::add_opt_param_hint(const OptParamType param_type, const ObObj &val)
 {
   int ret = OB_SUCCESS;
   ObObj cur_value;
   if (!is_param_val_valid(param_type, val)) {
-    if (param_type == ENABLE_SEMANTIC_LIFT || param_type == ENABLE_SEMANTIC_CACHE) {
+    if (param_type == ENABLE_SEMANTIC_LIFT || param_type == ENABLE_SEMANTIC_CACHE ||
+        param_type == ENABLE_SEMANTIC_PROXY || param_type == SEMANTIC_PROXY_MODEL ||
+        param_type == SEMANTIC_PROXY_QUERY || param_type == SEMANTIC_PROXY_THRESHOLD) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, param_type == ENABLE_SEMANTIC_LIFT
-          ? "enable_semantic_lift requires 'true' or 'false'"
-          : "enable_semantic_cache requires 'true' or 'false'");
-      LOG_WARN("invalid semantic execution option", K(ret), K(param_type), K(val));
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+          param_type == ENABLE_SEMANTIC_LIFT ? "enable_semantic_lift requires 'true' or 'false'" :
+          param_type == ENABLE_SEMANTIC_CACHE ? "enable_semantic_cache requires 'true' or 'false'" :
+          param_type == ENABLE_SEMANTIC_PROXY ? "enable_semantic_proxy requires 'true' or 'false'" :
+          param_type == SEMANTIC_PROXY_MODEL ? "semantic_proxy_model requires a nonempty model name" :
+          param_type == SEMANTIC_PROXY_QUERY ? "semantic_proxy_query requires nonempty retrieval text" :
+          "semantic_proxy_threshold requires a quoted finite number in [-1,1]");
+      LOG_WARN("invalid semantic execution option", K(ret), K(param_type),
+               "value_type", val.get_type());
     }
   } else if (OB_FAIL(get_opt_param(param_type, cur_value))) {
   } else if (!cur_value.is_nop_value()) {
@@ -671,9 +710,20 @@ bool ObOptParamHint::is_param_val_valid(const OptParamType param_type, const ObO
     case ENABLE_TOPN_RUNTIME_FILTER:
     case ENABLE_SEMANTIC_LIFT:
     case ENABLE_SEMANTIC_CACHE:
+    case ENABLE_SEMANTIC_PROXY:
     case PRESERVE_ORDER_FOR_GROUPBY: {
       is_valid = val.is_varchar() && (0 == val.get_varchar().case_compare("true")
                                       || 0 == val.get_varchar().case_compare("false"));
+      break;
+    }
+    case SEMANTIC_PROXY_MODEL:
+    case SEMANTIC_PROXY_QUERY: {
+      is_valid = val.is_varchar() && !val.get_varchar().empty();
+      break;
+    }
+    case SEMANTIC_PROXY_THRESHOLD: {
+      double threshold = 0;
+      is_valid = parse_semantic_proxy_threshold(val, threshold);
       break;
     }
     case ROWSETS_MAX_ROWS: {

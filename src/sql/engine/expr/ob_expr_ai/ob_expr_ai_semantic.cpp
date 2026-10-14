@@ -21,6 +21,7 @@
 #include "common/object/file_ref.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
 #include "sql/resolver/dml/ob_select_stmt.h"
+#include "sql/engine/basic/ob_semantic_proxy.h"
 
 namespace oceanbase
 {
@@ -89,6 +90,29 @@ int calc_semantic_result_type(ObExprResType &type, ObExprResType *types,
         type.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObLongTextType]);
       }
     }
+  }
+  return ret;
+}
+
+int remove_semantic_proxy_options(MultimodeAlloctor &allocator, ObJsonObject *config,
+                                  ObItemType type)
+{
+  int ret = OB_SUCCESS;
+  if (nullptr == config || nullptr == config->get_value("semantic_proxy")) {
+  } else if (type != T_FUN_SYS_AI_FILTER) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "semantic_proxy options are supported only by AI_FILTER");
+  } else {
+    SemanticProxyConfig overrides;
+    bool has_threshold = false;
+    if (OB_FAIL(SemanticEmbeddingProxy::parse_filter_options(
+        allocator, *config, overrides, has_threshold))) {
+    } else {
+      ret = config->remove("semantic_proxy");
+    }
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to remove engine-only semantic proxy options", K(ret), K(type));
   }
   return ret;
 }
@@ -547,6 +571,9 @@ int SemanticExprUtils::prepare_input(const ObExpr &expr, ObEvalCtx &ctx,
         config = static_cast<ObJsonObject *>(options);
       }
     }
+    if (OB_SUCC(ret) && prepare_config &&
+        OB_FAIL(remove_semantic_proxy_options(allocator, config, expr.type_))) {
+    }
     if (OB_SUCC(ret) && prepare_config && (expr.type_ == T_FUN_SYS_AI_FILTER || is_join) &&
         OB_FAIL(prepare_semantic_boolean_config(allocator, config, expr.type_))) {
     }
@@ -648,6 +675,9 @@ int SemanticExprUtils::prepare_request_input(const ObExpr &expr, ObEvalCtx &ctx,
         config = static_cast<ObJsonObject *>(options);
       }
     }
+    if (OB_SUCC(ret) && prepare_config &&
+        OB_FAIL(remove_semantic_proxy_options(allocator, config, expr.type_))) {
+    }
     if (OB_SUCC(ret) && prepare_config && (is_join || expr.type_ == T_FUN_SYS_AI_FILTER)) {
       ret = prepare_semantic_boolean_config(allocator, config, expr.type_);
     }
@@ -699,6 +729,35 @@ bool SemanticExprUtils::supports_function_cache(const ObRawExpr &expr)
     supported = semantic_cache_text_input(expr.get_param_expr(argument));
   }
   return supported;
+}
+
+int SemanticExprUtils::prepare_join_proxy_input(const ObExpr &expr, ObEvalCtx &ctx,
+                                               MultimodeAlloctor &allocator,
+                                               ObString &left, ObString &right)
+{
+  int ret = OB_SUCCESS;
+  if (expr.type_ != T_FUN_SYS_AI_JOIN || (expr.arg_cnt_ != 4 && expr.arg_cnt_ != 5) ||
+      nullptr == expr.args_ || nullptr == expr.args_[2] || nullptr == expr.args_[3]) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  for (uint16_t argument = 2; OB_SUCC(ret) && argument <= 3; ++argument) {
+    SemanticInput input;
+    bool ordered = false;
+    ObString &text = argument == 2 ? left : right;
+    if (OB_FAIL(append_semantic_argument(expr, argument, ctx, allocator, input, ordered))) {
+    } else if (input.has_files_) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_JOIN embedding proxy supports text inputs only");
+    } else if (OB_FAIL(input.render_text(allocator, text))) {
+    } else if (text.empty()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "AI_JOIN embedding proxy inputs must not be empty");
+    }
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to capture AI_JOIN proxy inputs", K(ret));
+  }
+  return ret;
 }
 
 int SemanticExprUtils::prepare_cache_key(const ObExpr &expr, ObEvalCtx &ctx,

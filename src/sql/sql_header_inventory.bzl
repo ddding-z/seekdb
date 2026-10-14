@@ -485,6 +485,7 @@ SQL_PRIVATE_HEADERS = [
     "engine/basic/ob_semantic_op.h",
     "engine/basic/ob_semantic_runtime.h",
     "engine/basic/ob_semantic_cache.h",
+    "engine/basic/ob_semantic_proxy.h",
     "engine/basic/ob_semantic_aggregation.h",
     "engine/basic/ob_semantic_media.h",
     "engine/basic/ob_material_op_impl.h",

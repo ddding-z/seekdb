@@ -153,6 +153,10 @@ struct ObOptParamHint
     DEF(APPROX_COUNT_DISTINCT_PRECISION,)           \
     DEF(ENABLE_SEMANTIC_LIFT,)                      \
     DEF(ENABLE_SEMANTIC_CACHE,)                     \
+    DEF(ENABLE_SEMANTIC_PROXY,)                     \
+    DEF(SEMANTIC_PROXY_MODEL,)                      \
+    DEF(SEMANTIC_PROXY_QUERY,)                      \
+    DEF(SEMANTIC_PROXY_THRESHOLD,)                  \
 
 
   DECLARE_ENUM(OptParamType, opt_param, OPT_PARAM_TYPE_DEF, static);
@@ -170,6 +174,7 @@ struct ObOptParamHint
   int get_bool_opt_param(const OptParamType param_type, bool &val) const;
   int get_integer_opt_param(const OptParamType param_type, int64_t &val, bool &is_exists) const;
   int get_integer_opt_param(const OptParamType param_type, int64_t &val) const;
+  int get_semantic_proxy_threshold(double &val) const;
   int get_opt_param_runtime_filter_type(int64_t &rf_type) const;
   int get_hash_rollup_param(ObObj &val, bool &has_opt_param) const;
   int get_enum_opt_param(const OptParamType param_type, int64_t &val) const;

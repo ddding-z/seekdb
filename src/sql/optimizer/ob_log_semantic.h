@@ -2,6 +2,7 @@
 #define OCEANBASE_SQL_OPTIMIZER_LOG_SEMANTIC_H_
 
 #include "sql/optimizer/ob_logical_operator.h"
+#include "sql/engine/basic/ob_semantic_proxy.h"
 
 namespace oceanbase
 {
@@ -26,6 +27,10 @@ public:
   int64_t query_task_count() const { return query_task_count_; }
   void set_function_cache_enabled(bool enabled) { function_cache_enabled_ = enabled; }
   bool function_cache_enabled() const { return function_cache_enabled_; }
+  const common::ObIArray<SemanticProxyConfig> &proxy_configs() const { return proxy_configs_; }
+  int set_proxy_config(const ObRawExpr &expr, const SemanticProxyConfig &config);
+  int64_t proxy_count() const;
+  bool has_embedding_proxy() const { return proxy_count() > 0; }
   void record_lifted_join() { ++lifted_join_count_; lift_stop_reason_ = nullptr; }
   void set_lift_stop_reason(const char *reason) { lift_stop_reason_ = reason; }
   int get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item) override;
@@ -48,6 +53,7 @@ private:
   int64_t lifted_join_count_;
   const char *lift_stop_reason_;
   bool function_cache_enabled_;
+  common::ObSEArray<SemanticProxyConfig, 8> proxy_configs_;
 };
 
 class LogSemanticMap : public LogSemantic

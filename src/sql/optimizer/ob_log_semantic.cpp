@@ -77,6 +77,41 @@ int LogSemantic::add_carried_expression(ObRawExpr *expr)
   return add_var_to_array_no_dup(carried_exprs_, expr);
 }
 
+int LogSemantic::set_proxy_config(const ObRawExpr &expr, const SemanticProxyConfig &config)
+{
+  int ret = OB_SUCCESS;
+  int64_t position = -1;
+  for (int64_t index = 0; position < 0 && index < semantic_exprs_.count(); ++index) {
+    if (semantic_exprs_.at(index) == &expr) {
+      position = index;
+    }
+  }
+  if (position < 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("embedding proxy call is not owned by its semantic stage", K(ret));
+  } else if (proxy_configs_.empty()) {
+    for (int64_t index = 0; OB_SUCC(ret) && index < semantic_exprs_.count(); ++index) {
+      ret = proxy_configs_.push_back(SemanticProxyConfig());
+    }
+  }
+  if (OB_SUCC(ret) && proxy_configs_.count() != semantic_exprs_.count()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("embedding proxy bindings do not match semantic calls", K(ret));
+  } else if (OB_SUCC(ret)) {
+    proxy_configs_.at(position) = config;
+  }
+  return ret;
+}
+
+int64_t LogSemantic::proxy_count() const
+{
+  int64_t count = 0;
+  for (const SemanticProxyConfig &config : proxy_configs_) {
+    count += config.enabled_;
+  }
+  return count;
+}
+
 int LogSemantic::get_op_exprs(ObIArray<ObRawExpr *> &exprs)
 {
   int ret = OB_SUCCESS;
@@ -139,7 +174,8 @@ int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_ite
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(ObLogicalOperator::get_plan_item_info(plan_text, plan_item))) {
-  } else if (lifted_join_count_ > 0 || nullptr != lift_stop_reason_ || function_cache_enabled_) {
+  } else if (lifted_join_count_ > 0 || nullptr != lift_stop_reason_ ||
+             function_cache_enabled_ || has_embedding_proxy()) {
     BEGIN_BUF_PRINT;
     const bool placement = lifted_join_count_ > 0 || nullptr != lift_stop_reason_;
     if (placement && OB_FAIL(BUF_PRINTF("semantic_placement=%s, crossed_inner_joins=%ld",
@@ -154,6 +190,29 @@ int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_ite
       }
       ret = BUF_PRINTF("%sfunction_cache=LOCAL_QUERY_TEXT, memoized_calls=%ld",
                        placement ? ", " : "", memoized);
+    }
+    if (OB_SUCC(ret) && has_embedding_proxy()) {
+      const int64_t count = proxy_count();
+      if (OB_FAIL(BUF_PRINTF(", embedding_proxy=REJECT_ONLY, approximate=true, proxy_calls=%ld",
+                            count))) {
+      } else if (count == 1) {
+        for (const SemanticProxyConfig &config : proxy_configs_) {
+          if (OB_SUCC(ret) && config.enabled_) {
+            ret = BUF_PRINTF(", threshold=%.17g", config.threshold_);
+          }
+        }
+      } else if (OB_FAIL(BUF_PRINTF(", thresholds=["))) {
+      } else {
+        int64_t printed = 0;
+        for (const SemanticProxyConfig &config : proxy_configs_) {
+          if (OB_SUCC(ret) && config.enabled_) {
+            ret = BUF_PRINTF("%s%.17g", printed++ > 0 ? "," : "", config.threshold_);
+          }
+        }
+        if (OB_SUCC(ret)) {
+          ret = BUF_PRINTF("]");
+        }
+      }
     }
     END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
   }
@@ -242,6 +301,10 @@ int LogSemanticJoin::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan
         memoized += nullptr != expr && SemanticExprUtils::supports_function_cache(*expr);
       }
       ret = BUF_PRINTF(", function_cache=LOCAL_QUERY_TEXT, memoized_calls=%ld", memoized);
+    }
+    if (OB_SUCC(ret) && has_embedding_proxy()) {
+      ret = BUF_PRINTF(", embedding_proxy=REJECT_ONLY, proxy_input=LEFT_RIGHT_TEXT, "
+                       "approximate=true, threshold=%.17g", proxy_configs().at(0).threshold_);
     }
     END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
   }

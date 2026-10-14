@@ -4,6 +4,244 @@ Legacy baseline validation (2026-09-29): the Debug build, all **105 SQL contract
 
 For the current architecture, code map, maintenance invariants and handoff checklist, see the [Chinese maintenance handoff](../../../../../docs/developer-guide/zh/ai-function-runtime-handoff.md).
 
+## Per-FILTER Proxy Composition (2026-10-14)
+
+The earlier V0 sections below describe their historical single-call scope.
+The current serial/cache-enabled implementation also supports independent
+positive FILTER predicates with different proxy settings, and FILTER followed
+by an independent MAP projection. Each FILTER can supply constant engine-only
+options; missing fields inherit the corresponding query-hint defaults:
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('rowsets_max_rows',8)
+           OPT_PARAM('enable_semantic_cache','true')
+           OPT_PARAM('enable_semantic_proxy','true') */
+       id, AI_MAP('judge_model', AI_INPUT('Extract a short title: ', content),
+                  '{"temperature":0}') AS title
+FROM documents
+WHERE AI_FILTER('judge_model', AI_INPUT('Discusses database deadlocks? ', content),
+                '{"temperature":0,"semantic_proxy":{"model":"embed_model","query":"database deadlocks","threshold":0.4}}')
+  AND AI_FILTER('judge_model', AI_INPUT('Discusses transactions? ', content),
+                '{"temperature":0,"semantic_proxy":{"model":"embed_model","query":"database transactions","threshold":0.3}}');
+```
+
+These numbers illustrate syntax only. Rejected rows do not run MAP. The native
+operator tracks one proxy configuration per FILTER through optimization,
+code generation, serialization, cache binding and asynchronous tasks.
+`semantic_proxy` is removed before calling the completion provider; remaining
+generation options retain their original meaning. Malformed/unknown proxy
+fields and use on MAP/JOIN/AGG are errors. The master proxy switch remains off
+by default; merely supplying per-call options does not enable approximation.
+The small rowset is explicit: callers must respect their embedding provider's
+input cap; there is no automatic provider-cap batch splitting.
+
+This does not enable projected/shared FILTER values, NOT/OR/CASE/comparison
+recipes, FILE, AGG or PX proxies. JOIN still requires a single semantic call.
+There is no general cross-FILTER document-vector cache, automatic acceptance,
+ANN candidate pruning or engine-side threshold learning. Individual FILTER
+recall targets do not imply a recall guarantee for their conjunction.
+
+Validation: Debug build, **5/5 FILTER plus 3/3 JOIN SQL/mock contracts** and
+**20/20 native input/provider/options/scoring contracts** pass. These are
+functional contracts, not new real-model effectiveness or speedup results.
+
+### External conservative calibration and native score parity
+
+[semantic_proxy_score.cpp](semantic_proxy_score.cpp) and
+[build_semantic_proxy_score.py](build_semantic_proxy_score.py) provide an
+experimental JSONL scorer linked against the same Debug parser/cosine objects.
+Its manifest binds kernel semantics, scorer/seekdb hashes and CPU dispatch
+flags. String IDs and ordered pair IDs survive JSON round trips; bad vectors
+remain errors. No model requests or Python/scalar score fallback occur.
+
+The enclosing workspace's
+[calibration workflow](../../../../../../experiments/sembench/README.md#10-原生评分独立验证的-reject-only-proxy-校准)
+fits on learning only, freezes the threshold, and uses disjoint validation
+with a one-sided Clopper–Pearson lower bound. Defaults 0.95 recall / 0.05
+failure probability need at least 59 distinct validation positives even with
+zero misses. Failed/insufficient evidence explicitly disables proxy routing.
+This certificate is relative to the frozen main-model oracle, conditional on
+sampling assumptions and binding; it does not certify composed SQL or human
+truth. Provider/format errors still fail rather than disable silently.
+
+53 offline calibration/profile tests pass. The focused native workflow also
+passes scorer → certified FILTER SQL and scorer → abstained exact-only SQL,
+including threshold equality, raw SQL ID restoration, zero embedding work
+when abstained, stripped engine options and actual Unix-socket peer/binary
+attestation. These use loopback mocks, not real-model benchmarks. The external
+tool consumes already collected labels/vectors; it does not add automatic
+engine learning, provider splitting or a new cost-based optimizer rule.
+
+## Experimental FILTER Embedding Proxy V0 (2026-10-13)
+
+This is explicit **approximate** execution, not an equivalent optimizer rewrite.
+A low cosine score can reject a row that the main model would accept. There is
+no learned threshold, recall guarantee or high-score automatic acceptance.
+The default remains the original semantic execution.
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('enable_semantic_cache', 'true')
+           OPT_PARAM('enable_semantic_lift', 'true')
+           OPT_PARAM('enable_semantic_proxy', 'true')
+           OPT_PARAM('semantic_proxy_model', 'embed_model')
+           OPT_PARAM('semantic_proxy_query', 'database deadlocks')
+           OPT_PARAM('semantic_proxy_threshold', '0.25') */
+       id
+FROM documents
+WHERE AI_FILTER('judge_model',
+               AI_INPUT('Does this text discuss database deadlocks? ', content));
+```
+
+`embed_model` must be a registered dense-embedding model; `judge_model` remains
+a completion model. All three proxy parameters are required when enabled.
+The threshold must be a quoted finite number in `[-1,1]`; `0.25` is only an
+interface example, not a calibrated recommendation. Enabling the proxy requires
+`enable_semantic_cache='true'`. Lifting is optional and uses the existing rules.
+
+V0 requires exactly one positive native FILTER call in one semantic stage,
+with constant model/options and `AI_INPUT(fixed text instruction, text column)`.
+Projected/shared FILTER values, NOT/OR/CASE/comparison recipes, additional
+semantic calls, FILE, AI_AGG and parallel/exchange plans are unsupported and
+explicitly fail when the proxy is enabled. Empty proxy documents also fail;
+normal argument validation, including SQL NULL handling, still precedes lookup.
+
+The cache first coalesces effective-call misses. Only unique misses are sent
+to the asynchronous embedding batch API. The retrieval text is embedded once
+per query binding; subsequent batches wait for that vector, rather than
+duplicating its request. The document embedding uses only the second text
+part, not the concatenated main-model instruction/prompt. Existing provider
+response-index validation preserves original input positions.
+
+Cosine scores strictly below the threshold publish `{"value":false}` to that
+call's future. Equal/higher scores go through the original asynchronous
+AI_FILTER request and strict Boolean response parser. Main-model prompts and
+settings are unchanged. SQL rows and duplicate bags are not deduplicated.
+Proxy model/query/threshold are included in cache identity; proxied rejections
+are not ordinary non-proxy model answers. Both model snapshots are query-owned.
+
+Scoring uses seekdb's native raw-cosine kernel and its existing runtime CPU
+dispatch (AVX2/AVX512 where supported by the build and CPU), not a separate
+scalar dot/norm implementation or the normalized SQL similarity interface.
+Input dimension/finite/nonzero checks and finite-result validation precede
+publication; kernel errors propagate without a scalar fallback. Scores remain
+clamped to `[-1,1]`, with the same strict reject threshold and support for
+non-normalized vectors. Native floating-point accumulation may differ slightly
+from the earlier double-accumulation loop near a threshold. This reuses vector
+computation only: it does not read stored VECTOR columns or build/use an ANN
+index, and does not reduce the number of embedding requests.
+
+The query vector is charged to the non-evicting cache quota. Temporary vector/
+JSON parsing allocations, request waves and response buffers use the existing
+query budget. Document vectors are released after scoring. Invalid counts,
+dimensions, nonnumeric/nonfinite/zero vectors and provider failures propagate
+as errors, never as low-score rejections or successful fallbacks.
+
+EXPLAIN adds `embedding_proxy=REJECT_ONLY, approximate=true, threshold=...`.
+The existing INFO cache summary additionally reports submitted query/document
+embedding inputs, rejected unique calls and forwarded unique calls. Submitted
+completion counts exclude proxy rejections; these are not HTTP retry counts.
+No prompts, retrieval text, vectors or credentials are logged.
+
+The small [proxy smoke module](test_semantic_proxy.py) uses loopback-only models:
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_proxy.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+```
+
+Validation: the Debug build, **3/3 SQL/mock smoke cases**, and **18/18 native
+input/provider/scoring contracts** passed. The native set adds three focused
+proxy scoring cases covering non-normalized raw cosine, unaligned inputs and
+dimension tails, the threshold boundary, invalid vectors and numeric failure.
+Run it with `test_semantic_input.py --build-dir build_debug`. This delivery is
+limited to compilation and these small native/SQL smoke sets, not a full
+historical regression run. No real-model accuracy, threshold sweep,
+SemBench effectiveness, latency or GPU benchmark is part of this version.
+There is no ANN index, precomputed embedding, cross-query vector cache,
+automatic calibration or high-score automatic acceptance. JOIN support is
+described separately below.
+
+## Experimental AI_JOIN Embedding Proxy V0
+
+JOIN uses the same opt-in cache/proxy/model/threshold hints, but deliberately
+does **not** use `semantic_proxy_query`; supplying that hint for JOIN is an
+explicit invalid-argument error.
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('enable_semantic_cache', 'true')
+           OPT_PARAM('enable_semantic_proxy', 'true')
+           OPT_PARAM('semantic_proxy_model', 'embed_model')
+           OPT_PARAM('semantic_proxy_threshold', '0.5') */
+       l.id, r.id
+FROM left_inputs l
+JOIN right_inputs r ON l.group_id = r.group_id
+  AND AI_JOIN('judge_model', 'Describe the same issue', l.content, r.content);
+```
+
+This is **approximate, reject-only** execution of all existing SQL candidate
+pairs. Native INNER JOIN candidate generation and duplicate multiplicities
+remain unchanged. There is no ANN index, Top-K candidate generation, candidate
+reordering or AI_JOIN lifting. A score below the threshold rejects the pair;
+equal/higher scores still require the original AI_JOIN completion request.
+Similarity alone cannot reliably proxy an arbitrary matching rule, so a low
+score can reject a true match. The example threshold is not calibrated.
+
+V0 accepts one positive native AI_JOIN predicate in an INNER JOIN `ON`, a static
+text rule, constant model/options, and scalar text or ordered all-text
+`AI_INPUT`/ROW sides. A standalone outer WHERE predicate is not supported.
+The existing serial/cache requirements and unsupported semantic recipe,
+FILE, aggregation and parallel/exchange restrictions still apply.
+Left and right embedding inputs are rendered separately from the original
+arguments, never recovered by parsing the main-model prompt. Ordered text
+parts are concatenated with the same native text-rendering behavior.
+The rule is **not** embedded. Original rule, side roles, tuple boundaries,
+completion prompts and completion options retain their pair-cache identity
+and main-model semantics.
+
+After pair-result cache lookup/coalescing, unique pair misses subscribe to
+query-owned side-vector futures keyed by the frozen embedding model and exact
+rendered text bytes. Identical text shares a vector across pairs, batches and
+left/right roles, including pending requests. Only newly claimed side inputs
+enter asynchronous embedding batches. Cosine uses the same native raw-cosine
+kernel as FILTER. The completion subset preserves original pair positions.
+
+Side-vector metadata, text keys and vectors use the existing half-query
+non-evicting cache quota; they are retained only until query completion.
+Temporary parsing and request/response waves use the existing query budget.
+Embedding production reuses the pair flight's wave credit rather than
+acquiring a separate credit per side. Bad vectors, provider failures, quota
+exhaustion, cancellation and deadlines propagate to dependent pair futures,
+never as false results or successful main-model fallbacks.
+
+EXPLAIN retains `candidate_policy=ALL_SQL_CANDIDATES` and adds
+`embedding_proxy=REJECT_ONLY, proxy_input=LEFT_RIGHT_TEXT, approximate=true,
+threshold=...`. The cache summary additionally counts submitted unique JOIN
+side embeddings, completed-vector hits and pending-vector coalescing.
+
+The small [JOIN proxy smoke module](test_semantic_join_proxy.py) uses only
+loopback mocks:
+
+```bash
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_join_proxy.py \
+  --binary "$PWD/build_debug/bin/src/observer/seekdb"
+```
+
+Validation: the final Debug build, **3/3 JOIN SQL/mock smoke cases**, the
+existing **3/3 FILTER proxy regression cases**, and **18/18 native
+input/provider/scoring contracts** passed. Fixed mocks verify pending-vector
+coalescing, cross-batch reuse, asymmetric pair answers, duplicate bags, raw
+threshold equality, reordered response indexes, ordered side rendering,
+explicit unsupported/invalid options, and embedding failure with fresh-query
+recovery. The routing fixture has 15 SQL candidates and 10 distinct ordered
+pairs: proxy-on uses five distinct side embeddings and forwards eight pairs;
+proxy-off uses no embeddings and submits all ten distinct pairs.
+These are functional routing/count assertions, not effectiveness evidence.
+No real-model accuracy, latency, throughput, threshold or SemBench experiment
+is included.
+
 ## Query Function Caching and Cached Greedy Lifting (2026-10-13)
 
 ```sql
@@ -89,8 +327,10 @@ python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_cache.py \
 The existing default-off [lifting contracts](test_semantic_lift.py) and native
 [ordered-input contracts](../../../../../unittest/sql/engine/test_semantic_input.cpp)
 also cover preserved demand, legacy text concatenation, and the shared strict
-Boolean parser. Embedding proxies, AI_JOIN relocation, AI_AGG answer caching,
-row-level publication and cross-server cache coordination are out of scope.
+Boolean parser. AI_JOIN relocation, AI_AGG answer caching, row-level publication
+and cross-server cache coordination are out of scope. The cache-only contract
+does not route by embeddings; the experimental opt-in FILTER proxy is described
+separately above.
 
 Validation on the final Debug binary: **16/16 cache SQL contracts** passed
 without skips, with **27/27 fixture self-tests**. Measured deterministic cases:

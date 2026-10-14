@@ -14,15 +14,19 @@
  * limitations under the License.
  */
 
+#include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include "common/object/file_ref.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_input.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
+#include "sql/engine/basic/ob_semantic_proxy.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -354,6 +358,137 @@ void test_invalid_blocks()
   }
 }
 
+void test_proxy_native_cosine()
+{
+  for (int64_t dimension : {1, 3, 4, 7, 8, 9, 15, 16, 17, 31, 33, 129}) {
+    std::vector<float> query(dimension + 1);
+    std::vector<float> document(dimension + 1);
+    double dot = 0;
+    double query_norm = 0;
+    double document_norm = 0;
+    for (int64_t index = 0; index < dimension; ++index) {
+      const double q = query[index + 1] = static_cast<float>(index % 7 - 3) * 1.5f;
+      const double d = document[index + 1] = static_cast<float>(index % 5 - 1) * 2.25f;
+      dot += q * d;
+      query_norm += q * q;
+      document_norm += d * d;
+    }
+    double score = 0;
+    require(OB_SUCCESS == SemanticEmbeddingProxy::cosine(
+        query.data() + 1, dimension, document.data() + 1, dimension, score),
+        "native proxy cosine supports unaligned inputs and dimension tails");
+    const double expected = dot / std::sqrt(query_norm * document_norm);
+    require(std::abs(score - expected) <= 1e-6, "native proxy cosine matches raw scalar reference");
+    require(score >= -1 && score <= 1, "native proxy cosine retains its score range");
+  }
+}
+
+void test_proxy_cosine_semantics()
+{
+  const float query[] = {4, 0, 0, 0};
+  double score = 0;
+  for (const auto &test : std::vector<std::pair<std::vector<float>, double>>{
+      {{2, 0, 0, 0}, 1}, {{-7, 0, 0, 0}, -1},
+      {{0, 3, 0, 0}, 0}, {{1, 1, 1, 1}, 0.5}}) {
+    require(OB_SUCCESS == SemanticEmbeddingProxy::cosine(
+        query, 4, test.first.data(), 4, score), "score non-normalized proxy vectors");
+    require(score == test.second, "proxy uses raw cosine, not distance or normalized similarity");
+  }
+  require(score >= 0.5, "score equal to threshold must remain eligible for main-model verification");
+  const float below[] = {1, 2, 0, 0};
+  require(OB_SUCCESS == SemanticEmbeddingProxy::cosine(query, 4, below, 4, score) && score < 0.5,
+          "score below threshold must remain rejectable");
+}
+
+void test_proxy_cosine_errors()
+{
+  const float valid[] = {1, 0, 0, 0};
+  const float zero[] = {0, 0, 0, 0};
+  double score = 0;
+  require(OB_INVALID_DATA == SemanticEmbeddingProxy::cosine(nullptr, 4, valid, 4, score),
+          "reject missing query vector");
+  require(OB_INVALID_DATA == SemanticEmbeddingProxy::cosine(valid, 4, nullptr, 4, score),
+          "reject missing document vector");
+  require(OB_INVALID_DATA == SemanticEmbeddingProxy::cosine(valid, 0, valid, 0, score),
+          "reject empty vector dimensions");
+  require(OB_INVALID_DATA == SemanticEmbeddingProxy::cosine(valid, 4, valid, 3, score),
+          "reject mismatched dimensions before native dispatch");
+  require(OB_INVALID_DATA == SemanticEmbeddingProxy::cosine(zero, 4, valid, 4, score),
+          "reject zero query vector");
+  require(OB_INVALID_DATA == SemanticEmbeddingProxy::cosine(valid, 4, zero, 4, score),
+          "reject zero document vector");
+  for (float value : {std::numeric_limits<float>::quiet_NaN(),
+                       std::numeric_limits<float>::infinity()}) {
+    const float invalid[] = {1, value, 0, 0};
+    require(OB_INVALID_DATA == SemanticEmbeddingProxy::cosine(invalid, 4, valid, 4, score),
+            "reject nonfinite query values before native dispatch");
+    require(OB_INVALID_DATA == SemanticEmbeddingProxy::cosine(valid, 4, invalid, 4, score),
+            "reject nonfinite document values before native dispatch");
+  }
+  const std::vector<float> huge(17, std::numeric_limits<float>::max());
+  score = 0.625;
+  require(OB_SUCCESS != SemanticEmbeddingProxy::cosine(
+      huge.data(), huge.size(), huge.data(), huge.size(), score),
+      "native numeric failure or nonfinite output must not become a usable proxy score");
+  require(score == 0.625, "failed native scoring must not publish a replacement score");
+}
+
+void test_proxy_filter_option_overrides()
+{
+  ObArenaAllocator allocator;
+  SemanticProxyConfig config;
+  config.model_ = ObString("hint-model");
+  config.query_ = ObString("hint-query");
+  config.threshold_ = 0.5;
+  bool has_threshold = true;
+  ObJsonObject &options = object(parse(allocator,
+      R"({"temperature":0,"semantic_proxy":{"query":"per-call-query"}})"));
+  require(OB_SUCCESS == SemanticEmbeddingProxy::parse_filter_options(
+      allocator, options, config, has_threshold), "parse partial FILTER proxy override");
+  require(config.model_ == "hint-model" && config.query_ == "per-call-query" &&
+      config.threshold_ == 0.5 && has_threshold, "missing proxy fields inherit defaults");
+  require(nullptr != options.get_value("semantic_proxy") &&
+      nullptr != options.get_value("temperature"), "proxy inspection does not modify model options");
+  ObJsonObject &complete = object(parse(allocator,
+      R"({"semantic_proxy":{"model":"per-call-model","query":"another-query","threshold":-1}})"));
+  has_threshold = false;
+  require(OB_SUCCESS == SemanticEmbeddingProxy::parse_filter_options(
+      allocator, complete, config, has_threshold), "parse complete FILTER proxy override");
+  require(config.model_ == "per-call-model" && config.query_ == "another-query" &&
+      config.threshold_ == -1 && has_threshold, "per-call fields override defaults");
+  ObJsonObject &ordinary = object(parse(allocator, R"({"temperature":0})"));
+  require(OB_SUCCESS == SemanticEmbeddingProxy::parse_filter_options(
+      allocator, ordinary, config, has_threshold), "ordinary options remain valid");
+  require(config.model_ == "per-call-model" && config.query_ == "another-query" &&
+      config.threshold_ == -1 && has_threshold, "ordinary options preserve proxy defaults");
+}
+
+void test_proxy_filter_option_errors()
+{
+  const std::vector<std::string> invalid = {
+    R"({"semantic_proxy":null})",
+    R"({"semantic_proxy":[]})",
+    R"({"semantic_proxy":true})",
+    R"({"semantic_proxy":{"model":""}})",
+    R"({"semantic_proxy":{"model":1}})",
+    R"({"semantic_proxy":{"query":""}})",
+    R"({"semantic_proxy":{"query":null}})",
+    R"({"semantic_proxy":{"threshold":"0.5"}})",
+    R"({"semantic_proxy":{"threshold":true}})",
+    R"({"semantic_proxy":{"threshold":1.01}})",
+    R"({"semantic_proxy":{"threshold":-1.01}})",
+    R"({"semantic_proxy":{"threshhold":0.5}})",
+  };
+  for (const std::string &fixture : invalid) {
+    ObArenaAllocator allocator;
+    SemanticProxyConfig config;
+    bool has_threshold = false;
+    require(OB_INVALID_ARGUMENT == SemanticEmbeddingProxy::parse_filter_options(
+        allocator, object(parse(allocator, fixture)), config, has_threshold),
+        "invalid per-FILTER proxy options explicitly fail");
+  }
+}
+
 struct TestCase
 {
   const char *name_;
@@ -376,6 +511,11 @@ const TestCase TESTS[] = {
   {"message_override_rejected", test_message_override_rejected},
   {"boolean_schema", test_boolean_schema},
   {"invalid_blocks", test_invalid_blocks},
+  {"proxy_native_cosine", test_proxy_native_cosine},
+  {"proxy_cosine_semantics", test_proxy_cosine_semantics},
+  {"proxy_cosine_errors", test_proxy_cosine_errors},
+  {"proxy_filter_option_overrides", test_proxy_filter_option_overrides},
+  {"proxy_filter_option_errors", test_proxy_filter_option_errors},
 };
 
 int run_tests()

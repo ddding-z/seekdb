@@ -4,6 +4,7 @@
 #include "query/engine/ob_operator.h"
 #include "query/engine/basic/ob_batch_result_holder.h"
 #include "sql/engine/basic/ob_semantic_runtime.h"
+#include "sql/engine/basic/ob_semantic_proxy.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
 
 namespace oceanbase
@@ -18,7 +19,8 @@ public:
       : ObOpSpec(allocator, type), expressions_(allocator), semantic_exprs_(allocator),
         owned_exprs_(allocator), local_exprs_(allocator),
         shared_exprs_(allocator), carried_exprs_(allocator),
-        query_task_count_(1), filter_expr_count_(0), memoized_exprs_(allocator) {}
+        query_task_count_(1), filter_expr_count_(0), memoized_exprs_(allocator),
+        proxy_configs_(allocator) {}
   common::ObFixedArray<ObExpr *, common::ObIAllocator> expressions_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> semantic_exprs_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> owned_exprs_;
@@ -30,6 +32,15 @@ public:
   int64_t query_task_count_;
   int64_t filter_expr_count_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> memoized_exprs_;
+  common::ObFixedArray<SemanticProxyConfig, common::ObIAllocator> proxy_configs_;
+  bool has_embedding_proxy() const
+  {
+    bool enabled = false;
+    for (int64_t index = 0; !enabled && index < proxy_configs_.count(); ++index) {
+      enabled = proxy_configs_.at(index).enabled_;
+    }
+    return enabled;
+  }
 };
 
 class SemanticMapSpec : public SemanticSpec
@@ -79,6 +90,7 @@ private:
   bool is_filter() const
   { return spec_.type_ == PHY_SEMANTIC_FILTER || spec_.type_ == PHY_SEMANTIC_JOIN; }
   int validate_shared_expressions() const;
+  int validate_proxy_configs() const;
   int reserve(Slot &slot, int64_t bytes);
   int64_t slot_metadata_bytes(int64_t size) const;
   int allocate_slot(Slot &slot, int64_t size);

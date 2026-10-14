@@ -1,14 +1,16 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/basic/ob_semantic_cache.h"
+#include "lib/hash_func/murmur_hash.h"
+#include "lib/time/ob_time_utility.h"
+#include "query/ai/ob_ai_endpoint_resolver.h"
+#include "share/rc/ob_server_runtime.h"
 #include "sql/engine/basic/ob_semantic_runtime.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
-#include "query/ai/ob_ai_endpoint_resolver.h"
-#include "share/rc/ob_server_runtime.h"
-#include "lib/hash_func/murmur_hash.h"
-#include "lib/time/ob_time_utility.h"
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -131,6 +133,135 @@ int canonical_config(const ObIJsonBase &node, ObJsonBuffer &buffer)
   }
   return ret;
 }
+
+int append_proxy_identity(ObJsonBuffer &buffer,
+                          const SemanticProxyConfig &proxy)
+{
+  int ret = buffer.append("\0embedding_proxy", 16);
+  const int64_t model_size = proxy.model_.length();
+  const int64_t query_size = proxy.query_.length();
+  if (OB_FAIL(ret))
+  {
+  }
+  else if (OB_FAIL(buffer.append(reinterpret_cast<const char *>(&model_size),
+                                 sizeof(model_size))))
+  {
+  }
+  else if (OB_FAIL(buffer.append(proxy.model_.ptr(), proxy.model_.length())))
+  {
+  }
+  else if (OB_FAIL(buffer.append(reinterpret_cast<const char *>(&query_size),
+                                 sizeof(query_size))))
+  {
+  }
+  else if (!proxy.query_.empty() &&
+           OB_FAIL(buffer.append(proxy.query_.ptr(), proxy.query_.length())))
+  {
+  }
+  else
+  {
+    ret = buffer.append(reinterpret_cast<const char *>(&proxy.threshold_),
+                        sizeof(proxy.threshold_));
+  }
+  return ret;
+}
+
+class ProxyVectorAllocator : public ObIAllocator
+{
+  struct alignas(std::max_align_t) Block
+  {
+    Block *previous_;
+    Block *next_;
+    int64_t bytes_;
+  };
+
+public:
+  explicit ProxyVectorAllocator(SemanticQueryBudget &budget)
+      : budget_(budget), head_(nullptr), bytes_(0), error_(OB_SUCCESS)
+  {
+  }
+  ~ProxyVectorAllocator()
+  {
+    while (nullptr != head_)
+    {
+      free(head_ + 1);
+    }
+  }
+  void *alloc(int64_t size) override
+  {
+    return alloc(size, ObMemAttr("SemanticProxy"));
+  }
+  void *alloc(int64_t size, const ObMemAttr &attr) override
+  {
+    void *result = nullptr;
+    if (error_ != OB_SUCCESS)
+    {
+    }
+    else if (size < 0 || size > INT64_MAX - static_cast<int64_t>(sizeof(Block)))
+    {
+      error_ = OB_SIZE_OVERFLOW;
+    }
+    else
+    {
+      const int64_t bytes = size + sizeof(Block);
+      error_ = budget_.reserve(bytes);
+      if (error_ == OB_SUCCESS)
+      {
+        Block *block = static_cast<Block *>(ob_malloc(bytes, attr));
+        if (nullptr == block)
+        {
+          budget_.release(bytes);
+          error_ = OB_ALLOCATE_MEMORY_FAILED;
+        }
+        else
+        {
+          block->previous_ = nullptr;
+          block->next_ = head_;
+          block->bytes_ = bytes;
+          if (nullptr != head_)
+          {
+            head_->previous_ = block;
+          }
+          head_ = block;
+          bytes_ += bytes;
+          result = block + 1;
+        }
+      }
+    }
+    return result;
+  }
+  void free(void *pointer) override
+  {
+    if (nullptr != pointer)
+    {
+      Block *block = static_cast<Block *>(pointer) - 1;
+      if (nullptr != block->previous_)
+      {
+        block->previous_->next_ = block->next_;
+      }
+      else
+      {
+        head_ = block->next_;
+      }
+      if (nullptr != block->next_)
+      {
+        block->next_->previous_ = block->previous_;
+      }
+      bytes_ -= block->bytes_;
+      budget_.release(block->bytes_);
+      ob_free(block);
+    }
+  }
+  int64_t total() const override { return bytes_; }
+  int64_t used() const override { return bytes_; }
+  int error() const { return error_; }
+
+private:
+  SemanticQueryBudget &budget_;
+  Block *head_;
+  int64_t bytes_;
+  int error_;
+};
 } // namespace
 
 struct SemanticFunctionCache::Impl
@@ -147,9 +278,17 @@ struct SemanticFunctionCache::Impl
 
   struct Binding
   {
+    enum QueryState
+    {
+      EMPTY,
+      PENDING,
+      READY,
+      FAILED
+    };
     Binding()
         : arena_("SemanticMemo"), allocator_(arena_), type_(T_INVALID), id_(0),
-          config_(nullptr)
+          config_(nullptr), query_state_(EMPTY), query_error_(OB_SUCCESS),
+          query_dimension_(0)
     {
     }
     ObArenaAllocator arena_;
@@ -159,6 +298,12 @@ struct SemanticFunctionCache::Impl
     uint64_t id_;
     ObString canonical_;
     ObJsonObject *config_;
+    SemanticProxyConfig proxy_;
+    std::shared_ptr<Model> embedding_model_;
+    std::atomic<QueryState> query_state_;
+    int query_error_;
+    std::unique_ptr<float[]> query_vector_;
+    int64_t query_dimension_;
   };
 
   struct BindingKey
@@ -206,18 +351,58 @@ struct SemanticFunctionCache::Impl
     }
   };
 
+  struct VectorEntry
+  {
+    VectorEntry() : state_(Entry::PENDING), error_(OB_SUCCESS), dimension_(0) {}
+    Entry::State state() const
+    {
+      return state_.load(std::memory_order_acquire);
+    }
+    std::atomic<Entry::State> state_;
+    int error_;
+    std::unique_ptr<char[]> text_buffer_;
+    ObString text_;
+    std::unique_ptr<float[]> values_;
+    int64_t dimension_;
+  };
+  using VectorHandle = std::shared_ptr<VectorEntry>;
+
+  struct VectorKey
+  {
+    const Model *model_;
+    ObString text_;
+  };
+  struct VectorLess
+  {
+    bool operator()(const VectorKey &left, const VectorKey &right) const
+    {
+      return left.model_ != right.model_
+                 ? std::less<const Model *>()(left.model_, right.model_)
+                 : left.text_.compare(right.text_) < 0;
+    }
+  };
+
   struct Flight
   {
     enum Phase
     {
       QUEUED,
       RUNNING,
+      WAIT_QUERY,
+      WAIT_VECTORS,
       DONE
+    };
+    enum RequestKind
+    {
+      COMPLETION,
+      EMBEDDING,
+      JOIN_EMBEDDING
     };
     Flight(SemanticQueryBudget &budget, int64_t deadline)
         : budget_(budget), deadline_(deadline), arena_("SemanticMemo"),
           allocator_(arena_), batch_(allocator_), busy_(false), phase_(QUEUED),
-          bytes_(0), credit_(false), max_parallel_(1)
+          bytes_(0), credit_(false), max_parallel_(1), kind_(COMPLETION),
+          includes_query_(false)
     {
     }
     ~Flight()
@@ -255,22 +440,36 @@ struct SemanticFunctionCache::Impl
     std::shared_ptr<Binding> binding_;
     std::vector<Handle> entries_;
     ObArray<ObString> prompts_;
+    RequestKind kind_;
+    bool includes_query_;
+    ObArray<ObString> documents_;
+    ObArray<ObString> completion_prompts_;
+    ObArray<int64_t> completion_positions_;
+    std::vector<VectorHandle> embedding_entries_;
+    std::vector<VectorHandle> left_vectors_;
+    std::vector<VectorHandle> right_vectors_;
   };
 
   Impl(SemanticQueryBudget &budget, int64_t deadline)
       : budget_(budget), deadline_(deadline),
         cache_limit_(budget.memory_limit() / 2), cache_bytes_(0),
         next_binding_(1), distinct_keys_(0), ready_hits_(0), coalesced_(0),
-        submitted_(0)
+        submitted_(0), proxy_query_embeddings_(0),
+        proxy_document_embeddings_(0), proxy_rejected_(0), proxy_forwarded_(0),
+        proxy_join_embeddings_(0), proxy_vector_ready_hits_(0), proxy_vector_coalesced_(0)
   {
   }
   ~Impl()
   {
     LOG_INFO("semantic function cache execution summary", "execution_id",
              budget_.execution_id(), K_(distinct_keys), K_(ready_hits),
-             K_(coalesced), K_(submitted), K_(cache_bytes));
+             K_(coalesced), K_(submitted), K_(cache_bytes),
+             K_(proxy_query_embeddings), K_(proxy_document_embeddings),
+             K_(proxy_rejected), K_(proxy_forwarded), K_(proxy_join_embeddings),
+             K_(proxy_vector_ready_hits), K_(proxy_vector_coalesced));
     flights_.clear();
     entries_.clear();
+    join_vectors_.clear();
     bindings_.clear();
     models_.clear();
     budget_.release(cache_bytes_);
@@ -302,12 +501,12 @@ struct SemanticFunctionCache::Impl
     return ret;
   }
 
-  int binding_locked(ObItemType type, const ObString &model_name,
-                     ObJsonObject *config, const ObString &canonical,
-                     std::shared_ptr<Binding> &binding)
+  int model_locked(const ObString &model_name, bool embedding,
+                   std::shared_ptr<Model> &model)
   {
     int ret = OB_SUCCESS;
-    std::shared_ptr<Model> model;
+    const auto expected_type = embedding ? share::EndpointType::DENSE_EMBEDDING
+                                         : share::EndpointType::COMPLETION;
     auto found_model = models_.find(model_name);
     if (found_model != models_.end())
     {
@@ -333,11 +532,13 @@ struct SemanticFunctionCache::Impl
                    model_name, model->allocator_, model->endpoint_)))
       {
       }
-      else if (model->info_->type_ != share::EndpointType::COMPLETION)
+      else if (model->info_->type_ != expected_type)
       {
         ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT,
-                       "semantic functions require a completion model");
+        LOG_USER_ERROR(
+            OB_INVALID_ARGUMENT,
+            embedding ? "semantic_proxy_model must be a dense embedding model"
+                      : "semantic functions require a completion model");
       }
       else if (OB_FAIL(
                    reserve_locked(sizeof(Model) + model->arena_.total() + 64)))
@@ -347,6 +548,27 @@ struct SemanticFunctionCache::Impl
       {
         models_.emplace(model->requested_name_, model);
       }
+    }
+    if (OB_SUCC(ret) && model->info_->type_ != expected_type)
+    {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(
+          OB_INVALID_ARGUMENT,
+          embedding ? "semantic_proxy_model must be a dense embedding model"
+                    : "semantic functions require a completion model");
+    }
+    return ret;
+  }
+
+  int binding_locked(ObItemType type, const ObString &model_name,
+                     ObJsonObject *config, const ObString &canonical,
+                     const SemanticProxyConfig *proxy,
+                     std::shared_ptr<Binding> &binding)
+  {
+    int ret = OB_SUCCESS;
+    std::shared_ptr<Model> model;
+    if (OB_FAIL(model_locked(model_name, false, model)))
+    {
     }
     if (OB_SUCC(ret))
     {
@@ -372,11 +594,28 @@ struct SemanticFunctionCache::Impl
         {
           ret = OB_ALLOCATE_MEMORY_FAILED;
         }
-        else if (OB_FAIL(reserve_locked(sizeof(Binding) +
-                                        binding->arena_.total() + 64)))
+        if (OB_SUCC(ret) && nullptr != proxy && proxy->enabled_)
+        {
+          binding->proxy_ = *proxy;
+          if (OB_FAIL(
+                  model_locked(proxy->model_, true, binding->embedding_model_)))
+          {
+          }
+          else if (OB_FAIL(ob_write_string(binding->allocator_, proxy->query_,
+                                           binding->proxy_.query_)))
+          {
+          }
+          else
+          {
+            binding->proxy_.model_ = binding->embedding_model_->requested_name_;
+          }
+        }
+        if (OB_SUCC(ret) &&
+            OB_FAIL(
+                reserve_locked(sizeof(Binding) + binding->arena_.total() + 64)))
         {
         }
-        else
+        else if (OB_SUCC(ret))
         {
           bindings_.emplace(BindingKey{model.get(), type, binding->canonical_},
                             binding);
@@ -384,6 +623,449 @@ struct SemanticFunctionCache::Impl
       }
     }
     return ret;
+  }
+
+  int store_result_locked(Entry &entry, const ObString &result)
+  {
+    int ret = OB_SUCCESS;
+    const int64_t bytes = result.length();
+    if (OB_FAIL(reserve_locked(bytes)))
+    {
+    }
+    else
+    {
+      entry.result_buffer_.reset(new char[std::max<int64_t>(bytes, 1)]);
+      if (bytes > 0)
+      {
+        std::memcpy(entry.result_buffer_.get(), result.ptr(), bytes);
+      }
+      entry.result_.assign_ptr(entry.result_buffer_.get(), bytes);
+    }
+    return ret;
+  }
+
+  int vector_locked(Flight &flight, const ObString &text, VectorHandle &vector)
+  {
+    int ret = OB_SUCCESS;
+    const VectorKey key{flight.binding_->embedding_model_.get(), text};
+    const auto found = join_vectors_.find(key);
+    if (text.empty())
+    {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                     "AI_JOIN embedding proxy inputs must not be empty");
+      LOG_WARN("empty AI_JOIN proxy embedding input", K(ret));
+    }
+    else if (found != join_vectors_.end())
+    {
+      vector = found->second;
+      if (vector->state() == Entry::PENDING)
+      {
+        ++proxy_vector_coalesced_;
+      }
+      else
+      {
+        ++proxy_vector_ready_hits_;
+      }
+    }
+    else if (OB_FAIL(reserve_locked(sizeof(VectorEntry) + sizeof(VectorKey) +
+                                    sizeof(VectorHandle) + 64 + text.length())))
+    {
+    }
+    else
+    {
+      vector = std::make_shared<VectorEntry>();
+      vector->text_buffer_.reset(new char[text.length()]);
+      std::memcpy(vector->text_buffer_.get(), text.ptr(), text.length());
+      vector->text_.assign_ptr(vector->text_buffer_.get(), text.length());
+      flight.embedding_entries_.push_back(vector);
+      join_vectors_.emplace(VectorKey{key.model_, vector->text_}, vector);
+    }
+    return ret;
+  }
+
+  int join_vectors_status(const Flight &flight) const
+  {
+    bool pending = false;
+    for (const auto *vectors : {&flight.left_vectors_, &flight.right_vectors_})
+    {
+      for (const VectorHandle &vector : *vectors)
+      {
+        if (!vector)
+        {
+          return OB_ERR_UNEXPECTED;
+        }
+        else
+        {
+          const Entry::State state = vector->state();
+          if (state == Entry::FAILED)
+          {
+            return vector->error_ == OB_SUCCESS ? OB_ERR_UNEXPECTED
+                                                : vector->error_;
+          }
+          pending |= state == Entry::PENDING;
+        }
+      }
+    }
+    return pending ? OB_EAGAIN : OB_SUCCESS;
+  }
+
+  int start_join_embedding(Flight &flight, bool &started)
+  {
+    int ret = OB_SUCCESS;
+    started = false;
+    ObArray<ObString> inputs;
+    for (const VectorHandle &vector : flight.embedding_entries_)
+    {
+      if (OB_SUCC(ret))
+      {
+        ret = inputs.push_back(vector->text_);
+      }
+    }
+    if (OB_FAIL(ret))
+    {
+    }
+    else if (inputs.empty())
+    {
+      flight.phase_.store(Flight::WAIT_VECTORS);
+    }
+    else
+    {
+      const Model &snapshot = *flight.binding_->embedding_model_;
+      ObAIFuncModel model(flight.allocator_, *snapshot.info_,
+                          snapshot.endpoint_);
+      if (OB_FAIL(model.start_dense_embedding_batch(inputs, nullptr,
+                                                    flight.batch_)))
+      {
+      }
+      else
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        proxy_join_embeddings_ += inputs.count();
+        started = true;
+      }
+    }
+    return ret;
+  }
+
+  int collect_join_vectors(Flight &flight, const ObIArray<ObString> &results)
+  {
+    int ret = OB_SUCCESS;
+    if (results.count() !=
+        static_cast<int64_t>(flight.embedding_entries_.size()))
+    {
+      ret = OB_INVALID_DATA;
+      LOG_WARN("AI_JOIN proxy response count differs from unique side inputs",
+               K(ret));
+      FORWARD_USER_ERROR(
+          ret,
+          "AI_JOIN embedding proxy response count differs from its inputs");
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && index < results.count(); ++index)
+    {
+      ProxyVectorAllocator allocator(budget_);
+      float *values = nullptr;
+      int64_t dimension = 0;
+      ret = SemanticEmbeddingProxy::parse_vector(allocator, results.at(index),
+                                                 values, dimension);
+      if (allocator.error() != OB_SUCCESS)
+      {
+        ret = allocator.error();
+      }
+      if (OB_SUCC(ret))
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (OB_FAIL(reserve_locked(dimension * sizeof(float) + 64)))
+        {
+        }
+        else
+        {
+          VectorEntry &vector = *flight.embedding_entries_.at(index);
+          vector.values_.reset(new float[dimension]);
+          std::memcpy(vector.values_.get(), values, dimension * sizeof(float));
+          vector.dimension_ = dimension;
+        }
+      }
+    }
+    if (OB_SUCC(ret))
+    {
+      for (const VectorHandle &vector : flight.embedding_entries_)
+      {
+        vector->state_.store(Entry::COMPLETE, std::memory_order_release);
+      }
+      flight.phase_.store(Flight::WAIT_VECTORS);
+    }
+    return ret;
+  }
+
+  int publish_routing(Flight &flight, bool &terminal)
+  {
+    int ret = OB_SUCCESS;
+    std::lock_guard<std::mutex> guard(mutex_);
+    int64_t kept = 0;
+    for (int64_t index = 0;
+         OB_SUCC(ret) && index < static_cast<int64_t>(flight.entries_.size());
+         ++index)
+    {
+      if (kept < flight.completion_positions_.count() &&
+          flight.completion_positions_.at(kept) == index)
+      {
+        ++kept;
+      }
+      else
+      {
+        Entry &entry = *flight.entries_.at(index);
+        if (OB_FAIL(store_result_locked(entry, ObString("{\"value\":false}"))))
+        {
+        }
+        else
+        {
+          entry.state_.store(Entry::COMPLETE, std::memory_order_release);
+          ++proxy_rejected_;
+        }
+      }
+    }
+    if (OB_SUCC(ret))
+    {
+      proxy_forwarded_ += flight.completion_positions_.count();
+      terminal = flight.completion_positions_.empty();
+      flight.kind_ = Flight::COMPLETION;
+      if (!terminal)
+      {
+        flight.phase_.store(Flight::QUEUED);
+      }
+    }
+    return ret;
+  }
+
+  int route_join(Flight &flight, bool &terminal)
+  {
+    int ret = join_vectors_status(flight);
+    if (OB_SUCC(ret) &&
+        (flight.left_vectors_.size() != flight.entries_.size() ||
+         flight.right_vectors_.size() != flight.entries_.size()))
+    {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("AI_JOIN proxy lost candidate vector bindings", K(ret));
+    }
+    for (int64_t index = 0;
+         OB_SUCC(ret) && index < static_cast<int64_t>(flight.entries_.size());
+         ++index)
+    {
+      const VectorEntry &left = *flight.left_vectors_.at(index);
+      const VectorEntry &right = *flight.right_vectors_.at(index);
+      double score = 0;
+      if (OB_FAIL(SemanticEmbeddingProxy::cosine(
+              left.values_.get(), left.dimension_, right.values_.get(),
+              right.dimension_, score)))
+      {
+      }
+      else if (score >= flight.binding_->proxy_.threshold_)
+      {
+        if (OB_FAIL(flight.completion_positions_.push_back(index)))
+        {
+        }
+        else
+        {
+          ret = flight.completion_prompts_.push_back(flight.prompts_.at(index));
+        }
+      }
+    }
+    if (OB_SUCC(ret))
+    {
+      ret = publish_routing(flight, terminal);
+    }
+    return ret;
+  }
+
+  int start_embedding(Flight &flight, bool &started)
+  {
+    int ret = OB_SUCCESS;
+    started = false;
+    Binding &binding = *flight.binding_;
+    ObArray<ObString> inputs;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      const auto state = binding.query_state_.load();
+      if (state == Binding::EMPTY)
+      {
+        binding.query_state_.store(Binding::PENDING);
+        flight.includes_query_ = true;
+      }
+      else if (state == Binding::PENDING)
+      {
+        flight.phase_.store(Flight::WAIT_QUERY);
+      }
+      else if (state == Binding::FAILED)
+      {
+        ret = binding.query_error_;
+      }
+    }
+    if (OB_SUCC(ret) && flight.phase_.load() != Flight::WAIT_QUERY)
+    {
+      if (flight.includes_query_)
+      {
+        ret = inputs.push_back(binding.proxy_.query_);
+      }
+      for (int64_t index = 0; OB_SUCC(ret) && index < flight.documents_.count();
+           ++index)
+      {
+        ret = inputs.push_back(flight.documents_.at(index));
+      }
+      if (OB_SUCC(ret))
+      {
+        ObAIFuncModel model(flight.allocator_, *binding.embedding_model_->info_,
+                            binding.embedding_model_->endpoint_);
+        ret = model.start_dense_embedding_batch(inputs, nullptr, flight.batch_);
+      }
+      if (OB_SUCC(ret))
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        proxy_query_embeddings_ += flight.includes_query_;
+        proxy_document_embeddings_ += flight.documents_.count();
+        started = true;
+      }
+    }
+    return ret;
+  }
+
+  int route_embedding(Flight &flight, const ObIArray<ObString> &results,
+                      bool &terminal)
+  {
+    int ret = OB_SUCCESS;
+    Binding &binding = *flight.binding_;
+    const int64_t offset = flight.includes_query_ ? 1 : 0;
+    if (results.count() !=
+        static_cast<int64_t>(flight.entries_.size()) + offset)
+    {
+      ret = OB_INVALID_DATA;
+      LOG_WARN("embedding proxy response count differs from unique inputs",
+               K(ret));
+      FORWARD_USER_ERROR(
+          ret, "embedding proxy response count differs from its inputs");
+    }
+    if (OB_SUCC(ret) && flight.includes_query_)
+    {
+      ProxyVectorAllocator allocator(budget_);
+      float *vector = nullptr;
+      int64_t dimension = 0;
+      ret = SemanticEmbeddingProxy::parse_vector(allocator, results.at(0),
+                                                 vector, dimension);
+      if (allocator.error() != OB_SUCCESS)
+      {
+        ret = allocator.error();
+      }
+      if (OB_SUCC(ret))
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (OB_FAIL(reserve_locked(dimension * sizeof(float) + 64)))
+        {
+        }
+        else
+        {
+          binding.query_vector_.reset(new float[dimension]);
+          std::memcpy(binding.query_vector_.get(), vector,
+                      dimension * sizeof(float));
+          binding.query_dimension_ = dimension;
+          binding.query_state_.store(Binding::READY, std::memory_order_release);
+        }
+      }
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && index < flight.documents_.count();
+         ++index)
+    {
+      ProxyVectorAllocator allocator(budget_);
+      float *vector = nullptr;
+      int64_t dimension = 0;
+      double score = 0;
+      ret = SemanticEmbeddingProxy::parse_vector(
+          allocator, results.at(index + offset), vector, dimension);
+      if (allocator.error() != OB_SUCCESS)
+      {
+        ret = allocator.error();
+      }
+      if (OB_FAIL(ret))
+      {
+      }
+      else if (OB_FAIL(SemanticEmbeddingProxy::cosine(
+                   binding.query_vector_.get(), binding.query_dimension_,
+                   vector, dimension, score)))
+      {
+      }
+      else if (score >= binding.proxy_.threshold_)
+      {
+        if (OB_FAIL(flight.completion_positions_.push_back(index)))
+        {
+        }
+        else
+        {
+          ret = flight.completion_prompts_.push_back(flight.prompts_.at(index));
+        }
+      }
+    }
+    if (OB_SUCC(ret))
+    {
+      ret = publish_routing(flight, terminal);
+    }
+    return ret;
+  }
+
+  void fail_pending_locked(Flight &flight, int error)
+  {
+    for (const VectorHandle &vector : flight.embedding_entries_)
+    {
+      if (vector->state() == Entry::PENDING)
+      {
+        vector->error_ = error;
+        vector->state_.store(Entry::FAILED, std::memory_order_release);
+      }
+    }
+    for (const Handle &entry : flight.entries_)
+    {
+      if (entry->state() == Entry::PENDING)
+      {
+        entry->error_ = error;
+        entry->state_.store(Entry::FAILED, std::memory_order_release);
+      }
+    }
+  }
+
+  void finish(Flight &flight, int error, bool &progress)
+  {
+    const int ret = error;
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (flight.includes_query_ &&
+        flight.binding_->query_state_.load() == Binding::PENDING)
+    {
+      flight.binding_->query_error_ =
+          error == OB_SUCCESS ? OB_ERR_UNEXPECTED : error;
+      flight.binding_->query_state_.store(Binding::FAILED,
+                                          std::memory_order_release);
+    }
+    if (error != OB_SUCCESS)
+    {
+      fail_pending_locked(flight, error);
+    }
+    else
+    {
+      for (const Handle &entry : flight.entries_)
+      {
+        if (entry->state() == Entry::PENDING)
+        {
+          entry->state_.store(Entry::COMPLETE, std::memory_order_release);
+        }
+      }
+    }
+    flight.phase_.store(Flight::DONE);
+    progress = true;
+    if (error != OB_SUCCESS)
+    {
+      LOG_WARN("cached semantic request failed; subscribers receive the "
+               "original error",
+               K(error), "execution_id", budget_.execution_id(), "binding_id",
+               flight.binding_->id_, "function_type", flight.binding_->type_,
+               "proxy", flight.binding_->proxy_.enabled_);
+    }
   }
 
   int drive(const std::shared_ptr<Flight> &flight, bool &progress)
@@ -407,42 +1089,89 @@ struct SemanticFunctionCache::Impl
       }
       else
       {
+        bool terminal = false;
         ret = Flight::check_status(flight.get());
-        if (OB_SUCC(ret) && flight->phase_.load() == Flight::QUEUED)
+        if (OB_SUCC(ret) && flight->phase_.load() == Flight::WAIT_QUERY)
         {
-          ObJsonObject *config = nullptr;
-          if (nullptr != flight->binding_->config_ &&
-              nullptr == (config = static_cast<ObJsonObject *>(
-                              flight->binding_->config_->clone(
-                                  &flight->allocator_, true))))
+          const auto state =
+              flight->binding_->query_state_.load(std::memory_order_acquire);
+          if (state == Binding::FAILED)
           {
-            ret = OB_ALLOCATE_MEMORY_FAILED;
+            ret = flight->binding_->query_error_;
+          }
+          else if (state == Binding::READY)
+          {
+            flight->phase_.store(Flight::QUEUED);
+          }
+        }
+        if (OB_SUCC(ret) && flight->phase_.load() == Flight::WAIT_VECTORS &&
+            join_vectors_status(*flight) != OB_EAGAIN)
+        {
+          ret = route_join(*flight, terminal);
+          progress = true;
+        }
+        if (OB_SUCC(ret) && !terminal &&
+            flight->phase_.load() == Flight::QUEUED)
+        {
+          bool started = false;
+          flight->batch_.set_nonblocking_admission();
+          flight->batch_.set_max_parallel(flight->max_parallel_);
+          flight->batch_.set_shared_buffer_usage(*budget_.memory_counter(),
+                                                 budget_.memory_limit());
+          flight->batch_.set_status_checker(&Flight::check_status,
+                                            flight.get());
+          if (flight->kind_ == Flight::EMBEDDING)
+          {
+            ret = start_embedding(*flight, started);
+          }
+          else if (flight->kind_ == Flight::JOIN_EMBEDDING)
+          {
+            ret = start_join_embedding(*flight, started);
           }
           else
           {
-            flight->batch_.set_nonblocking_admission();
-            flight->batch_.set_max_parallel(flight->max_parallel_);
-            flight->batch_.set_shared_buffer_usage(*budget_.memory_counter(),
-                                                   budget_.memory_limit());
-            flight->batch_.set_status_checker(&Flight::check_status,
-                                              flight.get());
-            ObAIFuncModel model(flight->allocator_,
-                                *flight->binding_->model_->info_,
-                                flight->binding_->model_->endpoint_);
-            ret = model.start_completion_batch(flight->prompts_, config,
-                                               flight->batch_);
+            ObJsonObject *config = nullptr;
+            if (nullptr != flight->binding_->config_ &&
+                nullptr == (config = static_cast<ObJsonObject *>(
+                                flight->binding_->config_->clone(
+                                    &flight->allocator_, true))))
+            {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            }
+            else
+            {
+              ObAIFuncModel model(flight->allocator_,
+                                  *flight->binding_->model_->info_,
+                                  flight->binding_->model_->endpoint_);
+              ObArray<ObString> &prompts = flight->binding_->proxy_.enabled_
+                                               ? flight->completion_prompts_
+                                               : flight->prompts_;
+              ret =
+                  model.start_completion_batch(prompts, config, flight->batch_);
+              if (OB_SUCC(ret))
+              {
+                started = true;
+                std::lock_guard<std::mutex> guard(mutex_);
+                submitted_ += prompts.count();
+              }
+            }
           }
-          if (OB_SUCC(ret))
+          if (OB_SUCC(ret) && started)
           {
             flight->phase_.store(Flight::RUNNING);
-            std::lock_guard<std::mutex> guard(mutex_);
-            submitted_ += flight->entries_.size();
+            progress = true;
+          }
+          else if (OB_SUCC(ret) &&
+                   (flight->phase_.load() == Flight::WAIT_QUERY ||
+                    flight->phase_.load() == Flight::WAIT_VECTORS))
+          {
             progress = true;
           }
         }
         bool finished = false;
         ObArray<ObString> results;
-        if (OB_SUCC(ret) && OB_FAIL(flight->batch_.poll(finished)))
+        if (OB_SUCC(ret) && flight->phase_.load() == Flight::RUNNING &&
+            OB_FAIL(flight->batch_.poll(finished)))
         {
         }
         else if (OB_SUCC(ret) && finished)
@@ -450,80 +1179,62 @@ struct SemanticFunctionCache::Impl
           if (OB_FAIL(flight->batch_.get_results(results)))
           {
           }
-          else if (results.count() !=
-                   static_cast<int64_t>(flight->entries_.size()))
+          else if (flight->kind_ == Flight::EMBEDDING)
           {
-            ret = OB_INVALID_DATA;
-            LOG_WARN(
-                "cached semantic response count differs from unique inputs",
-                K(ret));
+            ret = route_embedding(*flight, results, terminal);
+            progress = true;
           }
-          for (int64_t index = 0; OB_SUCC(ret) && index < results.count();
-               ++index)
+          else if (flight->kind_ == Flight::JOIN_EMBEDDING)
           {
-            const ObItemType type = flight->binding_->type_;
-            bool value = false;
-            if (type != T_FUN_SYS_AI_MAP &&
-                OB_FAIL(SemanticExprUtils::parse_boolean_result(
-                    type, flight->allocator_, results.at(index), value)))
+            ret = collect_join_vectors(*flight, results);
+            flight->batch_.cancel();
+            progress = true;
+          }
+          else
+          {
+            const bool proxy = flight->binding_->proxy_.enabled_;
+            const int64_t expected_count =
+                proxy ? flight->completion_positions_.count()
+                      : static_cast<int64_t>(flight->entries_.size());
+            if (results.count() != expected_count)
             {
+              ret = OB_INVALID_DATA;
+              LOG_WARN(
+                  "cached semantic response count differs from unique inputs",
+                  K(ret));
             }
-            else
+            for (int64_t index = 0; OB_SUCC(ret) && index < results.count();
+                 ++index)
             {
-              const int64_t bytes = results.at(index).length();
-              std::lock_guard<std::mutex> guard(mutex_);
-              if (OB_FAIL(reserve_locked(bytes)))
+              const ObItemType type = flight->binding_->type_;
+              bool value = false;
+              if (type != T_FUN_SYS_AI_MAP &&
+                  OB_FAIL(SemanticExprUtils::parse_boolean_result(
+                      type, flight->allocator_, results.at(index), value)))
               {
               }
               else
               {
-                Handle &entry = flight->entries_.at(index);
-                entry->result_buffer_.reset(
-                    new char[std::max<int64_t>(bytes, 1)]);
-                if (bytes > 0)
-                {
-                  std::memcpy(entry->result_buffer_.get(),
-                              results.at(index).ptr(), bytes);
-                }
-                entry->result_.assign_ptr(entry->result_buffer_.get(), bytes);
+                const int64_t position =
+                    proxy ? flight->completion_positions_.at(index) : index;
+                std::lock_guard<std::mutex> guard(mutex_);
+                ret = store_result_locked(*flight->entries_.at(position),
+                                          results.at(index));
               }
             }
+            terminal = true;
           }
         }
-        if (ret != OB_SUCCESS || finished)
+        if (ret != OB_SUCCESS || terminal)
         {
-          std::lock_guard<std::mutex> guard(mutex_);
-          for (const Handle &entry : flight->entries_)
-          {
-            entry->error_ = ret;
-            entry->state_.store(ret == OB_SUCCESS ? Entry::COMPLETE
-                                                  : Entry::FAILED,
-                                std::memory_order_release);
-          }
-          flight->phase_.store(Flight::DONE);
-          progress = true;
-          if (OB_FAIL(ret))
-          {
-            LOG_WARN("cached semantic request failed; subscribers receive the "
-                     "original error",
-                     K(ret), "execution_id", budget_.execution_id(),
-                     "binding_id", flight->binding_->id_, "function_type",
-                     flight->binding_->type_);
-          }
+          finish(*flight, ret, progress);
         }
       }
     }
     catch (const std::bad_alloc &)
     {
       ret = OB_ALLOCATE_MEMORY_FAILED;
-      std::lock_guard<std::mutex> guard(mutex_);
-      for (const Handle &entry : flight->entries_)
-      {
-        entry->error_ = ret;
-        entry->state_.store(Entry::FAILED, std::memory_order_release);
-      }
-      flight->phase_.store(Flight::DONE);
-      progress = true;
+      finish(*flight, ret, progress);
       LOG_WARN("allocate memoized semantic result failed", K(ret));
     }
     return ret;
@@ -543,6 +1254,14 @@ struct SemanticFunctionCache::Impl
   int64_t ready_hits_;
   int64_t coalesced_;
   int64_t submitted_;
+  int64_t proxy_query_embeddings_;
+  int64_t proxy_document_embeddings_;
+  int64_t proxy_rejected_;
+  int64_t proxy_forwarded_;
+  int64_t proxy_join_embeddings_;
+  int64_t proxy_vector_ready_hits_;
+  int64_t proxy_vector_coalesced_;
+  std::map<VectorKey, VectorHandle, VectorLess> join_vectors_;
 };
 
 SemanticFunctionCache::SemanticFunctionCache(SemanticQueryBudget &budget,
@@ -558,9 +1277,14 @@ int SemanticFunctionCache::submit(ObItemType type, const ObString &model,
                                   const ObIArray<ObString> &keys,
                                   const ObIArray<ObString> &prompts,
                                   int64_t max_parallel, uint64_t &binding_id,
-                                  std::vector<Handle> &handles, bool &progress)
+                                  std::vector<Handle> &handles, bool &progress,
+                                  const SemanticProxyConfig *proxy,
+                                  const ObIArray<ObString> *documents,
+                                  const ObIArray<ObString> *right_documents)
 {
   int ret = impl_->budget_.failure();
+  const bool use_proxy = nullptr != proxy && proxy->enabled_;
+  const bool join_proxy = use_proxy && type == T_FUN_SYS_AI_JOIN;
   if (OB_FAIL(ret))
   {
   }
@@ -570,6 +1294,29 @@ int SemanticFunctionCache::submit(ObItemType type, const ObString &model,
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid semantic memo submission", K(ret), K(type),
              K(max_parallel));
+  }
+  else if (use_proxy &&
+           ((type != T_FUN_SYS_AI_FILTER && !join_proxy) || nullptr == documents ||
+            documents->count() != keys.count() || proxy->model_.empty() ||
+            (join_proxy ? (!proxy->query_.empty() || nullptr == right_documents ||
+                           right_documents->count() != keys.count())
+                        : (proxy->query_.empty() || nullptr != right_documents)) ||
+            !std::isfinite(proxy->threshold_) ||
+            proxy->threshold_ < -1 || proxy->threshold_ > 1))
+  {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid embedding proxy submission", K(ret), K(type));
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                   "invalid embedding proxy inputs or options");
+  }
+  else if (use_proxy &&
+           (proxy->query_.length() > ObAIFuncClient::MAX_REQUEST_BYTES ||
+            proxy->model_.length() > ObAIFuncClient::MAX_REQUEST_BYTES))
+  {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("embedding proxy options exceed request size limit", K(ret));
+    FORWARD_USER_ERROR(ret,
+                       "embedding proxy options exceed the request size limit");
   }
   else
   {
@@ -586,142 +1333,209 @@ int SemanticFunctionCache::submit(ObItemType type, const ObString &model,
       {
         ret = canonical_config(*config, canonical);
       }
+      if (OB_SUCC(ret) && use_proxy)
+      {
+        ret = append_proxy_identity(canonical, *proxy);
+      }
       if (OB_SUCC(ret))
       {
         std::lock_guard<std::mutex> guard(impl_->mutex_);
         std::shared_ptr<Impl::Binding> binding;
         std::shared_ptr<Impl::Flight> flight;
         if (OB_FAIL(impl_->binding_locked(type, model, config,
-                                          canonical.string(), binding)))
+                                          canonical.string(), proxy, binding)))
         {
         }
         else
         {
           binding_id = binding->id_;
         }
-        for (int64_t index = 0; OB_SUCC(ret) && index < keys.count(); ++index)
+        try
         {
-          const Impl::Key key{binding->id_, keys.at(index)};
-          auto found = impl_->entries_.find(key);
-          if (found != impl_->entries_.end())
+          for (int64_t index = 0; OB_SUCC(ret) && index < keys.count(); ++index)
           {
-            handles.at(index) = found->second;
-            if (found->second->state() == Entry::PENDING)
+            const Impl::Key key{binding->id_, keys.at(index)};
+            auto found = impl_->entries_.find(key);
+            if (found != impl_->entries_.end())
             {
-              ++impl_->coalesced_;
+              handles.at(index) = found->second;
+              if (found->second->state() == Entry::PENDING)
+              {
+                ++impl_->coalesced_;
+              }
+              else
+              {
+                ++impl_->ready_hits_;
+              }
             }
             else
             {
-              ++impl_->ready_hits_;
-            }
-          }
-          else
-          {
-            const int64_t retained = sizeof(Entry) + sizeof(Impl::Key) +
-                                     sizeof(Handle) + 64 +
-                                     keys.at(index).length();
-            const int64_t config_bytes =
-                nullptr == config ? 0 : config->get_serialize_size();
-            const int64_t request_bytes =
-                6 * prompts.at(index).length() + 8 * config_bytes + 2048;
-            const int64_t overhead =
-                nullptr == flight ? sizeof(Impl::Flight) : 0;
-            if (request_bytes + overhead > impl_->budget_.memory_limit() ||
-                request_bytes > ObAIFuncClient::MAX_BATCH_BYTES)
-            {
-              ret = OB_SIZE_OVERFLOW;
-            }
-            else if (request_bytes + overhead + retained >
-                     impl_->budget_.memory_limit() -
-                         impl_->budget_.memory_used())
-            {
-              if (impl_->budget_.active_tasks() == 0)
+              const int64_t retained = sizeof(Entry) + sizeof(Impl::Key) +
+                                       sizeof(Handle) + 64 +
+                                       keys.at(index).length();
+              const int64_t config_bytes =
+                  nullptr == config ? 0 : config->get_serialize_size();
+              const int64_t proxy_bytes =
+                  join_proxy ? 6 * (documents->at(index).length() +
+                                    right_documents->at(index).length()) +
+                                   8192
+                  : use_proxy ? 6 * (documents->at(index).length() +
+                                     proxy->query_.length()) +
+                                    4096
+                              : 0;
+              const int64_t request_bytes = 6 * prompts.at(index).length() +
+                                            8 * config_bytes + 2048 +
+                                            proxy_bytes;
+              const int64_t overhead =
+                  nullptr == flight ? sizeof(Impl::Flight) : 0;
+              if (request_bytes + overhead > impl_->budget_.memory_limit() ||
+                  request_bytes > ObAIFuncClient::MAX_BATCH_BYTES)
               {
                 ret = OB_SIZE_OVERFLOW;
-                LOG_WARN("semantic memo cannot construct a request with "
-                         "retained input/cache memory",
-                         K(ret), K(request_bytes), K(retained));
               }
-            }
-            else
-            {
-              if (!flight)
+              else if (request_bytes + overhead + retained >
+                       impl_->budget_.memory_limit() -
+                           impl_->budget_.memory_used())
               {
-                const int admission = impl_->budget_.acquire_task();
-                if (admission == OB_EAGAIN)
+                if (impl_->budget_.active_tasks() == 0)
                 {
-                  continue;
+                  ret = OB_SIZE_OVERFLOW;
+                  LOG_WARN("semantic memo cannot construct a request with "
+                           "retained input/cache memory",
+                           K(ret), K(request_bytes), K(retained));
                 }
-                else if (admission != OB_SUCCESS)
+              }
+              else
+              {
+                if (!flight)
                 {
-                  ret = admission;
-                }
-                else
-                {
-                  try
+                  const int admission = impl_->budget_.acquire_task();
+                  if (admission == OB_EAGAIN)
                   {
-                    flight = std::make_shared<Impl::Flight>(impl_->budget_,
-                                                            impl_->deadline_);
-                    flight->credit_ = true;
-                    flight->binding_ = binding;
-                    flight->max_parallel_ = max_parallel;
-                    impl_->flights_.push_back(flight);
+                    continue;
                   }
-                  catch (const std::bad_alloc &)
+                  else if (admission != OB_SUCCESS)
                   {
-                    if (!flight)
+                    ret = admission;
+                  }
+                  else
+                  {
+                    try
                     {
-                      impl_->budget_.release_task();
+                      flight = std::make_shared<Impl::Flight>(impl_->budget_,
+                                                              impl_->deadline_);
+                      flight->credit_ = true;
+                      flight->binding_ = binding;
+                      flight->max_parallel_ = max_parallel;
+                      if (use_proxy)
+                      {
+                        flight->kind_ = join_proxy
+                                            ? Impl::Flight::JOIN_EMBEDDING
+                                            : Impl::Flight::EMBEDDING;
+                      }
+                      impl_->flights_.push_back(flight);
                     }
-                    throw;
+                    catch (const std::bad_alloc &)
+                    {
+                      if (!flight)
+                      {
+                        impl_->budget_.release_task();
+                      }
+                      throw;
+                    }
                   }
                 }
-              }
-              if (OB_SUCC(ret) && OB_FAIL(impl_->reserve_locked(retained)))
-              {
-              }
-              else if (OB_SUCC(ret) && OB_FAIL(impl_->budget_.reserve(
-                                           request_bytes + overhead)))
-              {
-              }
-              else if (OB_SUCC(ret))
-              {
-                flight->bytes_ += request_bytes + overhead;
-                Handle entry = std::make_shared<Entry>();
-                entry->binding_ = binding->id_;
-                entry->key_buffer_.reset(
-                    new char[std::max<int64_t>(keys.at(index).length(), 1)]);
-                if (!keys.at(index).empty())
-                {
-                  std::memcpy(entry->key_buffer_.get(), keys.at(index).ptr(),
-                              keys.at(index).length());
-                }
-                entry->key_.assign_ptr(entry->key_buffer_.get(),
-                                       keys.at(index).length());
-                ObString prompt;
-                if (OB_FAIL(ob_write_string(flight->allocator_,
-                                            prompts.at(index), prompt)))
+                if (OB_SUCC(ret) && OB_FAIL(impl_->reserve_locked(retained)))
                 {
                 }
-                else if (OB_FAIL(flight->prompts_.push_back(prompt)))
+                else if (OB_SUCC(ret) && OB_FAIL(impl_->budget_.reserve(
+                                             request_bytes + overhead)))
                 {
                 }
-                else
+                else if (OB_SUCC(ret))
                 {
-                  flight->entries_.push_back(entry);
-                  impl_->entries_.emplace(Impl::Key{binding->id_, entry->key_},
-                                          entry);
-                  handles.at(index) = entry;
-                  ++impl_->distinct_keys_;
-                  progress = true;
+                  flight->bytes_ += request_bytes + overhead;
+                  Handle entry = std::make_shared<Entry>();
+                  entry->binding_ = binding->id_;
+                  entry->key_buffer_.reset(
+                      new char[std::max<int64_t>(keys.at(index).length(), 1)]);
+                  if (!keys.at(index).empty())
+                  {
+                    std::memcpy(entry->key_buffer_.get(), keys.at(index).ptr(),
+                                keys.at(index).length());
+                  }
+                  entry->key_.assign_ptr(entry->key_buffer_.get(),
+                                         keys.at(index).length());
+                  ObString prompt;
+                  if (OB_FAIL(ob_write_string(flight->allocator_,
+                                              prompts.at(index), prompt)))
+                  {
+                  }
+                  else if (OB_FAIL(flight->prompts_.push_back(prompt)))
+                  {
+                  }
+                  if (OB_SUCC(ret) && join_proxy)
+                  {
+                    Impl::VectorHandle left;
+                    Impl::VectorHandle right;
+                    if (OB_FAIL(impl_->vector_locked(
+                            *flight, documents->at(index), left)))
+                    {
+                    }
+                    else if (OB_FAIL(impl_->vector_locked(
+                                 *flight, right_documents->at(index), right)))
+                    {
+                    }
+                    else
+                    {
+                      flight->left_vectors_.push_back(left);
+                      flight->right_vectors_.push_back(right);
+                    }
+                  }
+                  else if (OB_SUCC(ret) && use_proxy)
+                  {
+                    ObString document;
+                    if (OB_FAIL(ob_write_string(flight->allocator_,
+                                                documents->at(index),
+                                                document)))
+                    {
+                    }
+                    else
+                    {
+                      ret = flight->documents_.push_back(document);
+                    }
+                  }
+                  if (OB_SUCC(ret))
+                  {
+                    flight->entries_.push_back(entry);
+                    impl_->entries_.emplace(
+                        Impl::Key{binding->id_, entry->key_}, entry);
+                    handles.at(index) = entry;
+                    ++impl_->distinct_keys_;
+                    progress = true;
+                  }
                 }
               }
             }
           }
         }
-        if (flight && flight->entries_.empty())
+        catch (const std::bad_alloc &)
+        {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        }
+        if (flight && join_proxy && ret != OB_SUCCESS)
+        {
+          impl_->fail_pending_locked(*flight, ret);
+          flight->phase_.store(Impl::Flight::DONE);
+          progress = true;
+        }
+        else if (flight && flight->entries_.empty())
         {
           flight->phase_.store(Impl::Flight::DONE);
+        }
+        else if (flight && join_proxy && flight->embedding_entries_.empty())
+        {
+          flight->phase_.store(Impl::Flight::WAIT_VECTORS);
         }
       }
     }
@@ -739,13 +1553,14 @@ int SemanticFunctionCache::submit(ObItemType type, const ObString &model,
 
 bool SemanticFunctionCache::can_submit(uint64_t binding_id, const ObString &key,
                                        const ObString &prompt,
-                                       int64_t config_bytes) const
+                                       int64_t config_bytes,
+                                       int64_t proxy_bytes) const
 {
   std::lock_guard<std::mutex> guard(impl_->mutex_);
   const int64_t retained =
       sizeof(Entry) + sizeof(Impl::Key) + sizeof(Handle) + 64 + key.length();
-  const int64_t request =
-      sizeof(Impl::Flight) + 6 * prompt.length() + 8 * config_bytes + 2048;
+  const int64_t request = sizeof(Impl::Flight) + 6 * prompt.length() +
+                          8 * config_bytes + 2048 + proxy_bytes;
   return impl_->entries_.find(Impl::Key{binding_id, key}) !=
              impl_->entries_.end() ||
          retained > impl_->cache_limit_ - impl_->cache_bytes_ ||
@@ -801,9 +1616,16 @@ bool SemanticFunctionCache::is_ready() const
     bool expected = false;
     if (!ready && flight->busy_.compare_exchange_strong(expected, true))
     {
-      ready = flight->phase_.load() != Impl::Flight::RUNNING ||
-              (flight->phase_.load() == Impl::Flight::RUNNING &&
-               flight->batch_.is_ready());
+      const auto phase = flight->phase_.load();
+      ready = phase == Impl::Flight::QUEUED || phase == Impl::Flight::DONE ||
+              (phase == Impl::Flight::RUNNING && flight->batch_.is_ready()) ||
+              (phase == Impl::Flight::WAIT_QUERY &&
+               flight->binding_->query_state_.load(std::memory_order_acquire) !=
+                   Impl::Binding::PENDING) ||
+              (phase == Impl::Flight::WAIT_VECTORS &&
+               impl_->join_vectors_status(*flight) != OB_EAGAIN) ||
+              impl_->budget_.failure() != OB_SUCCESS ||
+              ObTimeUtility::current_time() >= impl_->deadline_;
       flight->busy_.store(false);
     }
   }
@@ -816,9 +1638,6 @@ bool SemanticFunctionCache::has_pending() const
   return !impl_->flights_.empty();
 }
 
-int64_t SemanticFunctionCache::deadline() const
-{
-  return impl_->deadline_;
-}
+int64_t SemanticFunctionCache::deadline() const { return impl_->deadline_; }
 } // namespace sql
 } // namespace oceanbase

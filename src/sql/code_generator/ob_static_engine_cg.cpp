@@ -1077,6 +1077,25 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
   spec.filter_expr_count_ = (op.get_type() == log_op_def::LOG_SEMANTIC_FILTER ||
                             op.get_type() == log_op_def::LOG_SEMANTIC_JOIN)
       ? op.expressions().count() : 0;
+  if (OB_SUCC(ret) && !op.proxy_configs().empty() &&
+      op.proxy_configs().count() != op.semantic_exprs().count()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("embedding proxy bindings do not match generated calls", K(ret));
+  } else if (OB_SUCC(ret) && op.has_embedding_proxy() && op.get_parallel() != 1) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "embedding proxy V0 requires serial execution");
+  } else if (OB_SUCC(ret) && OB_FAIL(spec.proxy_configs_.assign(op.proxy_configs()))) {
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && index < spec.proxy_configs_.count(); ++index) {
+    SemanticProxyConfig &config = spec.proxy_configs_.at(index);
+    if (!config.enabled_) {
+    } else if (OB_FAIL(ob_write_string(phy_plan_->get_allocator(),
+                                      op.proxy_configs().at(index).model_, config.model_))) {
+    } else {
+      ret = ob_write_string(phy_plan_->get_allocator(),
+                           op.proxy_configs().at(index).query_, config.query_);
+    }
+  }
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(generate_rt_exprs(op.expressions(), spec.expressions_))) {
   } else if (OB_FAIL(generate_rt_exprs(op.semantic_exprs(), spec.semantic_exprs_))) {
