@@ -351,7 +351,7 @@ class SemanticRowAsyncContracts(cache.SemanticCacheContracts):
         for fields in (
                 "a.id",
                 f"AI_AGG('{self.models[0]}',a.prompt,'Summarize the input.')",
-                f"AI_MAP('{self.models[0]}', AI_INPUT('file:',TO_FILE(a.prompt)))"):
+                self.call("map", options="a.opts")):
             with self.subTest(fields=fields):
                 statement = self.statement(fields)
                 for prefix in ("EXPLAIN ", ""):

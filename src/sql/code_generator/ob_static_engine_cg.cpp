@@ -1098,7 +1098,7 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
         op.get_type() != log_op_def::LOG_SEMANTIC_RANK))) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED,
-                   "row asynchronous execution requires serial text MAP/FILTER/RANK stages");
+                   "row asynchronous execution requires serial MAP/FILTER/RANK stages");
   } else if (OB_SUCC(ret) && !op.proxy_configs().empty() &&
       op.proxy_configs().count() != op.semantic_exprs().count()) {
     ret = OB_ERR_UNEXPECTED;

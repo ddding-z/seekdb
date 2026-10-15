@@ -38,6 +38,34 @@ using namespace share::schema;
 namespace sql
 {
 
+namespace
+{
+int check_semantic_auto_select(const ObSelectStmt &stmt, bool derived = false)
+{
+  int ret = OB_SUCCESS;
+  const TableItem *source = stmt.get_table_size() == 1 ? stmt.get_table_item(0) : nullptr;
+  if (!stmt.is_single_table_stmt() || nullptr == source ||
+      stmt.is_set_stmt() || stmt.has_group_by() || stmt.get_aggr_item_size() != 0 ||
+      stmt.has_having() || stmt.has_distinct() || stmt.has_window_function() ||
+      stmt.has_for_update() || stmt.has_select_into() || stmt.get_subquery_expr_size() != 0 ||
+      stmt.get_cte_definition_size() != 0 || (derived && (stmt.has_order_by() || stmt.has_limit()))) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (source->is_basic_table()) {
+  } else if (source->is_generated_table() && source->cte_type_ == TableItem::NOT_CTE &&
+             !source->is_view_table_ && nullptr != source->ref_query_) {
+    ret = SMART_CALL(check_semantic_auto_select(*source->ref_query_, true));
+  } else {
+    ret = OB_NOT_SUPPORTED;
+  }
+  if (ret == OB_NOT_SUPPORTED) {
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "automatic semantic output supports a single-table SELECT with ordering, LIMIT or simple derived inputs; derived inputs must not contain ordering or LIMIT");
+    LOG_WARN("unsupported automatic semantic statement boundary", K(ret), K(derived));
+  }
+  return ret;
+}
+}
+
 ObSelectResolver::ObSelectResolver(ObResolverParams &params)
   : ObDMLResolver(params),
     current_recursive_cte_table_item_(NULL),
@@ -1116,18 +1144,20 @@ int ObSelectResolver::resolve(const ParseNode &parse_tree)
   }
   if (OB_SUCC(ret)) {
     const ObOptParamHint &options = select_stmt->get_query_ctx()->get_global_hint().opt_params_;
-    bool unordered_output = false;
+    ObOptParamHint::SemanticOutputPolicy policy = ObOptParamHint::SemanticOutputPolicy::ORDERED;
     bool row_async_enabled = false;
-    if (OB_FAIL(options.get_semantic_unordered_output(unordered_output))) {
+    if (OB_FAIL(options.get_semantic_output_policy(policy))) {
       LOG_WARN("failed to read semantic output order", K(ret));
-    } else if (unordered_output) {
+    } else if (policy != ObOptParamHint::SemanticOutputPolicy::ORDERED) {
       if (OB_FAIL(options.get_bool_opt_param(ObOptParamHint::ENABLE_SEMANTIC_ROW_ASYNC,
                                             row_async_enabled))) {
         LOG_WARN("failed to read row asynchronous execution option", K(ret));
       } else if (!row_async_enabled) {
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT,
-                       "semantic_output_order='unordered' requires enable_semantic_row_async='true'");
+                       "semantic_output_order='unordered' or 'auto' requires enable_semantic_row_async='true'");
+      } else if (policy == ObOptParamHint::SemanticOutputPolicy::AUTO) {
+        ret = check_semantic_auto_select(*select_stmt);
       } else if (!select_stmt->is_single_table_stmt() ||
                  !select_stmt->get_table_item(0)->is_basic_table() ||
                  select_stmt->is_set_stmt() || select_stmt->has_order_by() ||

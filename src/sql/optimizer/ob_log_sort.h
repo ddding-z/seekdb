@@ -112,7 +112,7 @@ public:
   {
     topk_limit_expr_ = top_limit_expr;
   }
-  inline ObRawExpr *get_topk_limit_expr() { return topk_limit_expr_; }
+  inline ObRawExpr *get_topk_limit_expr() const { return topk_limit_expr_; }
   inline void set_topk_offset_expr(ObRawExpr *topk_offset_expr)
   {
     topk_offset_expr_ = topk_offset_expr;

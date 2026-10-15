@@ -707,34 +707,35 @@ int SemanticExprUtils::prepare_request_input(const ObExpr &expr, ObEvalCtx &ctx,
 
 namespace
 {
-bool semantic_cache_text_input(const ObRawExpr *expr)
+bool semantic_async_input(const ObRawExpr *expr, bool allow_files)
 {
   bool supported = false;
   if (nullptr != expr) {
-    if (ob_is_string_type(expr->get_data_type())) {
+    if (ob_is_string_type(expr->get_data_type()) ||
+        (allow_files && expr->get_data_type() == ObFileType)) {
       supported = true;
     } else if (expr->get_expr_type() == T_FUN_SYS_AI_INPUT ||
                expr->get_expr_type() == T_OP_ROW) {
       supported = expr->get_param_count() > 0;
       for (int64_t index = 0; supported && index < expr->get_param_count(); ++index) {
         supported = nullptr != expr->get_param_expr(index) &&
-            ob_is_string_type(expr->get_param_expr(index)->get_data_type());
+            (ob_is_string_type(expr->get_param_expr(index)->get_data_type()) ||
+             (allow_files && expr->get_param_expr(index)->get_data_type() == ObFileType));
       }
     } else if (expr->get_expr_type() == T_FUN_SYS_CAST &&
                CM_IS_IMPLICIT_CAST(expr->get_cast_mode()) &&
                expr->get_param_count() == 2) {
-      supported = semantic_cache_text_input(expr->get_param_expr(0));
+      supported = semantic_async_input(expr->get_param_expr(0), allow_files);
     }
   }
   return supported;
 }
-}
 
-bool SemanticExprUtils::supports_function_cache(const ObRawExpr &expr)
+bool semantic_static_call(const ObRawExpr &expr, bool allow_files)
 {
   const bool join = expr.get_expr_type() == T_FUN_SYS_AI_JOIN;
   const int64_t required = join ? 4 : 2;
-  bool supported = is_semantic(expr.get_expr_type()) &&
+  bool supported = SemanticExprUtils::is_semantic(expr.get_expr_type()) &&
       (expr.get_param_count() == required || expr.get_param_count() == required + 1) &&
       nullptr != expr.get_param_expr(0) &&
       expr.get_param_expr(0)->is_static_scalar_const_expr();
@@ -743,9 +744,22 @@ bool SemanticExprUtils::supports_function_cache(const ObRawExpr &expr)
         expr.get_param_expr(required)->is_static_scalar_const_expr();
   }
   for (int64_t argument = 1; supported && argument < required; ++argument) {
-    supported = semantic_cache_text_input(expr.get_param_expr(argument));
+    supported = semantic_async_input(expr.get_param_expr(argument), allow_files);
   }
   return supported;
+}
+}
+
+bool SemanticExprUtils::supports_function_cache(const ObRawExpr &expr)
+{
+  return semantic_static_call(expr, false);
+}
+
+bool SemanticExprUtils::supports_row_async(const ObRawExpr &expr)
+{
+  return (expr.get_expr_type() == T_FUN_SYS_AI_MAP ||
+          expr.get_expr_type() == T_FUN_SYS_AI_FILTER ||
+          expr.get_expr_type() == T_FUN_SYS_AI_RANK) && semantic_static_call(expr, true);
 }
 
 int SemanticExprUtils::prepare_join_proxy_input(const ObExpr &expr, ObEvalCtx &ctx,

@@ -35,6 +35,7 @@
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/engine/ob_physical_plan_ctx.h"
 #include "sql/engine/sort/ob_sort_op.h"
+#include "sql/engine/subquery/ob_subplan_scan_op.h"
 #include "sql/resolver/dml/ob_hint.h"
 #include "sql/session/ob_sql_session_info.h"
 
@@ -840,15 +841,21 @@ void test_semantic_output_order()
 void test_semantic_output_order_hint()
 {
   ObOptParamHint hints;
-  bool unordered = true;
-  require_equal(hints.get_semantic_unordered_output(unordered), OB_SUCCESS, "default output policy");
-  require(!unordered, "missing output policy means ordered");
+  auto policy = ObOptParamHint::SemanticOutputPolicy::UNORDERED;
+  require_equal(hints.get_semantic_output_policy(policy), OB_SUCCESS, "default output policy");
+  require(policy == ObOptParamHint::SemanticOutputPolicy::ORDERED, "missing output policy means ordered");
   ObObj value;
   value.set_varchar("UnOrDeReD");
   require_equal(hints.add_opt_param_hint(ObOptParamHint::SEMANTIC_OUTPUT_ORDER, value), OB_SUCCESS,
                 "accept a case-insensitive output policy");
-  require_equal(hints.get_semantic_unordered_output(unordered), OB_SUCCESS, "read output policy");
-  require(unordered, "unordered hint is not interpreted as a boolean");
+  require_equal(hints.get_semantic_output_policy(policy), OB_SUCCESS, "read output policy");
+  require(policy == ObOptParamHint::SemanticOutputPolicy::UNORDERED, "unordered hint is not a boolean");
+  ObOptParamHint automatic;
+  value.set_varchar("AuTo");
+  require_equal(automatic.add_opt_param_hint(ObOptParamHint::SEMANTIC_OUTPUT_ORDER, value),
+                OB_SUCCESS, "accept case-insensitive automatic policy");
+  require_equal(automatic.get_semantic_output_policy(policy), OB_SUCCESS, "read automatic output policy");
+  require(policy == ObOptParamHint::SemanticOutputPolicy::AUTO, "auto is distinct from strict unordered");
   ObOptParamHint invalid;
   value.set_int(1);
   require_equal(invalid.add_opt_param_hint(ObOptParamHint::SEMANTIC_OUTPUT_ORDER, value),
@@ -889,6 +896,18 @@ void test_sort_suspension_capability()
   require(sort.supports_semantic_suspend(), "restoring ordinary sort restores capability");
 }
 
+void test_subplan_scan_suspension_capability()
+{
+  ObArenaAllocator allocator("SemanticTest");
+  ObSubPlanScanSpec subplan(allocator, PHY_SUBPLAN_SCAN);
+  ObExecContext context(allocator);
+  ObSubPlanScanOp scan(context, subplan, nullptr);
+  subplan.max_batch_size_ = 0;
+  require(!scan.supports_semantic_suspend(), "scalar derived scans stay protected");
+  subplan.max_batch_size_ = 16;
+  require(scan.supports_semantic_suspend(), "vectorized simple derived scans are resumable");
+}
+
 struct TestCase
 {
   const char *name_;
@@ -917,6 +936,7 @@ const TestCase TESTS[] = {
   {"semantic_output_order", test_semantic_output_order},
   {"semantic_output_order_hint", test_semantic_output_order_hint},
   {"sort_suspension_capability", test_sort_suspension_capability},
+  {"subplan_scan_suspension_capability", test_subplan_scan_suspension_capability},
 };
 } // namespace
 

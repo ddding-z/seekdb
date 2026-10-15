@@ -434,7 +434,6 @@ class SemanticUnorderedContracts(rank.SemanticRankContracts):
             "WITH source_rows AS (SELECT * FROM cache_inputs) " +
             self.statement(fields, source="source_rows a"),
             self.statement(f"AI_AGG('{self.models[0]}',a.prompt,'Summarize.')"),
-            self.statement(self.call("map", "AI_INPUT('image:',TO_FILE(a.prompt))")),
             self.statement(self.call("map", "a.prompt", options="a.opts")),
             self.statement("AI_MAP(a.model,a.prompt)"),
             self.statement(fields + ",ROW_NUMBER() OVER (ORDER BY a.id)"),

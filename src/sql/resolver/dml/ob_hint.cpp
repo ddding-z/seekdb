@@ -657,19 +657,21 @@ int ObOptParamHint::get_semantic_proxy_threshold(double &val) const
   return ret;
 }
 
-int ObOptParamHint::get_semantic_unordered_output(bool &unordered) const
+int ObOptParamHint::get_semantic_output_policy(SemanticOutputPolicy &policy) const
 {
   int ret = OB_SUCCESS;
   ObObj value;
-  unordered = false;
+  policy = SemanticOutputPolicy::ORDERED;
   if (OB_FAIL(get_opt_param(SEMANTIC_OUTPUT_ORDER, value))) {
   } else if (value.is_nop_value()) {
   } else if (!is_param_val_valid(SEMANTIC_OUTPUT_ORDER, value)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "semantic_output_order requires 'ordered' or 'unordered'");
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "semantic_output_order requires 'ordered', 'unordered' or 'auto'");
     LOG_WARN("invalid semantic output order", K(ret), "value_type", value.get_type());
   } else {
-    unordered = 0 == value.get_varchar().case_compare("unordered");
+    policy = 0 == value.get_varchar().case_compare("unordered") ? SemanticOutputPolicy::UNORDERED :
+        0 == value.get_varchar().case_compare("auto") ? SemanticOutputPolicy::AUTO :
+        SemanticOutputPolicy::ORDERED;
   }
   return ret;
 }
@@ -688,7 +690,7 @@ int ObOptParamHint::add_opt_param_hint(const OptParamType param_type, const ObOb
           param_type == ENABLE_SEMANTIC_LIFT ? "enable_semantic_lift requires 'true' or 'false'" :
           param_type == ENABLE_SEMANTIC_CACHE ? "enable_semantic_cache requires 'true' or 'false'" :
           param_type == ENABLE_SEMANTIC_ROW_ASYNC ? "enable_semantic_row_async requires 'true' or 'false'" :
-          param_type == SEMANTIC_OUTPUT_ORDER ? "semantic_output_order requires 'ordered' or 'unordered'" :
+          param_type == SEMANTIC_OUTPUT_ORDER ? "semantic_output_order requires 'ordered', 'unordered' or 'auto'" :
           param_type == ENABLE_SEMANTIC_PROXY ? "enable_semantic_proxy requires 'true' or 'false'" :
           param_type == SEMANTIC_PROXY_MODEL ? "semantic_proxy_model requires a nonempty model name" :
           param_type == SEMANTIC_PROXY_QUERY ? "semantic_proxy_query requires nonempty retrieval text" :
@@ -739,7 +741,8 @@ bool ObOptParamHint::is_param_val_valid(const OptParamType param_type, const ObO
     }
     case SEMANTIC_OUTPUT_ORDER: {
       is_valid = val.is_varchar() && (0 == val.get_varchar().case_compare("ordered")
-                                      || 0 == val.get_varchar().case_compare("unordered"));
+                                      || 0 == val.get_varchar().case_compare("unordered")
+                                      || 0 == val.get_varchar().case_compare("auto"));
       break;
     }
     case SEMANTIC_PROXY_MODEL:

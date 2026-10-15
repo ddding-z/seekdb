@@ -1118,8 +1118,8 @@ LIMIT 5;
 ```
 
 `enable_semantic_row_async` 默认 false，使用带引号的 true/false，大小写不敏感。
-EXPLAIN 在启用的原生阶段显示 `row_async=ORDERED_PREFIX`。显式启用时只支持
-串行文本 MAP/FILTER/RANK、静态模型和 options；FILE、AI_JOIN、AI_AGG、PX/exchange
+未指定输出策略时，EXPLAIN 在启用的原生阶段显示 `row_async=ORDERED_PREFIX`。显式启用时只支持
+串行文本/FILE MAP/FILTER/RANK、静态模型和 options；AI_JOIN、AI_AGG、PX/exchange
 明确报错，不会悄悄退回整批发布。普通串行 SQL 连接不等于 AI_JOIN，仍可使用，
 但不能扩大原有 worker 挂起的安全边界。函数缓存、FILTER proxy、上提仍分别
 由原有开关控制；行间异步本身不近似答案，也不改变表达式求值需求。
@@ -1261,8 +1261,9 @@ SemanticRankSpec/Op 和逻辑 LogSemanticRank 是现有运行时的薄封装，�
 本地 PX 都按同一个类型接线。缓存的身份必须包括函数类型：即使 MAP/RANK 的
 HTTP body 完全相同，也不能把 MAP 文本结果直接当作评分命中。
 
-`enable_semantic_row_async` 扩展到串行 TEXT RANK，仍默认关闭；有序前缀、
-slot 背压和客户端 flush 规则不变，FILE/PX/JOIN/AGG 仍不属于该选项范围。
+`enable_semantic_row_async` 支持串行 TEXT/FILE RANK，仍默认关闭；有序前缀、
+slot 背压和客户端 flush 规则不变，PX/AI_JOIN/AI_AGG 仍不属于该选项范围。
+FILE 的扩展和自动输出策略见第 21、22 节。
 关闭该选项时，RANK 可复用已有 FILE 和合格本地 PX 路径。FILTER proxy 可先
 筛选，随后独立 RANK 只处理保留行；这不等于给 score 本身增加 reject-only proxy。
 
@@ -1308,13 +1309,14 @@ WHERE AI_FILTER('selector', AI_INPUT('内容是否相关：', content))
 LIMIT 5;
 ```
 
-`semantic_output_order` 接受带引号、大小写不敏感的 ordered/unordered，默认
-ordered。它与逐请求发布开关分开：
+`semantic_output_order` 接受带引号、大小写不敏感的 ordered/unordered/auto，默认
+ordered。它与逐请求发布开关分开，auto 的阶段级规则见第 22 节：
 
 - row-async 关闭或未指定：保留原有整批完成路径。
 - row-async 开启，策略未指定或 ordered：`row_async=ORDERED_PREFIX`。
 - row-async 开启且 unordered：`row_async=UNORDERED_READY`。
-- unordered 但未开启 row-async、非法字符串或数值策略：明确返回 1210，
+- row-async 开启且 auto：由规划器逐阶段选择有序前缀或无序就绪输出。
+- unordered/auto 但未开启 row-async、非法字符串或数值策略：明确返回 1210，
   不静默回退。显式 ordered 不会自行开启 row-async。
 
 ### 运行时与所有权
@@ -1345,12 +1347,12 @@ readiness 不因子算子已有未消费输出就持续唤醒，避免父算子�
 
 ### 规划准入与语义边界
 
-首版只支持单基表、串行 TEXT MAP/FILTER/RANK 流水线，允许普通筛选、投影、
+strict unordered 支持单基表、串行 TEXT/FILE MAP/FILTER/RANK 流水线，允许普通筛选、投影、
 LIMIT、静态 model/options、CASE/AND/OR/嵌套调用、查询缓存和独立 FILTER proxy。
 无序策略不进入函数缓存 key，也不改变共享 Flight 的查询级所有权。
 
 明确拒绝 ORDER BY/Top-N、GROUP BY/HAVING/聚合、DISTINCT、普通或语义 JOIN、
-FILE、AI_AGG、PX/exchange、派生表/CTE、标量子查询、集合/窗口查询以及
+AI_AGG、PX/exchange、派生表/CTE、标量子查询、集合/窗口查询以及
 locking/output SELECT。EXPLAIN 和 SELECT 都在模型请求前返回 1235。
 [ob_select_resolver.cpp](../../../src/sql/resolver/dml/ob_select_resolver.cpp)
 在重写前检查形态，避免派生表、连接或排序边界被重写消去后绕过首版范围；
@@ -1387,5 +1389,122 @@ range-order 属性，不能向父算子谎称保序。codegen/spec 序列化携�
 - native input/provider/proxy/评分 **22/22**；资源 **20 项重复两轮，共 40 次**
   通过，包含输出策略默认值、严格 hint 类型及 spec 序列化往返。
 
-以上是确定性功能验证；未宣称真实模型加速、SemBench 质量、sanitizer 或一般
-rescan 计划的穷尽式验证。FILE 行间异步、通用 JOIN/PX 和保序恢复仍是后续阶段。
+以上是初版无序输出的历史功能验证；未宣称真实模型加速、SemBench 质量、
+sanitizer 或一般 rescan 计划的穷尽式验证。后续 FILE 和普通排序恢复扩展见下文；
+通用 JOIN/PX 等仍未纳入无序/auto 的范围。
+
+## 21. P1：FILE 行间异步
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','unordered') */
+       id, AI_MAP('vision_model', AI_INPUT('描述图片：', image_file))
+FROM images
+LIMIT 5;
+```
+
+原来“FILE 不能启用行间异步”来自把资格检查复用了 TEXT 函数缓存检查，不是媒体
+runtime 完全同步。现在
+[supports_row_async](../../../src/sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.cpp)
+与 `supports_function_cache` 分开，支持静态模型/options 的原生 FILE、
+混合文本/FILE AI_INPUT 和 tuple MAP/FILTER/RANK。FILE 模型结果仍不进入 TEXT
+函数缓存；后续纯文本调用仍可缓存。已有查询内媒体复用遵循原 URI/version 和
+校验规则，不新增按 URL 复用模型答案。
+
+复用 [媒体 runtime](../../../src/sql/engine/basic/ob_semantic_media.h) 和
+[逐请求语义执行器](../../../src/sql/engine/basic/ob_semantic_op.cpp)：
+每行只等待自己的全部 FILE part 下载、校验和编码完成后提交模型，不等待同批
+其他行的媒体。慢首图下载期间，后图可以推理并进入依赖的文本 MAP/RANK。
+ordered 仍按输入前缀交付；unordered 可以先交付快行；auto 按下一节的计划要求
+选择。FILE 本身不采用“下载一部分就提交 provider”的流式协议。
+
+模型模态、MIME/大小/digest、part 顺序、CASE/Boolean demand guards、媒体并发和
+查询预算沿用原规则。HTTP 请求组可能仍借用媒体输入，不能因单行完成就提前
+释放组级 request arena 或 media handles。慢行仍可能 pin 自己的槽；未实现
+逐行 arena 回收、新 HTTP credit 或自适应 batch。
+
+下载、provider、格式校验、deadline 和 kill 都显式传播，已可见快行不代表查询
+成功。取消时先停止 pending 工作，再释放输入所有权，不返回伪成功默认值。
+
+新增入口
+[test_semantic_file_row_async.py](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_file_row_async.py)；
+使用受控 loopback 下载和模型端点，验证实际 SQL 可见性而非仅观察 HTTP 乱序。
+运行参数与既有 private deployment 契约一致。
+
+## 22. P2：计划级自动输出策略
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','auto') */
+       id, AI_MAP('summarizer', content)
+FROM documents
+WHERE AI_FILTER('selector', content)
+ORDER BY AI_RANK('ranker', content) DESC, id
+LIMIT 10;
+```
+
+auto 是显式、带引号、大小写不敏感的新策略，仍必须开启 row-async。默认 ordered
+和 strict unordered 不变；strict unordered 遇 ORDER BY/派生表仍报错，不偷改成
+ordered。在同一计划中可形成：
+
+```text
+Scan -> Filter[UNORDERED] -> Rank[UNORDERED] -> Sort -> Limit -> Map[ORDERED]
+```
+
+[ob_select_log_plan.cpp](../../../src/sql/optimizer/ob_select_log_plan.cpp) 在父算子
+依赖顺序属性前先清除无序阶段的顺序承诺，再按完整候选计划自顶向下传递保序需求，
+自底向上重算 ordering/interesting-order。普通完整 SORT 恢复顺序；其输入可以
+无序，但最终排序之上的语义投影必须保序。索引/scan 已满足 ORDER BY、没有独立
+SORT 时，末端投影同样采用 ordered-prefix，不能只凭“有无 SORT”决定无序。
+
+EXPLAIN 显示有效 `row_async` 模式及 `output_policy=AUTO, order_reason=...`：
+
+| reason | 有效输出 |
+| --- | --- |
+| `NO_ORDER_REQUIREMENT` | 无序就绪输出 |
+| `SORT_RESTORES_ORDER` | 普通完整排序/精确 Top-N 之前无序 |
+| `FINAL_SQL_ORDER` | 最终 SQL 有序区域内保留输入前缀 |
+
+本阶段开放单输入、串行 MAP/FILTER/RANK、普通完整排序、精确 Top-N、LIMIT 和
+简单派生表。重写前递归检查原始 query block，派生输入内部暂不允许 ORDER BY
+或 LIMIT。允许 merge 后计划，也验证保留的向量化 SUBPLAN SCAN；后者只在拉取
+子输入前的安全边界挂起，不在 CPU projector 执行一半时恢复。
+
+CTE/物化、stored view、标量子查询、JOIN、GROUP/聚合、DISTINCT、window/set、
+locking/output SELECT 和 PX 仍明确拒绝。prefix/local-merge/partition sort、
+WITH TIES、近似 Top-K 和 Top-N filter 不被当作普通顺序恢复边界。
+
+Top-N filter 还可能在较晚的 runtime-filter 分配 pass 中新增，因此
+[ob_log_sort.cpp](../../../src/sql/optimizer/ob_log_sort.cpp) 也检查 auto 准入，
+不能只在语义阶段分配时检查一次。若要显式选用不带该可选 filter 的普通精确
+Top-N，可指定 `OPT_PARAM('enable_topn_runtime_filter','false')`；不静默修改此设置。
+
+这次策略 pass 不挪动原语义阶段的 LIMIT/guard 需求边界。关系 ORDER BY/LIMIT
+之后的 MAP/RANK 只处理选中行并保持结果顺序；按模型 score 的精确 Top-N 通常
+仍需评分全部候选，SORT 仍可能阻塞客户端输出，不是语义 Top-K 剪枝。无 ORDER BY
+的 LIMIT 仍有完成速度偏置，不保证稳定分页。
+
+新增
+[test_semantic_output_policy.py](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_output_policy.py)
+覆盖无序可见性、混合阶段、数值精确 Top-N、无独立 SORT 的有序投影、精确请求数、
+guard/共享表达式、真实派生边界及其 timeout/kill/恢复。两份新入口均支持
+`--list-cases`、重复 `--case`、私有 `--binary`/`--log-dir` 与不停止外部服务器的
+`--socket`。这些是确定性功能契约，不宣称真实模型加速、SemBench 质量或 sanitizer
+验证。
+
+### P1/P2 最终验收
+
+- 最终 Debug 构建通过；FILE 行间异步 **18/18**、auto 输出策略 **22/22**
+  SQL/mock 契约通过，包含 FILE 评分后排序、关系排序/LIMIT 后仅对选中 FILE
+  推理并保序的跨 P1/P2 接线。
+- **113 项既有 SQL 回归**通过：ordered row-async 20、strict unordered 22、
+  RANK 27、默认 runtime 39、本地媒体 3、远程媒体 2。旧的 FILE-row-async
+  必拒绝 oracle 已按新的支持边界更新。
+- 6 项关键 auto 可见性、顺序/需求、派生恢复 gate 在全新私有部署再次通过。
+- native 输入/provider/proxy/资格 **24/24**；资源/策略/排序/派生挂起能力
+  **21 项重复两轮，共 42 次**通过。
+- 用 512 行及真实统计信息触发较晚的 Top-N filter 分配，负对照先证实仅有早期
+  准入检查会漏过该边界；修复后 EXPLAIN/SELECT 在模型请求前明确拒绝。
+  ordered 模式保留原功能，显式禁用该 filter 的 auto 精确 Top-N 仍可执行。

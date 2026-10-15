@@ -27,6 +27,7 @@
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
 #include "sql/engine/basic/ob_semantic_proxy.h"
+#include "sql/resolver/expr/ob_raw_expr.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -537,6 +538,71 @@ void test_proxy_filter_option_errors()
   }
 }
 
+void test_row_async_file_eligibility_is_not_function_cache_eligibility()
+{
+  ObArenaAllocator allocator;
+  ObConstRawExpr model(allocator);
+  require(OB_SUCCESS == model.add_flag(IS_CONST), "static model");
+  ObColumnRefRawExpr text_input(allocator);
+  text_input.set_data_type(ObVarcharType);
+  ObColumnRefRawExpr file_input(allocator);
+  file_input.set_data_type(ObFileType);
+  ObSysFunRawExpr recipe(allocator);
+  recipe.set_expr_type(T_FUN_SYS_AI_INPUT);
+  require(OB_SUCCESS == recipe.set_param_exprs(&text_input, &file_input), "mixed text and FILE input");
+  ObOpRawExpr tuple(allocator);
+  tuple.set_expr_type(T_OP_ROW);
+  require(OB_SUCCESS == tuple.set_param_exprs(&text_input, &file_input), "mixed tuple input");
+  for (ObItemType kind : {T_FUN_SYS_AI_MAP, T_FUN_SYS_AI_FILTER, T_FUN_SYS_AI_RANK}) {
+    for (ObRawExpr *input : {static_cast<ObRawExpr *>(&text_input),
+                            static_cast<ObRawExpr *>(&file_input),
+                            static_cast<ObRawExpr *>(&recipe),
+                            static_cast<ObRawExpr *>(&tuple)}) {
+      ObSysFunRawExpr call(allocator);
+      call.set_expr_type(kind);
+      require(OB_SUCCESS == call.set_param_exprs(&model, input), "static semantic call");
+      require(SemanticExprUtils::supports_row_async(call), "text and FILE support row async");
+      require(SemanticExprUtils::supports_function_cache(call) == (input == &text_input),
+              "FILE calls do not inherit text model-result caching");
+    }
+  }
+  file_input.set_data_type(ObIntType);
+  ObSysFunRawExpr invalid(allocator);
+  invalid.set_expr_type(T_FUN_SYS_AI_MAP);
+  require(OB_SUCCESS == invalid.set_param_exprs(&model, &recipe), "invalid recipe fixture");
+  require(!SemanticExprUtils::supports_row_async(invalid), "numeric recipe parts stay unsupported");
+}
+
+void test_row_async_static_call_guards()
+{
+  ObArenaAllocator allocator;
+  ObConstRawExpr constant(allocator);
+  require(OB_SUCCESS == constant.add_flag(IS_CONST), "static model and options");
+  ObColumnRefRawExpr dynamic(allocator);
+  dynamic.set_data_type(ObVarcharType);
+  for (bool dynamic_model : {false, true}) {
+    for (bool dynamic_options : {false, true}) {
+      ObSysFunRawExpr call(allocator);
+      call.set_expr_type(T_FUN_SYS_AI_RANK);
+      require(OB_SUCCESS == call.set_param_exprs(
+          dynamic_model ? static_cast<ObRawExpr *>(&dynamic) : &constant, &dynamic,
+          dynamic_options ? static_cast<ObRawExpr *>(&dynamic) : &constant),
+              "model and options fixture");
+      require(SemanticExprUtils::supports_row_async(call) == (!dynamic_model && !dynamic_options),
+              "row async requires a static model and options");
+    }
+  }
+  ObSysFunRawExpr join(allocator);
+  join.set_expr_type(T_FUN_SYS_AI_JOIN);
+  require(OB_SUCCESS == join.init_param_exprs(4) &&
+          OB_SUCCESS == join.add_param_expr(&constant) &&
+          OB_SUCCESS == join.add_param_expr(&dynamic) &&
+          OB_SUCCESS == join.add_param_expr(&dynamic) &&
+          OB_SUCCESS == join.add_param_expr(&dynamic), "text join fixture");
+  require(SemanticExprUtils::supports_function_cache(join), "existing text JOIN cache eligibility stays valid");
+  require(!SemanticExprUtils::supports_row_async(join), "FILE eligibility does not admit row-async JOIN");
+}
+
 struct TestCase
 {
   const char *name_;
@@ -566,6 +632,9 @@ const TestCase TESTS[] = {
   {"proxy_cosine_errors", test_proxy_cosine_errors},
   {"proxy_filter_option_overrides", test_proxy_filter_option_overrides},
   {"proxy_filter_option_errors", test_proxy_filter_option_errors},
+  {"row_async_file_eligibility_is_not_function_cache_eligibility",
+   test_row_async_file_eligibility_is_not_function_cache_eligibility},
+  {"row_async_static_call_guards", test_row_async_static_call_guards},
 };
 
 int run_tests()

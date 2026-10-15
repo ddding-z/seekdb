@@ -67,8 +67,9 @@ This reuses the bounded asynchronous runtime, cancellation, query cache and
 eligible resumable local PX path. Cache identity includes function kind even
 when MAP and RANK have identical HTTP bodies.
 
-Serial TEXT RANK is also accepted by `enable_semantic_row_async`, with the
-same ordered-prefix contract below; FILE and PX remain outside that option.
+Serial TEXT and FILE RANK are accepted by `enable_semantic_row_async`, with the
+same ordered-prefix contract below; PX remains outside that option. FILE
+preparation and stage-level automatic output policy are described next.
 An independent FILTER proxy can reject rows before a separate RANK stage
 scores survivors. RANK itself cannot use `semantic_proxy`. Existing lifting
 guards still apply. Cached scoring comparisons admit finite, nonthrowing
@@ -104,6 +105,142 @@ Validation:
 These are functional contracts, not a real-model accuracy, SemBench quality,
 latency or specialized Top-K pruning result. Sanitizer validation is not claimed.
 
+## FILE Row-Asynchronous Media Preparation (P1)
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','unordered') */
+       id, AI_MAP('vision_model', AI_INPUT('Describe this image: ', image_file))
+FROM images
+LIMIT 5;
+```
+
+Serial MAP/FILTER/RANK now accept native FILE inputs and mixed text/FILE
+`AI_INPUT` or tuple inputs with static models/options. Async eligibility is
+separate from function-cache eligibility; enabling the cache is not required.
+Default/`ordered` still emits completed input prefixes. Explicit `unordered`
+can emit a later ready row while an earlier remote download is held. `auto`
+uses the stage policy below. Other unordered query-shape limits are unchanged.
+
+This reuses the existing bounded media runtime and incremental model-response
+publication. Each row waits for all of its own FILE parts to be read, validated
+and encoded before model submission, but not for other rows' files. A ready
+image can reach its vision model, then a dependent text MAP/RANK, without
+waiting for a slow sibling download. This is neither download-to-provider
+streaming nor token streaming. Mixed content-part order, model modality
+checks, MIME/size/digest validation, demand guards and media admission budgets
+are unchanged.
+
+FILE-dependent **model results are not memoized** by the text function cache.
+Text calls remain cacheable, including text calls dependent on a completed
+vision result. Existing query-scoped media reuse keeps its URI/version
+identity and validation rules; it is not a model-answer cache keyed by URL.
+Slots, task credits and retained bytes are still bounded. Media handles and
+request arenas are not released per completed row while a request group may
+still borrow them; a slow row can retain its slot's memory.
+
+Downloads, model errors, deadline and cancellation remain query failures,
+including after a visible ready row. Teardown cancels pending work before
+releasing input owners; no failure becomes a successful default result.
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_file_row_async.py \
+  --binary build_debug/bin/src/observer/seekdb
+```
+
+The suite owns private loopback download/model fixtures and a private database.
+It tests SQL visibility rather than inferring progress from HTTP completion.
+
+## Stage-Level Automatic Output Policy (P2)
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','auto') */
+       id, AI_MAP('summarizer', content)
+FROM documents
+WHERE AI_FILTER('selector', content)
+ORDER BY AI_RANK('ranker', content) DESC, id
+LIMIT 10;
+```
+
+`auto` is explicit, quoted and case-insensitive. It requires row-async; it
+does not change the default `ordered` policy or weaken strict `unordered`.
+One plan can select:
+
+```text
+Scan -> Filter[UNORDERED] -> Rank[UNORDERED] -> Sort -> Limit -> Map[ORDERED]
+```
+
+The planner clears order properties before choosing dependent parent plans,
+then propagates order requirements down the admitted plan and recomputes
+ordering bottom-up. A full sort restores order; operators above it that must
+preserve final SQL order use ordered-prefix delivery. This also applies if
+an index/scan already supplies the final order and no separate SORT exists.
+Projection placement and LIMIT demand boundaries are not moved by this pass.
+
+EXPLAIN shows both the effective `row_async` mode and
+`output_policy=AUTO, order_reason=...`:
+
+| Reason | Effective mode |
+| --- | --- |
+| `NO_ORDER_REQUIREMENT` | `UNORDERED_READY` |
+| `SORT_RESTORES_ORDER` | `UNORDERED_READY` below an ordinary full sort/exact Top-N |
+| `FINAL_SQL_ORDER` | `ORDERED_PREFIX` in the final order-preserving region |
+
+P2 admits serial single-input MAP/FILTER/RANK plans, ordinary full sort,
+exact Top-N, LIMIT and simple derived scans. The resolver checks original
+query-block boundaries before rewrites. Derived inputs must have no ORDER BY
+or LIMIT; stored views, CTEs/materialization, scalar subqueries, JOIN,
+grouping/aggregates, DISTINCT, windows, sets, locking/output SELECT and PX are
+not in the auto scope. Prefix/local-merge/partition sorts, WITH TIES,
+approximate Top-K and pushed Top-N filters fail explicitly. Both merged
+derived inputs and retained vectorized SUBPLAN SCAN are covered; a retained
+scan suspends only before consuming child output, not midway through its
+CPU projection.
+
+The later runtime-filter allocation pass also checks auto admission: a
+statistics-enabled pushed Top-N filter must not bypass the earlier semantic
+plan check. To explicitly select an ordinary exact Top-N without this optional
+filter, use `OPT_PARAM('enable_topn_runtime_filter','false')`; no policy silently
+changes that setting.
+
+Score-dependent Top-N normally scores every demanded candidate; unordered
+scoring is not a pruning algorithm. A final sort still blocks client rows
+until it has enough input. Conversely, a projection after relational
+ORDER BY/LIMIT calls models only for selected rows and preserves that final
+order. Order-free LIMIT remains latency-biased, not stable pagination.
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_output_policy.py \
+  --binary build_debug/bin/src/observer/seekdb
+```
+
+Both new suites accept `--list-cases`, repeatable `--case`, private `--log-dir`
+and `--socket` with the existing deployment-ownership rules. The auto suite
+checks mixed stage policies, numeric exact Top-N and demand counts, sort-free
+index ordering, guarded/shared results, retained derived scans, final errors
+and deadline/kill/recovery. These are deterministic functional contracts, not
+real-model latency, SemBench quality or sanitizer results.
+
+Final P1/P2 Debug validation:
+
+- FILE row-async **18/18** and automatic policy **22/22** SQL/mock contracts
+  passed, including AUTO FILE scoring before sort and selected-only FILE
+  projection after relational ORDER BY/LIMIT.
+- **113 existing SQL contracts** passed: ordered row-async 20, strict
+  unordered 22, RANK 27, default runtime 39, local media 3 and remote media 2.
+  Obsolete FILE-row-async rejection checks were updated to the new contract.
+- Six critical automatic-policy visibility/order/derived-resume gates passed
+  again in a fresh private deployment.
+- Native input/provider/proxy/eligibility **24/24**, and resource/policy/sort/
+  derived-scan capability **21 cases repeated twice (42 executions)** passed.
+- A 512-row, statistics-enabled negative control exposed late Top-N filter
+  insertion bypassing early plan admission before the final fix. Both EXPLAIN
+  and SELECT now reject it before model work; ordered mode and explicit
+  filter-disabled auto exact Top-N remain covered positive controls.
+
 ## Opt-in Unordered Ready-Row Output
 
 ```sql
@@ -117,9 +254,9 @@ WHERE AI_FILTER('selector', AI_INPUT('Relevant? ', content))
 LIMIT 5;
 ```
 
-`semantic_output_order` accepts quoted, case-insensitive `ordered` or
-`unordered`. The default is `ordered`; the default for row-async remains
-false. Invalid policy values, numeric values and `unordered` without
+`semantic_output_order` accepts quoted, case-insensitive `ordered`,
+`unordered` or `auto`. The default is `ordered`; the default for row-async
+remains false. Invalid policy values, numeric values and `unordered`/`auto` without
 `enable_semantic_row_async='true'` fail with 1210 rather than falling back.
 
 | Row-async | Output policy | Delivery |
@@ -127,6 +264,7 @@ false. Invalid policy values, numeric values and `unordered` without
 | Off/default | Ordered/default | Existing batch-completion path |
 | On | Ordered/default | `row_async=ORDERED_PREFIX` |
 | On | Unordered | `row_async=UNORDERED_READY` |
+| On | Auto | Per-stage policy described above |
 
 Unordered delivery does not wait for an input prefix: any accepted terminal
 row can be delivered, including from a later slot while the first slot is
@@ -137,11 +275,11 @@ datums stay pinned until the next pull; a partial slot retains its arena and
 outstanding work. Rejected rows count toward completion but are never output.
 This is not a strict ordering of HTTP completion timestamps.
 
-V1 supports a serial, single-base-table TEXT MAP/FILTER/RANK pipeline, optional
+Strict unordered supports a serial, single-base-table TEXT/FILE MAP/FILTER/RANK pipeline, optional
 ordinary filters/projection/LIMIT, static models/options, guarded/nested
 expressions, query caching and independent reject-only FILTER proxies. Explicit
 ORDER BY/Top-N, GROUP BY/HAVING/aggregate, DISTINCT, JOIN (including ordinary
-joins), FILE, AI_JOIN/AI_AGG, PX/exchange, derived tables/CTEs, scalar subqueries,
+joins), AI_JOIN/AI_AGG, PX/exchange, derived tables/CTEs, scalar subqueries,
 set/window queries and locking/output SELECTs are rejected with 1235 before
 model requests. The resolver checks shape before rewriting can erase a
 boundary; the planner also checks the serial operator whitelist. Unordered
@@ -189,9 +327,9 @@ same ownership rules as the rank suite. Validation on the final Debug build:
   repeated twice (40 executions)** passed. Resource coverage includes output
   policy defaults, strict hint typing and serialized spec round trips.
 
-These are deterministic functional results, not a real-model latency,
-SemBench quality or sanitizer claim. FILE row-async and general order-restoring
-plans remain outside V1.
+These are historical V1 functional results, not a real-model latency,
+SemBench quality or sanitizer claim. The P1/P2 sections above describe the
+subsequent FILE and ordinary order-restoring-plan extensions.
 
 ## Opt-in Ordered Row-Asynchronous MAP/FILTER/RANK
 
@@ -209,9 +347,9 @@ The new option defaults to **false**. It accepts quoted, case-insensitive
 `true`/`false`; invalid values and explicitly unsupported shapes fail rather
 than silently using the old publication path. EXPLAIN identifies enabled
 stages with `row_async=ORDERED_PREFIX` when `semantic_output_order` is omitted
-or `ordered`; the unordered policy above is separately opt-in. Current scope is serial native TEXT
+or `ordered`; unordered and auto policies above are separately opt-in. Current scope is serial native TEXT/FILE
 MAP/FILTER/RANK with static model/options, with or without query caching and the
-existing reject-only FILTER proxies. FILE, AI_JOIN, AI_AGG and PX/exchange
+existing reject-only text FILTER proxies. AI_JOIN, AI_AGG and PX/exchange
 plans are not enabled by this option. Ordinary SQL joins remain possible in
 serial plans, subject to their existing suspension guards.
 

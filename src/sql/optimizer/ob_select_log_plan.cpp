@@ -5375,18 +5375,29 @@ int semantic_lift_candidate(ObLogJoin &join, int64_t side, LogSemantic &stage,
   return ret;
 }
 
-int check_unordered_semantic_plan(const ObLogicalOperator &node)
+int check_semantic_output_plan(const ObLogicalOperator &node, bool automatic)
 {
   int ret = OB_SUCCESS;
   const ObLogOpType type = node.get_type();
   if ((type != LOG_TABLE_SCAN && type != LOG_EXPR_VALUES &&
        type != LOG_LIMIT && type != LOG_SEMANTIC_MAP &&
-       type != LOG_SEMANTIC_FILTER && type != LOG_SEMANTIC_RANK) ||
+       type != LOG_SEMANTIC_FILTER && type != LOG_SEMANTIC_RANK &&
+       !(automatic && (type == LOG_SORT || type == LOG_SUBPLAN_SCAN))) ||
       node.get_num_of_child() > 1) {
     ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED,
-                   "unordered semantic execution supports a serial single-scan pipeline with optional LIMIT only");
-    LOG_WARN("unsupported unordered semantic plan boundary", K(ret), "operator_type", type);
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, automatic
+        ? "automatic semantic output supports a serial single-scan pipeline, ordinary sort, LIMIT and simple derived scans only"
+        : "unordered semantic execution supports a serial single-scan pipeline with optional LIMIT only");
+    LOG_WARN("unsupported semantic output plan boundary", K(ret), K(automatic), "operator_type", type);
+  } else if (type == LOG_SORT) {
+    const auto &sort = static_cast<const ObLogSort &>(node);
+    if (sort.is_prefix_sort() || sort.is_local_merge_sort() || sort.is_part_sort() ||
+        sort.is_fetch_with_ties() || nullptr != sort.get_topk_limit_expr() ||
+        sort.enable_pd_topn_filter()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "automatic semantic output currently requires an ordinary full sort or exact Top-N");
+      LOG_WARN("unsupported automatic semantic sort boundary", K(ret));
+    }
   }
   for (int64_t index = 0; OB_SUCC(ret) && index < node.get_num_of_child(); ++index) {
     const ObLogicalOperator *child = node.get_child(index);
@@ -5394,8 +5405,38 @@ int check_unordered_semantic_plan(const ObLogicalOperator &node)
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("missing unordered semantic plan input", K(ret));
     } else {
-      ret = SMART_CALL(check_unordered_semantic_plan(*child));
+      ret = SMART_CALL(check_semantic_output_plan(*child, automatic));
     }
+  }
+  return ret;
+}
+
+int assign_semantic_auto_output(ObLogicalOperator &node, bool ordered, const char *reason)
+{
+  int ret = OB_SUCCESS;
+  if (node.get_type() == LOG_SEMANTIC_MAP || node.get_type() == LOG_SEMANTIC_FILTER ||
+      node.get_type() == LOG_SEMANTIC_RANK) {
+    auto &stage = static_cast<LogSemantic &>(node);
+    stage.set_output_order(ordered ? SemanticOutputOrder::INPUT_ORDER : SemanticOutputOrder::READY_ORDER);
+    stage.set_auto_order_reason(reason);
+  } else if (node.get_type() == LOG_SORT) {
+    // A full sort establishes its own order; prefix/merge sorts are excluded by admission.
+    ordered = false;
+    reason = "SORT_RESTORES_ORDER";
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && index < node.get_num_of_child(); ++index) {
+    ObLogicalOperator *child = node.get_child(index);
+    if (OB_ISNULL(child)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing automatic semantic plan input", K(ret));
+    } else {
+      ret = SMART_CALL(assign_semantic_auto_output(*child, ordered, reason));
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(node.compute_op_ordering())) {
+    LOG_WARN("failed to refresh automatic semantic ordering", K(ret));
+  } else if (OB_SUCC(ret) && OB_FAIL(node.compute_op_interesting_order_info())) {
+    LOG_WARN("failed to refresh automatic semantic interesting order", K(ret));
   }
   return ret;
 }
@@ -5564,13 +5605,13 @@ public:
     return ret;
   }
 
-  int assign_query_limits(ObLogicalOperator &root, bool bind_proxy)
+  int assign_query_limits(ObLogicalOperator &root, bool bind_proxy, bool before_sort)
   {
     int ret = OB_SUCCESS;
     bool cache_enabled = false;
     bool proxy_enabled = false;
     bool row_async_enabled = false;
-    bool unordered_output = false;
+    ObOptParamHint::SemanticOutputPolicy policy = ObOptParamHint::SemanticOutputPolicy::ORDERED;
     const ObOptParamHint &options = plan_.get_optimizer_context().get_global_hint().opt_params_;
     if (OB_FAIL(options.get_bool_opt_param(
         ObOptParamHint::ENABLE_SEMANTIC_CACHE, cache_enabled))) {
@@ -5581,7 +5622,7 @@ public:
     } else if (OB_FAIL(options.get_bool_opt_param(
         ObOptParamHint::ENABLE_SEMANTIC_ROW_ASYNC, row_async_enabled))) {
       LOG_WARN("failed to read row asynchronous execution option", K(ret));
-    } else if (OB_FAIL(options.get_semantic_unordered_output(unordered_output))) {
+    } else if (OB_FAIL(options.get_semantic_output_policy(policy))) {
       LOG_WARN("failed to read semantic output order", K(ret));
     }
     ObSEArray<ObRawExpr *, 16> calls;
@@ -5618,18 +5659,20 @@ public:
       }
       for (int64_t index = 0; OB_SUCC(ret) && index < calls.count(); ++index) {
         const ObRawExpr &call = *calls.at(index);
-        if ((call.get_expr_type() != T_FUN_SYS_AI_MAP &&
-             call.get_expr_type() != T_FUN_SYS_AI_FILTER &&
-             call.get_expr_type() != T_FUN_SYS_AI_RANK) ||
-            !SemanticExprUtils::supports_function_cache(call)) {
+        if (!SemanticExprUtils::supports_row_async(call)) {
           ret = OB_NOT_SUPPORTED;
           LOG_USER_ERROR(OB_NOT_SUPPORTED,
-                         "row asynchronous execution supports static text MAP/FILTER/RANK calls only");
+                         "row asynchronous execution supports static text or FILE MAP/FILTER/RANK calls only");
         }
       }
-      if (OB_SUCC(ret) && unordered_output && bind_proxy) {
-        ret = check_unordered_semantic_plan(root);
+      if (OB_SUCC(ret) && policy != ObOptParamHint::SemanticOutputPolicy::ORDERED) {
+        ret = check_semantic_output_plan(root, policy == ObOptParamHint::SemanticOutputPolicy::AUTO);
       }
+    }
+    if (OB_SUCC(ret) && policy == ObOptParamHint::SemanticOutputPolicy::AUTO) {
+      const bool ordered = bind_proxy && !before_sort && plan_.get_stmt()->has_order_by();
+      ret = assign_semantic_auto_output(root, ordered,
+          ordered ? "FINAL_SQL_ORDER" : "NO_ORDER_REQUIREMENT");
     }
     if (OB_SUCC(ret) && proxy_enabled && bind_proxy) {
       bool serial = true;
@@ -5856,10 +5899,10 @@ private:
     ObSEArray<ObRawExpr *, 8> calls;
     ObSEArray<ObRawExpr *, 4> join_calls;
     bool has_rank = false;
-    bool unordered_output = false;
+    ObOptParamHint::SemanticOutputPolicy policy = ObOptParamHint::SemanticOutputPolicy::ORDERED;
     LogSemantic *stage = nullptr;
     if (OB_FAIL(plan_.get_optimizer_context().get_global_hint().opt_params_
-        .get_semantic_unordered_output(unordered_output))) {
+        .get_semantic_output_policy(policy))) {
       LOG_WARN("failed to read semantic output order", K(ret));
     } else if (OB_ISNULL(child)) {
       ret = OB_ERR_UNEXPECTED;
@@ -5928,8 +5971,8 @@ private:
         ret = stage->add_expression(expressions.at(index));
       }
       if (OB_SUCC(ret)) {
-        stage->set_output_order(unordered_output
-            ? SemanticOutputOrder::READY_ORDER : SemanticOutputOrder::INPUT_ORDER);
+        stage->set_output_order(policy == ObOptParamHint::SemanticOutputPolicy::ORDERED
+            ? SemanticOutputOrder::INPUT_ORDER : SemanticOutputOrder::READY_ORDER);
         stage->set_child(ObLogicalOperator::first_child, child);
         stage->set_is_plan_root(child->is_plan_root());
         child->set_is_plan_root(false);
@@ -5951,7 +5994,7 @@ private:
 };
 }
 
-int ObSelectLogPlan::candi_allocate_semantic(bool projection)
+int ObSelectLogPlan::candi_allocate_semantic(bool projection, bool before_sort)
 {
   int ret = OB_SUCCESS;
   ObSEArray<ObRawExpr *, 16> relations;
@@ -5969,7 +6012,7 @@ int ObSelectLogPlan::candi_allocate_semantic(bool projection)
   }
   bool proxy_enabled = false;
   bool row_async_enabled = false;
-  bool unordered_output = false;
+  ObOptParamHint::SemanticOutputPolicy policy = ObOptParamHint::SemanticOutputPolicy::ORDERED;
   if (OB_SUCC(ret) && OB_FAIL(get_optimizer_context().get_global_hint().opt_params_
       .get_bool_opt_param(ObOptParamHint::ENABLE_SEMANTIC_PROXY, proxy_enabled))) {
     LOG_WARN("failed to read embedding proxy option", K(ret));
@@ -5977,13 +6020,13 @@ int ObSelectLogPlan::candi_allocate_semantic(bool projection)
       .get_bool_opt_param(ObOptParamHint::ENABLE_SEMANTIC_ROW_ASYNC, row_async_enabled))) {
     LOG_WARN("failed to read row asynchronous execution option", K(ret));
   } else if (OB_SUCC(ret) && OB_FAIL(get_optimizer_context().get_global_hint().opt_params_
-      .get_semantic_unordered_output(unordered_output))) {
+      .get_semantic_output_policy(policy))) {
     LOG_WARN("failed to read semantic output order", K(ret));
-  } else if (OB_SUCC(ret) && unordered_output && !row_async_enabled) {
+  } else if (OB_SUCC(ret) && policy != ObOptParamHint::SemanticOutputPolicy::ORDERED && !row_async_enabled) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT,
-                   "semantic_output_order='unordered' requires enable_semantic_row_async='true'");
-  } else if (OB_SUCC(ret) && unordered_output &&
+                   "semantic_output_order='unordered' or 'auto' requires enable_semantic_row_async='true'");
+  } else if (OB_SUCC(ret) && policy == ObOptParamHint::SemanticOutputPolicy::UNORDERED &&
       (!get_stmt()->is_single_table_stmt() || !get_stmt()->get_table_item(0)->is_basic_table() ||
        get_stmt()->has_order_by() || get_stmt()->has_group_by() ||
        get_stmt()->get_aggr_item_size() != 0 || get_stmt()->has_having() ||
@@ -5991,12 +6034,14 @@ int ObSelectLogPlan::candi_allocate_semantic(bool projection)
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED,
                    "unordered semantic execution requires a single base table without ordering, grouping or DISTINCT");
-  } else if (OB_SUCC(ret) && projection && proxy_enabled && !present) {
+  } else if (OB_SUCC(ret) && projection && proxy_enabled && !present &&
+             (policy != ObOptParamHint::SemanticOutputPolicy::AUTO || is_final_root_plan())) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "embedding proxy requires a native text AI_FILTER or AI_JOIN");
-  } else if (OB_SUCC(ret) && projection && row_async_enabled && !present) {
+  } else if (OB_SUCC(ret) && projection && row_async_enabled && !present &&
+             (policy != ObOptParamHint::SemanticOutputPolicy::AUTO || is_final_root_plan())) {
     ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "row asynchronous execution requires native text MAP/FILTER calls");
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "row asynchronous execution requires native MAP/FILTER/RANK calls");
   }
   if (OB_SUCC(ret) && present) {
     const ObSelectStmt &stmt = *get_stmt();
@@ -6011,7 +6056,7 @@ int ObSelectLogPlan::candi_allocate_semantic(bool projection)
       SemanticPlanLowering lowering(*this);
       if (OB_FAIL(lowering.lower(root))) {
       } else if (projection && OB_FAIL(lowering.add_projection(root, selects))) {
-      } else if (OB_FAIL(lowering.assign_query_limits(*root, projection))) {
+      } else if (OB_FAIL(lowering.assign_query_limits(*root, projection, before_sort))) {
       }
     }
   }
@@ -6259,7 +6304,7 @@ int ObSelectLogPlan::allocate_plan_top()
     }
     // Keep demand above LIMIT/Top-N and potentially failing computed sort keys.
     if (OB_SUCC(ret) && can_project_semantic_before_sort(*select_stmt) &&
-        OB_FAIL(candi_allocate_semantic())) {
+        OB_FAIL(candi_allocate_semantic(true, true))) {
     }
     // step. allocate 'order-by' if needed
     if (OB_SUCC(ret) && select_stmt->has_order_by() &&

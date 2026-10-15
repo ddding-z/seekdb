@@ -67,6 +67,7 @@ public:
                                   common::ObString &model_id, SemanticInput &input,
                                   common::ObJsonObject *&config, bool prepare_config = true);
   static bool supports_function_cache(const ObRawExpr &expr);
+  static bool supports_row_async(const ObRawExpr &expr);
   static int prepare_cache_key(const ObExpr &expr, ObEvalCtx &ctx,
                                MultimodeAlloctor &allocator, common::ObString &key);
   static int prepare_join_proxy_input(const ObExpr &expr, ObEvalCtx &ctx,

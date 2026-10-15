@@ -501,8 +501,13 @@ class SemanticRankContracts(cache.SemanticCacheContracts):
                              forbidden_paths=[asset.path])
         self.assertEqual(self.first.requests[0]["response_format"], RANK_FORMAT)
         opted_in = statement.replace("/*+", "/*+ " + ROW_HINT, 1)
-        sql_error(self, 1235, lambda: self.execute(opted_in))
-        self.assertEqual(len(self.first.requests), 1)
+        self.assertIn("row_async=ORDERED_PREFIX",
+                      "\n".join(row[0] for row in self.execute("EXPLAIN " + opted_in)))
+        self.assertEqual(self.execute(opted_in), ((9.5,),))
+        self.assertEqual(self.cursor.description[0][1], FIELD_TYPE.DOUBLE)
+        self.assertEqual(len(self.first.requests), 2)
+        files.assert_content(self, self.first.requests[1], content, assets=[asset],
+                             forbidden_paths=[asset.path])
 
 
 class SemanticRankProxyContracts(proxy.SemanticProxySmoke):

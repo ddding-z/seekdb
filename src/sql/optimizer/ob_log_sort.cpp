@@ -604,6 +604,17 @@ int ObLogSort::try_allocate_pushdown_topn_runtime_filter()
   }
 
   if (OB_SUCC(ret) && can_allocate) {
+    ObOptParamHint::SemanticOutputPolicy policy = ObOptParamHint::SemanticOutputPolicy::ORDERED;
+    if (OB_FAIL(get_plan()->get_optimizer_context().get_global_hint().opt_params_
+        .get_semantic_output_policy(policy))) {
+      LOG_WARN("failed to read semantic output policy for Top-N runtime filtering", K(ret));
+    } else if (policy == ObOptParamHint::SemanticOutputPolicy::AUTO) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "automatic semantic output does not support pushed Top-N filters");
+      LOG_WARN("Top-N filter allocation would invalidate automatic semantic plan admission", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && can_allocate) {
     ObRawExprFactory &expr_factory = get_plan()->get_optimizer_context().get_expr_factory();
     if (OB_FAIL(
             expr_factory.create_raw_expr(T_OP_PUSHDOWN_TOPN_FILTER, pushdown_topn_filter_expr))) {

@@ -49,6 +49,8 @@ public:
 
   virtual int inner_get_next_batch(const int64_t max_row_cnt) override;
 
+  bool supports_semantic_suspend() const override { return is_vectorized(); }
+
   virtual void destroy() override { ObOperator::destroy(); }
 private:
   int next_batch(const int64_t max_row_cnt);

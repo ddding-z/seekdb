@@ -233,6 +233,9 @@ int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_ite
                        output_order_ == SemanticOutputOrder::READY_ORDER
                            ? "UNORDERED_READY" : "ORDERED_PREFIX");
     }
+    if (OB_SUCC(ret) && nullptr != auto_order_reason_) {
+      ret = BUF_PRINTF(", output_policy=AUTO, order_reason=%s", auto_order_reason_);
+    }
     END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
   }
   return ret;

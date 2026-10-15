@@ -163,6 +163,8 @@ struct ObOptParamHint
 
   DECLARE_ENUM(OptParamType, opt_param, OPT_PARAM_TYPE_DEF, static);
 
+  enum class SemanticOutputPolicy { ORDERED, UNORDERED, AUTO };
+
   static bool is_param_val_valid(const OptParamType param_type, const ObObj &val);
   int merge_opt_param_hint(const ObOptParamHint &other);
   int add_opt_param_hint(const ObString &param_name, const ObObj &val)
@@ -177,7 +179,7 @@ struct ObOptParamHint
   int get_integer_opt_param(const OptParamType param_type, int64_t &val, bool &is_exists) const;
   int get_integer_opt_param(const OptParamType param_type, int64_t &val) const;
   int get_semantic_proxy_threshold(double &val) const;
-  int get_semantic_unordered_output(bool &unordered) const;
+  int get_semantic_output_policy(SemanticOutputPolicy &policy) const;
   int get_opt_param_runtime_filter_type(int64_t &rf_type) const;
   int get_hash_rollup_param(ObObj &val, bool &has_opt_param) const;
   int get_enum_opt_param(const OptParamType param_type, int64_t &val) const;
