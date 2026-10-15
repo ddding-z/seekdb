@@ -1060,6 +1060,7 @@ void ObExprOperatorFactory::register_expr_operators()
     REG_OP(ExprAIJoin);
     REG_OP(ExprAIInput);
     REG_OP(ExprAIAgg);
+    REG_OP(ExprAIRank);
   }();
 }
 

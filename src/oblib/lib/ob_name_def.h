@@ -1092,6 +1092,7 @@
 #define N_AI_RERANK                         "ai_rerank"
 #define N_AI_PROMPT                         "ai_prompt"
 #define N_AI_MAP                            "ai_map"
+#define N_AI_RANK                           "ai_rank"
 #define N_AI_FILTER                         "ai_filter"
 #define N_AI_JOIN                           "ai_join"
 #define N_AI_INPUT                          "ai_input"

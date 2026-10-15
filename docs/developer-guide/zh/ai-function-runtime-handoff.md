@@ -1,6 +1,6 @@
 # AI Function、异步 Semantic Operators 与全局 SOLO 维护交接
 
-更新日期：2026-10-12。实现起点：`2ea8cd37c`，`feat(sql): add native FILE and multimodal semantic execution`。本文包含在该基线上新增的原生文本 AI_AGG；保留 2026-10-10 真实视觉模型的部分验收及质量边界。
+更新日期：2026-10-15。实现起点：`2ea8cd37c`，`feat(sql): add native FILE and multimodal semantic execution`。本文包含在该基线上新增的原生文本 AI_AGG 和数值评分 AI_RANK；保留 2026-10-10 真实视觉模型的部分验收及质量边界。
 
 本文面向接手实现、调试和回归测试的开发者，覆盖 AI Function 异步运行时及全阻塞 SOLO。这里的 SOLO 是数据库端的输入排列算法，不是推理服务端的 KV cache 实现。
 
@@ -14,7 +14,9 @@
 | SQL worker 释放 | 符合准入条件的单语句 AI 根算子查询可挂起并从保留状态恢复，不重新执行整条 SQL |
 | 全局 SOLO | 收齐当前 AI 阶段的全部输入，完成一次列重排和行重排后才提交模型请求 |
 | AI_MAP / AI_FILTER | 显式逻辑和物理算子；独立表达式并发、依赖感知的跨批推进、严格布尔过滤 |
-| 可选行间异步 | 串行文本 MAP/FILTER 逐请求发布、脏行推进、有序前缀输出；默认关闭，见第 18 节 |
+| AI_RANK | SemBench 逐行数值评分；原生 DOUBLE，普通 SQL 完成排序、Top-K 和分组平均，见第 19 节 |
+| 可选行间异步 | 串行文本 MAP/FILTER/RANK 逐请求发布、脏行推进、有序前缀输出；默认关闭，见第 18 节 |
+| 可选无序输出 | 显式 unordered 策略，完成行及后续槽可先交付、非队首槽独立复用；首版限单基表串行文本流水线，见第 20 节 |
 | AI_JOIN | INNER JOIN ON 的显式语义连接；普通 SQL 候选对生成加有界异步判断，不做近似候选裁剪 |
 | AI_AGG | 真正跨行的文本聚合；SQL 分组、小组一次调用、有界确定性归约及共享异步运行时 |
 | 语义 PX | 经校验的 reduce-transmit / semantic / GI / scan 路径保留任务状态并释放物理 worker；同一查询共享预算 |
@@ -71,8 +73,8 @@ prefix/local-merge/partition sort、prescan、WITH TIES、近似 Top-K 和 Top-N
 仍受保护；强制 dump 或已经 spill 的运行时也不会借此扩大挂起边界。
 
 实现使用显式 shared/carried 元数据：只有声明过的语义结果可以携带内部
-“尚未请求”的 NULL 标记，正常 AI_MAP/AI_FILTER 结果不会是 SQL NULL。false 和
-空字符串都是有效的已完成值；内部标记不能作为查询输出。依赖这些结果的 CPU
+“尚未请求”的 NULL 标记，正常 AI_MAP/AI_FILTER/AI_RANK 结果不会是 SQL NULL。
+false、空字符串和零分都是有效的已完成值；内部标记不能作为查询输出。依赖这些结果的 CPU
 prompt 配方及条件 fallback 不当成完整输入列传递，而是在消费者的语义运行时中
 按需重算。批次已初始化状态与每行完成位分开，补算一行不能清掉其他行的缓存。
 完整 CASE/OR 条件已经算完，不代表它跳过的 CPU 分支也算完了；条件本身可以输出，
@@ -1117,7 +1119,7 @@ LIMIT 5;
 
 `enable_semantic_row_async` 默认 false，使用带引号的 true/false，大小写不敏感。
 EXPLAIN 在启用的原生阶段显示 `row_async=ORDERED_PREFIX`。显式启用时只支持
-串行文本 MAP/FILTER、静态模型和 options；FILE、AI_JOIN、AI_AGG、PX/exchange
+串行文本 MAP/FILTER/RANK、静态模型和 options；FILE、AI_JOIN、AI_AGG、PX/exchange
 明确报错，不会悄悄退回整批发布。普通串行 SQL 连接不等于 AI_JOIN，仍可使用，
 但不能扩大原有 worker 挂起的安全边界。函数缓存、FILTER proxy、上提仍分别
 由原有开关控制；行间异步本身不近似答案，也不改变表达式求值需求。
@@ -1175,7 +1177,7 @@ EXPLAIN 在启用的原生阶段显示 `row_async=ORDERED_PREFIX`。显式启用
 retry、错误后部分输出、取消和同连接恢复。native 资源入口补充默认关闭、
 显式启用及原 task 背压不变的契约。
 
-### 本轮验收
+### 初版 MAP/FILTER 验收
 
 - Debug 构建通过；新增 **20/20 SQL/mock 契约**通过，包括两阶段 EXPLAIN 标记、
   语义阶段在协调器串行执行但下方普通 SQL 子树有 PX 时仍明确拒绝。
@@ -1190,3 +1192,200 @@ retry、错误后部分输出、取消和同连接恢复。native 资源入口�
 
 以上为确定性功能验证，不代表真实模型延迟提升或 SemBench 质量结果；未宣称完成
 sanitizer、所有 rescan 和穷尽式故障注入验证。
+
+## 19. 原生 Semantic Rank：SemBench 数值评分
+
+接口是 `AI_RANK(model, input[, options])`，返回真正的 SQL DOUBLE。
+这里对应 SemBench 的 `AI.SCORE`：movie Q9 逐 review 评分，Q10 再按 movie
+求平均；不是两两比较排序，也不是已有的 AI_RERANK 接口。
+
+```sql
+SELECT reviewId,
+       AI_RANK('judge_model',
+               AI_INPUT('请按 1 到 5 分评价这条影评：', reviewText)) AS reviewScore
+FROM reviews;
+
+SELECT movieId,
+       AVG(AI_RANK('judge_model',
+                   AI_INPUT('请按 1 到 5 分评价这条影评：', reviewText))) AS movieScore
+FROM reviews
+GROUP BY movieId;
+
+SELECT reviewId,
+       AI_RANK('judge_model',
+               AI_INPUT('请按 1 到 5 分评价这条影评：', reviewText)) AS reviewScore
+FROM reviews
+ORDER BY reviewScore DESC, reviewId
+LIMIT 10;
+```
+
+评分标准和期望范围由 prompt 决定；引擎不固定为 1 到 5 分，也不夹紧或填默认值。
+负数、小数和大的有限 DOUBLE 都合法。升降序必须由 SQL 指定；排序和 AVG 都是
+数值运算，重复行和并列分数遵循普通 SQL 语义。按 score 排序的 Top-K 仍要评分
+所有被需求的候选；如果只是最终投影，关系排序/LIMIT 可先减少真正需要评分的行。
+`SEMANTIC RANK` 是评分物化阶段，不是专用排序、比较式 Top-K 或 ANN 剪枝算子。
+
+### 协议与必须保留的数值契约
+
+模型和 options 静态；输入复用 MAP 的文本、AI_INPUT、有序 tuple/FILE 协议。
+provider 必须支持 strict JSON schema；引擎要求根对象只有一个必需的
+`value:number`，设置 `additionalProperties=false` 和 `strict=true`。
+接受格式是 `{"value":4.5}`，不是裸数字，也不是 `{"value":"4.5"}`。
+完全匹配的 schema 和调用者非空名称可以保留；冲突格式、保留键 Schema 和
+RANK 自身的 semantic_proxy 都报错，其他 generation options 保持透传。
+
+[ob_expr_ai_semantic.cpp](../../../src/sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.cpp)
+统一准备 Boolean/number schema，但回填必须按函数类型处理：RANK 使用
+`set_double`，不能经过 LONGTEXT 或宽松 SQL CAST。严格拒绝额外/重复键、
+Boolean/null/string、非有限值、DOUBLE 溢出和非零数下溢成零。普通 DOUBLE
+精度舍入允许；输出参数只在完整校验成功后改变。尤其不能只打印 JSON DOM 再转
+DOUBLE：底层 JSON parser 可能已把 `1e-400` 舍为零。当前先校验严格对象，再对
+原始数值 token 做完整消费、有限性及非零下溢检查；escaped value 键和重复键
+也有 native 回归。
+
+refusal、截断和无效结果不能缓存为成功或假分数。provider 可能先于评分解析器
+拒绝非法 JSON/溢出，保留其原始 SQL 错误，不为了统一 4070 覆盖已有 3140。
+已经发出有序前缀后遇到错误仍返回 SQL error，客户端必须读取最终状态。
+
+### 计划、缓存与执行组合
+
+[ob_select_log_plan.cpp](../../../src/sql/optimizer/ob_select_log_plan.cpp)
+把包含评分的非筛选物化阶段标为 SEMANTIC RANK；依赖评分的 WHERE/HAVING
+仍是 SEMANTIC FILTER。CASE/AND/OR 继续按需执行，不能常量折叠模型调用；
+cache 关闭时，即使 prompt 是常量，也按被需求的 SQL 行调用。
+MAP→RANK、RANK→CPU→MAP 依赖、别名复用和已物化值携带复用原机制。
+
+[ob_semantic_op.h](../../../src/sql/engine/basic/ob_semantic_op.h) 的
+SemanticRankSpec/Op 和逻辑 LogSemanticRank 是现有运行时的薄封装，不新增
+一套调度器。表达式、codegen、序列化、共享预算/取消、根结果集挂起和可恢复
+本地 PX 都按同一个类型接线。缓存的身份必须包括函数类型：即使 MAP/RANK 的
+HTTP body 完全相同，也不能把 MAP 文本结果直接当作评分命中。
+
+`enable_semantic_row_async` 扩展到串行 TEXT RANK，仍默认关闭；有序前缀、
+slot 背压和客户端 flush 规则不变，FILE/PX/JOIN/AGG 仍不属于该选项范围。
+关闭该选项时，RANK 可复用已有 FILE 和合格本地 PX 路径。FILTER proxy 可先
+筛选，随后独立 RANK 只处理保留行；这不等于给 score 本身增加 reject-only proxy。
+
+上提仍受原有 join/source/shared/guard 安全条件限制。缓存评分谓词的隐式
+Int/UInt→DOUBLE 转换可准入：包括 SQL 参数化后的整数阈值，转换始终有限、
+不抛错，前后遵循相同 SQL 舍入语义。它不扩大模型输入转换范围，也不准入显式
+CAST、可能失败的 Double→Int/字符串转换或任意 CPU 配方。
+新增回归同时验证上提后的精确请求数、连接重复行、超过 2^53 的阈值和被保护的
+显式 cast；不能只根据算子名称宣称上提成功。
+
+### 验收与入口
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_rank.py \
+  --binary build_debug/bin/src/observer/seekdb
+```
+
+支持 `--list-cases`、重复 `--case` 和私有部署 `--log-dir`。`--socket` 不停止
+外部实例，FILE/PX 的私有部署专属验证跳过；默认 binary 模式实际验证这些能力。
+
+- Debug 构建和 **27/27 新增 SQL/mock 契约**通过，覆盖 Q9/Q10、DOUBLE 协议
+  元数据、数值排序/Top-K、LIMIT、别名、guard、依赖、cache/上提、严格错误、
+  retry、kill/恢复、小前缀及其后错误、FILE、实际本地 PX、FILTER proxy，
+  以及原生 JOIN/FILTER 后对保留候选评分并分组 AVG。
+- 本轮 **83 项既有 SQL 回归**通过：runtime 39、row-async 20、
+  cache/lift/JOIN 16 和定向上提安全边界 8；后两组在最终构建上重新通过。
+- native input/provider/proxy/评分 **22/22**；资源 **18 项重复两轮，共 36 次**
+  通过。
+
+以上为确定性功能契约；未宣称完成真实模型评分质量、SemBench accuracy、
+实际延迟加速、专用 Top-K 剪枝或 sanitizer 验证。
+
+## 20. 可选无序输出：UNORDERED_READY
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','unordered')
+           OPT_PARAM('rowsets_max_rows',16) */
+       id, AI_RANK('judge_model', AI_INPUT('请评估相关性：', content)) AS score
+FROM documents
+WHERE AI_FILTER('selector', AI_INPUT('内容是否相关：', content))
+LIMIT 5;
+```
+
+`semantic_output_order` 接受带引号、大小写不敏感的 ordered/unordered，默认
+ordered。它与逐请求发布开关分开：
+
+- row-async 关闭或未指定：保留原有整批完成路径。
+- row-async 开启，策略未指定或 ordered：`row_async=ORDERED_PREFIX`。
+- row-async 开启且 unordered：`row_async=UNORDERED_READY`。
+- unordered 但未开启 row-async、非法字符串或数值策略：明确返回 1210，
+  不静默回退。显式 ordered 不会自行开启 row-async。
+
+### 运行时与所有权
+
+[ob_semantic_op.cpp](../../../src/sql/engine/basic/ob_semantic_op.cpp) 复用原有
+固定 HTTP 请求组、逐请求校验发布、dirty-row 依赖推进和共享异步网络调度，
+没有新增协程或逐行网络客户端。
+
+行只在 WAITING 转为 ACCEPTED/REJECTED 时计入终态数。无序模式下 ACCEPTED
+立即把原始行号放入 kept_rows 选择向量，不再等待 prefix；REJECTED 不输出，
+但推进槽的完成状态。重复完成通知不能造成重复 SQL 行。
+
+可交付槽进入 SQL worker 独占的 intrusive ready 队列，同槽最多入队一次；
+每次从一个槽返回 batch，仍有可交付行则排到队尾。网络线程不操作 SQL frame
+或这个队列。这里承诺的是“不等待输入顺序”，不是严格按 HTTP 完成时间排序。
+
+终态且已消费的槽可以独立回收，不要求它是 head。实现交换活动区间里的槽指针，
+保持活动窗口紧凑，不移动 Slot 对象、Task 或它们持有的 datum。输出槽至少 pin
+到下一次 pull，不能在返回后立刻 reset arena；尚有慢行的部分槽继续保留内存。
+close/rescan/失败清理会清空 ready 链和输出 pin，并沿用取消、等待及预算释放。
+readiness 不因子算子已有未消费输出就持续唤醒，避免父算子等待模型期间空转。
+
+既有 slots/task/byte 背压仍有效，不新增独立的 query-wide HTTP request-credit。
+但慢首槽期间的累计请求数可以超过两批：另一个槽可以输出、回收并反复接新批。
+因此不能再用“累计最多 slots × batch 行”作为无序模式的窗口 oracle，
+应检查瞬时活动槽、任务 credit、保留字节和取消后的资源归零。慢行仍可能 pin
+自己整个槽的 arena，首版不做逐行 arena 回收。
+
+### 规划准入与语义边界
+
+首版只支持单基表、串行 TEXT MAP/FILTER/RANK 流水线，允许普通筛选、投影、
+LIMIT、静态 model/options、CASE/AND/OR/嵌套调用、查询缓存和独立 FILTER proxy。
+无序策略不进入函数缓存 key，也不改变共享 Flight 的查询级所有权。
+
+明确拒绝 ORDER BY/Top-N、GROUP BY/HAVING/聚合、DISTINCT、普通或语义 JOIN、
+FILE、AI_AGG、PX/exchange、派生表/CTE、标量子查询、集合/窗口查询以及
+locking/output SELECT。EXPLAIN 和 SELECT 都在模型请求前返回 1235。
+[ob_select_resolver.cpp](../../../src/sql/resolver/dml/ob_select_resolver.cpp)
+在重写前检查形态，避免派生表、连接或排序边界被重写消去后绕过首版范围；
+[ob_select_log_plan.cpp](../../../src/sql/optimizer/ob_select_log_plan.cpp)
+再检查串行性和物理路径生成前的逻辑算子白名单。
+
+[ob_log_semantic.cpp](../../../src/sql/optimizer/ob_log_semantic.cpp) 在
+compute_property 之前拿到输出策略，无序阶段清除继承的 ordering/local-order/
+range-order 属性，不能向父算子谎称保序。codegen/spec 序列化携带独立枚举，
+执行层防御无效枚举及 unordered 但未开启 row-async 的不一致配置。
+
+完整成功执行保留值、重复数和结果 bag，不保证原输入次序。LIMIT 可以选中较快
+完成的匹配行，存在延迟偏置，不是随机采样或稳定分页，也不保证只发送 K 个请求。
+仅投影的 MAP/RANK 如果位于普通关系 LIMIT 之后，仍只处理选中的行；本选项
+不把它跨 LIMIT 前移。AI_RANK 仍是评分，不是专用 Top-K。
+
+小行在安全挂起时复用已有客户端 flush 接线；缓冲客户端仍可能看不到即时进度。
+已经读到行也必须读取最终状态：后续 Boolean/number 校验错误、timeout、kill
+仍然是查询失败，不能包装成部分成功。
+
+### 验收
+
+入口：
+[test_semantic_unordered.py](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_unordered.py)。
+复用已有 cache/rank/proxy fixture；支持 `--list-cases`、重复 `--case`、
+私有部署 `--binary`/`--log-dir` 及不停止外部实例的 `--socket`。
+
+- 最终 Debug 构建通过，新增 **22/22 SQL/mock 契约**通过：扣住首行的 SSCursor
+  可见性、跨槽越过、慢首槽下后续槽连续复用、FILTER→MAP/RANK、LIMIT 取消、
+  cache 开关和精确 bag、guard、retry、LOB/携带值生命周期、proxy、quota、
+  错误后部分输出、timeout/kill/恢复，以及错误配置和不支持形态的零请求拒绝。
+- 6 项关键 gate 在另外两个全新私有部署重复，**12/12 次通过**。
+- **86 项既有 SQL 回归**通过：有序 row-async 20、RANK 27、默认 runtime 39。
+- native input/provider/proxy/评分 **22/22**；资源 **20 项重复两轮，共 40 次**
+  通过，包含输出策略默认值、严格 hint 类型及 spec 序列化往返。
+
+以上是确定性功能验证；未宣称真实模型加速、SemBench 质量、sanitizer 或一般
+rescan 计划的穷尽式验证。FILE 行间异步、通用 JOIN/PX 和保序恢复仍是后续阶段。

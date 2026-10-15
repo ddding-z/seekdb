@@ -20,7 +20,7 @@ public:
         owned_exprs_(allocator), local_exprs_(allocator),
         shared_exprs_(allocator), carried_exprs_(allocator),
         query_task_count_(1), filter_expr_count_(0), row_async_enabled_(false), memoized_exprs_(allocator),
-        proxy_configs_(allocator) {}
+        proxy_configs_(allocator), output_order_(SemanticOutputOrder::INPUT_ORDER) {}
   common::ObFixedArray<ObExpr *, common::ObIAllocator> expressions_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> semantic_exprs_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> owned_exprs_;
@@ -34,6 +34,8 @@ public:
   bool row_async_enabled_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> memoized_exprs_;
   common::ObFixedArray<SemanticProxyConfig, common::ObIAllocator> proxy_configs_;
+  SemanticOutputOrder output_order_;
+  bool unordered_output() const { return output_order_ == SemanticOutputOrder::READY_ORDER; }
   bool has_embedding_proxy() const
   {
     bool enabled = false;
@@ -57,6 +59,14 @@ class SemanticFilterSpec : public SemanticSpec
   OB_UNIS_VERSION_V(1);
 public:
   SemanticFilterSpec(common::ObIAllocator &allocator, ObPhyOperatorType type)
+      : SemanticSpec(allocator, type) {}
+};
+
+class SemanticRankSpec : public SemanticSpec
+{
+  OB_UNIS_VERSION_V(1);
+public:
+  SemanticRankSpec(common::ObIAllocator &allocator, ObPhyOperatorType type)
       : SemanticSpec(allocator, type) {}
 };
 
@@ -100,6 +110,9 @@ private:
   int prepare(Slot &slot, bool &progress);
   void mark_row_ready(Slot &slot, int64_t row);
   bool slot_drained(const Slot &slot) const;
+  void enqueue_ready_slot(Slot &slot);
+  void reclaim_unordered_slots(bool &progress);
+  int output_ready_slot(int64_t max_row_cnt);
   int advance_media(Task &task, bool &progress);
   bool input_ready(const Task &task, int64_t position) const;
   bool has_pending_requests() const;
@@ -124,6 +137,9 @@ private:
   int64_t slot_count_;
   int64_t head_;
   int64_t count_;
+  Slot *ready_head_;
+  Slot *ready_tail_;
+  Slot *last_output_slot_;
   bool input_end_;
   const ObBatchRows *pending_input_;
   int64_t waiting_memory_;
@@ -144,6 +160,13 @@ class SemanticFilterOp : public SemanticOp
 {
 public:
   SemanticFilterOp(ObExecContext &ctx, const ObOpSpec &spec, ObOpInput *input)
+      : SemanticOp(ctx, spec, input) {}
+};
+
+class SemanticRankOp : public SemanticOp
+{
+public:
+  SemanticRankOp(ObExecContext &ctx, const ObOpSpec &spec, ObOpInput *input)
       : SemanticOp(ctx, spec, input) {}
 };
 

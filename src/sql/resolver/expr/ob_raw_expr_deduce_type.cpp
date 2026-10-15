@@ -351,7 +351,8 @@ static bool is_file_param_allowed(const ObItemType type)
       || T_FUN_COLUMN_CONV == type || T_FUN_SYS_VALUES == type || T_FUN_SYS_DEFAULT == type
       || T_FUN_SYS_FILE_URI == type || T_FUN_SYS_FILE_META == type
       || T_FUN_SYS_AI_INPUT == type
-      || T_FUN_SYS_AI_MAP == type || T_FUN_SYS_AI_FILTER == type || T_FUN_SYS_AI_JOIN == type;
+      || T_FUN_SYS_AI_MAP == type || T_FUN_SYS_AI_FILTER == type || T_FUN_SYS_AI_JOIN == type
+      || T_FUN_SYS_AI_RANK == type;
 }
 
 bool need_reject_geometry_type(ObItemType item_type)

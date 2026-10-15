@@ -55,9 +55,10 @@ SemanticRequestMemory request_memory(const SemanticInput &input)
 
 OB_SERIALIZE_MEMBER((SemanticSpec, ObOpSpec), expressions_, semantic_exprs_, owned_exprs_,
                     local_exprs_, shared_exprs_, carried_exprs_, query_task_count_, filter_expr_count_,
-                    memoized_exprs_, proxy_configs_, row_async_enabled_);
+                    memoized_exprs_, proxy_configs_, row_async_enabled_, output_order_);
 OB_SERIALIZE_MEMBER((SemanticMapSpec, SemanticSpec));
 OB_SERIALIZE_MEMBER((SemanticFilterSpec, SemanticSpec));
+OB_SERIALIZE_MEMBER((SemanticRankSpec, SemanticSpec));
 OB_SERIALIZE_MEMBER((SemanticJoinSpec, SemanticSpec), join_exprs_);
 
 int SemanticJoinSpec::validate_bindings() const
@@ -174,7 +175,8 @@ struct SemanticOp::Slot
            kept_rows_(nullptr), tasks_(nullptr), task_count_(0), size_(0), kept_count_(0),
            offset_(0), retained_bytes_(0), ready_(false), needs_prepare_(false),
            row_states_(nullptr), dirty_(nullptr), dirty_rows_(nullptr),
-           dirty_head_(0), dirty_tail_(0), dirty_count_(0), prefix_(0) {}
+           dirty_head_(0), dirty_tail_(0), dirty_count_(0), prefix_(0),
+           terminal_count_(0), ready_next_(nullptr), output_queued_(false) {}
   ObArenaAllocator allocator_;
   ObDatum *inputs_;
   ObDatum *values_;
@@ -195,11 +197,15 @@ struct SemanticOp::Slot
   int64_t dirty_tail_;
   int64_t dirty_count_;
   int64_t prefix_;
+  int64_t terminal_count_;
+  Slot *ready_next_;
+  bool output_queued_;
 };
 
 SemanticOp::SemanticOp(ObExecContext &ctx, const ObOpSpec &spec, ObOpInput *input)
     : ObOperator(ctx, spec, input), function_cache_(nullptr),
       slots_(nullptr), slot_count_(0), head_(0), count_(0),
+      ready_head_(nullptr), ready_tail_(nullptr), last_output_slot_(nullptr),
       input_end_(false), pending_input_(nullptr), waiting_memory_(0),
       evaluating_slot_(nullptr), registered_(false), first_prepare_logged_(false)
 {
@@ -270,13 +276,21 @@ int SemanticOp::inner_open()
              (!is_filter() && spec.filter_expr_count_ != 0)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid semantic filter condition count", K(ret), K(spec.filter_expr_count_));
+  } else if ((spec.output_order_ != SemanticOutputOrder::INPUT_ORDER &&
+              spec.output_order_ != SemanticOutputOrder::READY_ORDER) ||
+             (spec.unordered_output() &&
+              (!spec.row_async_enabled_ || spec_.type_ == PHY_SEMANTIC_JOIN))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid semantic output order specification", K(ret), K(spec.output_order_),
+             K(spec.row_async_enabled_));
   } else if (OB_FAIL(validate_proxy_configs())) {
   } else if (OB_FAIL(validate_shared_expressions())) {
   } else if (spec_.type_ == PHY_SEMANTIC_JOIN &&
              OB_FAIL(static_cast<const SemanticJoinSpec &>(spec_).validate_bindings())) {
   } else if (!spec_.is_vectorized()) {
     ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_MAP, AI_FILTER and AI_JOIN require a vectorized semantic operator");
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "AI_MAP, AI_FILTER, AI_JOIN and AI_RANK require a vectorized semantic operator");
   } else if (OB_FAIL(ctx_.get_my_session()->get_sys_variable(
                          share::SYS_VAR_AI_PIPELINE_SLOTS, slot_count_))) {
   } else if (OB_FAIL(ctx_.get_my_session()->get_sys_variable(
@@ -389,10 +403,14 @@ void SemanticOp::reset_slot(Slot &slot)
   slot.row_states_ = slot.dirty_ = nullptr;
   slot.dirty_rows_ = nullptr;
   slot.dirty_head_ = slot.dirty_tail_ = slot.dirty_count_ = slot.prefix_ = 0;
+  slot.terminal_count_ = 0;
+  slot.ready_next_ = nullptr;
+  slot.output_queued_ = false;
 }
 
 void SemanticOp::reset_pipeline()
 {
+  ready_head_ = ready_tail_ = last_output_slot_ = nullptr;
   for (int64_t index = 0; nullptr != slots_ && index < slot_count_; ++index) {
     if (nullptr != slots_[index]) {
       reset_slot(*slots_[index]);
@@ -481,6 +499,7 @@ int64_t SemanticOp::slot_metadata_bytes(int64_t size) const
       tasks * (sizeof(Task) + sizeof(Task *)) +
       size * memoized * (2 * sizeof(ObString) + sizeof(SemanticFunctionCache::Handle)) +
       (semantic_spec().row_async_enabled_ ? size * (2 * sizeof(uint8_t) + sizeof(int64_t)) : 0) +
+      (semantic_spec().unordered_output() ? sizeof(Slot *) + sizeof(int64_t) + sizeof(bool) : 0) +
       (semantic_spec().has_embedding_proxy() && spec_.type_ == PHY_SEMANTIC_JOIN
           ? size * 2 * sizeof(ObString) : 0);
 }
@@ -964,7 +983,12 @@ int SemanticOp::prepare(Slot &slot, bool &progress)
       }
       if (OB_SUCC(ret) && complete) {
         if (incremental) {
+          OB_ASSERT(slot.row_states_[row] == Slot::WAITING);
           slot.row_states_[row] = accepted ? Slot::ACCEPTED : Slot::REJECTED;
+          ++slot.terminal_count_;
+          if (semantic_spec().unordered_output() && accepted) {
+            slot.kept_rows_[slot.kept_count_++] = row;
+          }
         } else if (accepted) {
           slot.kept_rows_[kept++] = row;
         }
@@ -973,7 +997,10 @@ int SemanticOp::prepare(Slot &slot, bool &progress)
     }
     evaluating_slot_ = nullptr;
     slot.needs_prepare_ = false;
-    if (OB_SUCC(ret) && incremental) {
+    if (OB_SUCC(ret) && incremental && semantic_spec().unordered_output()) {
+      slot.ready_ = slot.terminal_count_ == slot.size_;
+      enqueue_ready_slot(slot);
+    } else if (OB_SUCC(ret) && incremental) {
       while (slot.prefix_ < slot.size_ && slot.row_states_[slot.prefix_] != Slot::WAITING) {
         if (slot.row_states_[slot.prefix_] == Slot::ACCEPTED) {
           slot.kept_rows_[slot.kept_count_++] = slot.prefix_;
@@ -1011,6 +1038,56 @@ void SemanticOp::mark_row_ready(Slot &slot, int64_t row)
 bool SemanticOp::slot_drained(const Slot &slot) const
 {
   return slot.ready_ && slot.offset_ == slot.kept_count_;
+}
+
+void SemanticOp::enqueue_ready_slot(Slot &slot)
+{
+  if (!slot.output_queued_ && slot.offset_ < slot.kept_count_) {
+    slot.ready_next_ = nullptr;
+    slot.output_queued_ = true;
+    if (nullptr == ready_tail_) {
+      ready_head_ = &slot;
+    } else {
+      ready_tail_->ready_next_ = &slot;
+    }
+    ready_tail_ = &slot;
+  }
+}
+
+void SemanticOp::reclaim_unordered_slots(bool &progress)
+{
+  for (int64_t index = 0; index < count_;) {
+    Slot *slot = slots_[(head_ + index) % slot_count_];
+    if (slot != last_output_slot_ && slot_drained(*slot)) {
+      OB_ASSERT(!slot->output_queued_);
+      reset_slot(*slot);
+      // Keep the active segment compact without moving the slot objects or their datums.
+      std::swap(slots_[(head_ + index) % slot_count_],
+                slots_[(head_ + count_ - 1) % slot_count_]);
+      --count_;
+      progress = true;
+    } else {
+      ++index;
+    }
+  }
+}
+
+int SemanticOp::output_ready_slot(int64_t max_row_cnt)
+{
+  OB_ASSERT(nullptr != ready_head_);
+  Slot &slot = *ready_head_;
+  ready_head_ = slot.ready_next_;
+  if (nullptr == ready_head_) {
+    ready_tail_ = nullptr;
+  }
+  slot.ready_next_ = nullptr;
+  slot.output_queued_ = false;
+  const int ret = output(slot, max_row_cnt);
+  if (ret == OB_SUCCESS) {
+    last_output_slot_ = &slot;
+    enqueue_ready_slot(slot);
+  }
+  return ret;
 }
 
 int SemanticOp::advance_media(Task &task, bool &progress)
@@ -1647,7 +1724,12 @@ int SemanticOp::inner_get_next_batch(int64_t max_row_cnt)
   } else if (nullptr != lib::RequestAwait::current() &&
              OB_FAIL(lib::RequestAwait::current()->cancel_ret())) {
   }
-  if (OB_SUCC(ret) && count_ > 0 && slot_drained(*slots_[head_])) {
+  if (OB_SUCC(ret)) {
+    // The parent has finished borrowing the previous output before pulling again.
+    last_output_slot_ = nullptr;
+  }
+  if (OB_SUCC(ret) && !semantic_spec().unordered_output() &&
+      count_ > 0 && slot_drained(*slots_[head_])) {
     reset_slot(*slots_[head_]);
     head_ = (head_ + 1) % slot_count_;
     --count_;
@@ -1664,13 +1746,23 @@ int SemanticOp::inner_get_next_batch(int64_t max_row_cnt)
       } else if (OB_FAIL(submit_tasks(slot, progress))) {
       }
     }
+    if (OB_SUCC(ret) && semantic_spec().unordered_output()) {
+      reclaim_unordered_slots(progress);
+    }
     if (OB_FAIL(ret)) {
-    } else if (count_ > 0 && slot_drained(*slots_[head_]) &&
+    } else if (semantic_spec().unordered_output() && nullptr != ready_head_) {
+      ret = output_ready_slot(max_row_cnt);
+      if (nullptr != lib::RequestAwait::current()) {
+        lib::RequestAwait::current()->reset_pending();
+      }
+      break;
+    } else if (!semantic_spec().unordered_output() &&
+               count_ > 0 && slot_drained(*slots_[head_]) &&
                semantic_spec().row_async_enabled_) {
       reset_slot(*slots_[head_]);
       head_ = (head_ + 1) % slot_count_;
       --count_;
-    } else if (count_ > 0 && (slots_[head_]->ready_ ||
+    } else if (!semantic_spec().unordered_output() && count_ > 0 && (slots_[head_]->ready_ ||
                (semantic_spec().row_async_enabled_ &&
                 slots_[head_]->offset_ < slots_[head_]->kept_count_))) {
       ret = output(*slots_[head_], max_row_cnt);

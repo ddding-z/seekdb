@@ -15,10 +15,13 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
+#include <cmath>
 #include "ob_expr_ai_semantic.h"
 #include "ob_expr_ai_complete.h"
 #include "ob_expr_ai_input.h"
 #include "common/object/file_ref.h"
+#include "lib/charset/ob_charset.h"
+#include "lib/string/ob_sql_string.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
 #include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/engine/basic/ob_semantic_proxy.h"
@@ -83,6 +86,8 @@ int calc_semantic_result_type(ObExprResType &type, ObExprResType *types,
         type.set_tinyint();
         type.set_precision(DEFAULT_PRECISION_FOR_BOOL);
         type.set_scale(DEFAULT_SCALE_FOR_INTEGER);
+      } else if (function_type == T_FUN_SYS_AI_RANK) {
+        type.set_double();
       } else {
         type.set_type(ObLongTextType);
         type.set_collation_type(CS_TYPE_UTF8MB4_BIN);
@@ -117,17 +122,17 @@ int remove_semantic_proxy_options(MultimodeAlloctor &allocator, ObJsonObject *co
   return ret;
 }
 
-int prepare_semantic_boolean_config(MultimodeAlloctor &allocator, ObJsonObject *&config,
-                                    ObItemType function_type)
+int prepare_semantic_result_config(MultimodeAlloctor &allocator, ObJsonObject *&config,
+                                   ObItemType function_type)
 {
-  static const char *boolean_format = R"({
+  static const char *format_template = R"({
     "type": "json_schema",
     "json_schema": {
       "name": "ai_filter",
       "strict": true,
       "schema": {
         "type": "object",
-        "properties": {"value": {"type": "boolean"}},
+        "properties": {"value": {"type": "%s"}},
         "required": ["value"],
         "additionalProperties": false
       }
@@ -135,17 +140,26 @@ int prepare_semantic_boolean_config(MultimodeAlloctor &allocator, ObJsonObject *
   })";
   int ret = OB_SUCCESS;
   const bool is_join = function_type == T_FUN_SYS_AI_JOIN;
-  const char *reserved_error = is_join
+  const bool is_rank = function_type == T_FUN_SYS_AI_RANK;
+  const char *reserved_error = is_rank
+      ? "AI_RANK options must not set the reserved Schema key"
+      : is_join
       ? "AI_JOIN options must not set the reserved Schema key"
       : "AI_FILTER options must not set the reserved Schema key";
-  const char *format_error = is_join
+  const char *format_error = is_rank
+      ? "AI_RANK response_format conflicts with its mandatory numeric value JSON schema"
+      : is_join
       ? "AI_JOIN response_format conflicts with its mandatory boolean value JSON schema"
       : "AI_FILTER response_format conflicts with its mandatory boolean value JSON schema";
+  ObSqlString required_text;
+  ObString owned_required_text;
   ObIJsonBase *required_format = nullptr;
   if (nullptr != config && nullptr != config->get_value("Schema")) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, reserved_error);
-  } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator, ObString(boolean_format),
+  } else if (OB_FAIL(required_text.append_fmt(format_template, is_rank ? "number" : "boolean"))) {
+  } else if (OB_FAIL(ob_write_string(allocator, required_text.string(), owned_required_text))) {
+  } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator, owned_required_text,
       ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, required_format))) {
   } else if (nullptr == config && OB_FAIL(ObAIFuncJsonUtils::get_json_object(allocator, config))) {
   } else {
@@ -153,7 +167,7 @@ int prepare_semantic_boolean_config(MultimodeAlloctor &allocator, ObJsonObject *
     if (nullptr == format) {
       ObJsonObject *definition = static_cast<ObJsonObject *>(
           static_cast<ObJsonObject *>(required_format)->get_value("json_schema"));
-      ObString default_name(is_join ? N_AI_JOIN : N_AI_FILTER);
+      ObString default_name(is_rank ? N_AI_RANK : is_join ? N_AI_JOIN : N_AI_FILTER);
       ObJsonString *name = nullptr;
       if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, default_name, name))) {
       } else if (OB_FAIL(definition->add("name", name))) {
@@ -192,7 +206,7 @@ int prepare_semantic_boolean_config(MultimodeAlloctor &allocator, ObJsonObject *
     }
   }
   if (OB_FAIL(ret)) {
-    LOG_WARN("failed to prepare semantic boolean output schema", K(ret), K(function_type));
+    LOG_WARN("failed to prepare semantic output schema", K(ret), K(function_type));
   }
   return ret;
 }
@@ -382,7 +396,7 @@ int get_semantic_expr_runtime(const ObExpr &expr, ISemanticExprRuntime *&runtime
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, expr.type_ == T_FUN_SYS_AI_JOIN
         ? "AI_JOIN requires a semantic join execution operator"
-        : "AI_MAP and AI_FILTER require a semantic execution operator");
+        : "AI_MAP, AI_FILTER and AI_RANK require a semantic execution operator");
     LOG_WARN("semantic expression runtime is not installed", K(ret), K(expr.type_));
   }
   return ret;
@@ -470,7 +484,8 @@ SemanticExprRuntimeGuard::~SemanticExprRuntimeGuard()
 
 bool SemanticExprUtils::is_semantic(ObItemType type)
 {
-  return type == T_FUN_SYS_AI_MAP || type == T_FUN_SYS_AI_FILTER || type == T_FUN_SYS_AI_JOIN;
+  return type == T_FUN_SYS_AI_MAP || type == T_FUN_SYS_AI_FILTER ||
+         type == T_FUN_SYS_AI_JOIN || type == T_FUN_SYS_AI_RANK;
 }
 
 int SemanticExprUtils::contains_semantic(const ObRawExpr *expr, bool &contains)
@@ -565,7 +580,7 @@ int SemanticExprUtils::prepare_input(const ObExpr &expr, ObEvalCtx &ctx,
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, is_join
             ? "AI_JOIN options must be a JSON object"
-            : "AI_MAP and AI_FILTER options must be a JSON object");
+            : "AI_MAP, AI_FILTER and AI_RANK options must be a JSON object");
         LOG_WARN("semantic options are not a JSON object", K(ret), K(expr.type_));
       } else {
         config = static_cast<ObJsonObject *>(options);
@@ -574,8 +589,9 @@ int SemanticExprUtils::prepare_input(const ObExpr &expr, ObEvalCtx &ctx,
     if (OB_SUCC(ret) && prepare_config &&
         OB_FAIL(remove_semantic_proxy_options(allocator, config, expr.type_))) {
     }
-    if (OB_SUCC(ret) && prepare_config && (expr.type_ == T_FUN_SYS_AI_FILTER || is_join) &&
-        OB_FAIL(prepare_semantic_boolean_config(allocator, config, expr.type_))) {
+    if (OB_SUCC(ret) && prepare_config &&
+        (expr.type_ == T_FUN_SYS_AI_FILTER || expr.type_ == T_FUN_SYS_AI_RANK || is_join) &&
+        OB_FAIL(prepare_semantic_result_config(allocator, config, expr.type_))) {
     }
   }
   return ret;
@@ -678,8 +694,9 @@ int SemanticExprUtils::prepare_request_input(const ObExpr &expr, ObEvalCtx &ctx,
     if (OB_SUCC(ret) && prepare_config &&
         OB_FAIL(remove_semantic_proxy_options(allocator, config, expr.type_))) {
     }
-    if (OB_SUCC(ret) && prepare_config && (is_join || expr.type_ == T_FUN_SYS_AI_FILTER)) {
-      ret = prepare_semantic_boolean_config(allocator, config, expr.type_);
+    if (OB_SUCC(ret) && prepare_config &&
+        (is_join || expr.type_ == T_FUN_SYS_AI_FILTER || expr.type_ == T_FUN_SYS_AI_RANK)) {
+      ret = prepare_semantic_result_config(allocator, config, expr.type_);
     }
   }
   if (OB_FAIL(ret) && ret != OB_EAGAIN) {
@@ -796,19 +813,20 @@ int SemanticExprUtils::prepare_cache_key(const ObExpr &expr, ObEvalCtx &ctx,
   return ret;
 }
 
-int SemanticExprUtils::parse_boolean_result(ObItemType type, ObIAllocator &allocator,
-                                            const ObString &result, bool &value)
+namespace
+{
+int parse_semantic_value_result(ObIAllocator &allocator, const ObString &result,
+                                ObJsonNode *&field)
 {
   int ret = OB_SUCCESS;
   ObIJsonBase *document = nullptr;
-  if (type != T_FUN_SYS_AI_FILTER && type != T_FUN_SYS_AI_JOIN) {
-    ret = OB_INVALID_ARGUMENT;
-  } else if (result.empty()) {
+  field = nullptr;
+  if (result.empty()) {
     ret = OB_INVALID_DATA;
   } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator, result,
       ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, document,
       ObJsonParser::JSN_STRICT_FLAG | ObJsonParser::JSN_UNIQUE_FLAG))) {
-    LOG_WARN("semantic boolean result is not valid JSON", K(ret), K(type));
+    LOG_WARN("semantic result is not valid JSON", K(ret));
     if (ret == OB_ERR_INVALID_JSON_TEXT || ret == OB_ERR_DUPLICATE_KEY) {
       ret = OB_INVALID_DATA;
     }
@@ -816,18 +834,96 @@ int SemanticExprUtils::parse_boolean_result(ObItemType type, ObIAllocator &alloc
              document->element_count() != 1) {
     ret = OB_INVALID_DATA;
   } else {
-    ObJsonNode *field = static_cast<ObJsonObject *>(document)->get_value("value");
-    if (nullptr == field || field->json_type() != ObJsonNodeType::J_BOOLEAN) {
+    field = static_cast<ObJsonObject *>(document)->get_value("value");
+    if (nullptr == field) {
       ret = OB_INVALID_DATA;
-    } else {
-      value = field->get_boolean();
     }
+  }
+  return ret;
+}
+}
+
+int SemanticExprUtils::parse_boolean_result(ObItemType type, ObIAllocator &allocator,
+                                            const ObString &result, bool &value)
+{
+  int ret = OB_SUCCESS;
+  ObJsonNode *field = nullptr;
+  if (type != T_FUN_SYS_AI_FILTER && type != T_FUN_SYS_AI_JOIN) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(parse_semantic_value_result(allocator, result, field))) {
+  } else if (field->json_type() != ObJsonNodeType::J_BOOLEAN) {
+    ret = OB_INVALID_DATA;
+  } else {
+    value = field->get_boolean();
   }
   if (ret == OB_INVALID_DATA) {
     LOG_WARN("semantic result violates its boolean value JSON schema", K(ret), K(type));
     FORWARD_USER_ERROR(ret, type == T_FUN_SYS_AI_JOIN
         ? "AI_JOIN response must be a JSON object containing only a boolean value field"
         : "AI_FILTER response must be a JSON object containing only a boolean value field");
+  }
+  return ret;
+}
+
+int SemanticExprUtils::parse_rank_result(ObIAllocator &allocator,
+                                         const ObString &result, double &value)
+{
+  int ret = OB_SUCCESS;
+  ObJsonNode *field = nullptr;
+  if (OB_FAIL(parse_semantic_value_result(allocator, result, field))) {
+  } else if (field->json_type() != ObJsonNodeType::J_INT &&
+             field->json_type() != ObJsonNodeType::J_UINT &&
+             field->json_type() != ObJsonNodeType::J_DOUBLE &&
+             field->json_type() != ObJsonNodeType::J_DECIMAL) {
+    ret = OB_INVALID_DATA;
+  } else {
+    // The validated object has one numeric field. Convert its original token:
+    // the JSON DOM can already have rounded a tiny nonzero number to zero.
+    const char *separator = static_cast<const char *>(MEMCHR(result.ptr(), ':', result.length()));
+    const char *limit = result.ptr() + result.length();
+    const char *begin = nullptr == separator ? limit : separator + 1;
+    while (begin < limit && (*begin == ' ' || *begin == '\t' || *begin == '\r' || *begin == '\n')) {
+      ++begin;
+    }
+    const char *number_end = begin;
+    bool nonzero = false;
+    bool exponent = false;
+    while (number_end < limit && *number_end != '}' && *number_end != ' ' &&
+           *number_end != '\t' && *number_end != '\r' && *number_end != '\n') {
+      exponent = exponent || *number_end == 'e' || *number_end == 'E';
+      nonzero = nonzero || (!exponent && *number_end >= '1' && *number_end <= '9');
+      ++number_end;
+    }
+    char *end = nullptr;
+    int error = 0;
+    const double score = ObCharset::strntodv2(begin, number_end - begin, &end, &error);
+    if (begin == number_end || error != 0 || end != number_end || !std::isfinite(score) ||
+        (score == 0 && nonzero)) {
+      ret = OB_INVALID_DATA;
+    } else {
+      value = score;
+    }
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("semantic rank result violates its numeric value JSON schema", K(ret));
+    if (ret == OB_INVALID_DATA) {
+      FORWARD_USER_ERROR(ret,
+          "AI_RANK response must contain only a numeric value field representable as a finite DOUBLE");
+    }
+  }
+  return ret;
+}
+
+int SemanticExprUtils::validate_result(ObItemType type, ObIAllocator &allocator,
+                                       const ObString &result)
+{
+  int ret = OB_SUCCESS;
+  if (type == T_FUN_SYS_AI_RANK) {
+    double value = 0;
+    ret = parse_rank_result(allocator, result, value);
+  } else if (type != T_FUN_SYS_AI_MAP) {
+    bool value = false;
+    ret = parse_boolean_result(type, allocator, result, value);
   }
   return ret;
 }
@@ -840,6 +936,13 @@ int SemanticExprUtils::set_result(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &d
     ObString text = result;
     if (OB_FAIL(ObAIFuncUtils::set_string_result(expr, ctx, datum, text))) {
       LOG_WARN("failed to set AI_MAP result", K(ret));
+    }
+  } else if (expr.type_ == T_FUN_SYS_AI_RANK) {
+    ObEvalCtx::TempAllocGuard guard(ctx);
+    double value = 0;
+    if (OB_FAIL(parse_rank_result(guard.get_allocator(), result, value))) {
+    } else {
+      datum.set_double(value);
     }
   } else if (expr.type_ == T_FUN_SYS_AI_FILTER || expr.type_ == T_FUN_SYS_AI_JOIN) {
     ObEvalCtx::TempAllocGuard guard(ctx);
@@ -921,6 +1024,39 @@ int ExprAIFilter::eval_ai_filter(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &re
 
 int ExprAIFilter::eval_ai_filter_batch(const ObExpr &expr, ObEvalCtx &ctx,
                                      const ObBitVector &skip, int64_t size)
+{
+  return eval_semantic_batch(expr, ctx, skip, size);
+}
+
+ExprAIRank::ExprAIRank(ObIAllocator &allocator)
+    : ObFuncExprOperator(allocator, T_FUN_SYS_AI_RANK, N_AI_RANK, MORE_THAN_ZERO,
+                         NOT_VALID_FOR_GENERATED_COL, NOT_ROW_DIMENSION)
+{
+}
+
+int ExprAIRank::calc_result_typeN(ObExprResType &type, ObExprResType *types,
+                                 int64_t param_num, ObExprTypeCtx &type_ctx) const
+{
+  UNUSED(type_ctx);
+  return calc_semantic_result_type(type, types, param_num, get_name(), T_FUN_SYS_AI_RANK);
+}
+
+int ExprAIRank::cg_expr(ObExprCGCtx &expr_cg_ctx, const ObRawExpr &raw_expr, ObExpr &rt_expr) const
+{
+  UNUSED(expr_cg_ctx);
+  UNUSED(raw_expr);
+  rt_expr.eval_func_ = eval_ai_rank;
+  rt_expr.eval_batch_func_ = eval_ai_rank_batch;
+  return OB_SUCCESS;
+}
+
+int ExprAIRank::eval_ai_rank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &result)
+{
+  return eval_semantic_scalar(expr, ctx, result);
+}
+
+int ExprAIRank::eval_ai_rank_batch(const ObExpr &expr, ObEvalCtx &ctx,
+                                  const ObBitVector &skip, int64_t size)
 {
   return eval_semantic_batch(expr, ctx, skip, size);
 }

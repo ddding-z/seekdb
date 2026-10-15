@@ -15,6 +15,12 @@ namespace sql
 class ObExecContext;
 class SemanticFunctionCache;
 
+enum class SemanticOutputOrder : int64_t
+{
+  INPUT_ORDER = 0,
+  READY_ORDER = 1
+};
+
 class SemanticQueryBudget
 {
 public:

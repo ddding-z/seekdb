@@ -926,6 +926,7 @@ typedef enum ObItemType
   T_FUN_SYS_FILE_META = 2092,
   T_FUN_SYS_AI_INPUT = 2093,
   T_FUN_AI_AGG = 2094,
+  T_FUN_SYS_AI_RANK = 2095,
   T_MAX_OP = 3000,
 
   //pseudo column, to mark the group iterator id

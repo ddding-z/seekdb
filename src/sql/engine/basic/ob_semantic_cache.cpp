@@ -1094,10 +1094,8 @@ struct SemanticFunctionCache::Impl
       else
       {
         const ObItemType type = flight.binding_->type_;
-        bool value = false;
-        if (type != T_FUN_SYS_AI_MAP &&
-            OB_FAIL(SemanticExprUtils::parse_boolean_result(
-                type, allocator, results.at(index), value)))
+        if (OB_FAIL(SemanticExprUtils::validate_result(
+                type, allocator, results.at(index))))
         {
         }
         else

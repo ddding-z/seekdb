@@ -655,7 +655,8 @@ int ObStaticEngineCG::generate_spec_basic(ObLogicalOperator &op,
     const ObIArray<ObRawExpr *> *stage_exprs = nullptr;
     if (op.get_type() == log_op_def::LOG_SEMANTIC_MAP ||
         op.get_type() == log_op_def::LOG_SEMANTIC_FILTER ||
-        op.get_type() == log_op_def::LOG_SEMANTIC_JOIN) {
+        op.get_type() == log_op_def::LOG_SEMANTIC_JOIN ||
+        op.get_type() == log_op_def::LOG_SEMANTIC_RANK) {
       stage_exprs = &static_cast<LogSemantic &>(op).owned_exprs();
     }
     // get calc exprs
@@ -1061,6 +1062,17 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
   int ret = OB_SUCCESS;
   ObSEArray<ObRawExpr *, 16> local_exprs;
   ObSEArray<ObRawExpr *, 8> memoized_exprs;
+  if ((op.output_order() != SemanticOutputOrder::INPUT_ORDER &&
+       op.output_order() != SemanticOutputOrder::READY_ORDER) ||
+      (op.output_order() == SemanticOutputOrder::READY_ORDER &&
+       (!op.row_async_enabled() ||
+        (op.get_type() != log_op_def::LOG_SEMANTIC_MAP &&
+         op.get_type() != log_op_def::LOG_SEMANTIC_FILTER &&
+         op.get_type() != log_op_def::LOG_SEMANTIC_RANK)))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid semantic output order for code generation", K(ret),
+             "output_order", op.output_order(), "row_async", op.row_async_enabled());
+  }
   for (int64_t index = 0; OB_SUCC(ret) && index < op.local_exprs().count(); ++index) {
     if (!op.is_child_output_exprs(op.local_exprs().at(index))) {
       ret = local_exprs.push_back(op.local_exprs().at(index));
@@ -1075,15 +1087,18 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
   }
   spec.query_task_count_ = op.query_task_count();
   spec.row_async_enabled_ = op.row_async_enabled();
+  spec.output_order_ = op.output_order();
   spec.filter_expr_count_ = (op.get_type() == log_op_def::LOG_SEMANTIC_FILTER ||
                             op.get_type() == log_op_def::LOG_SEMANTIC_JOIN)
       ? op.expressions().count() : 0;
   if (OB_SUCC(ret) && spec.row_async_enabled_ &&
       (op.get_parallel() != 1 ||
        (op.get_type() != log_op_def::LOG_SEMANTIC_MAP &&
-        op.get_type() != log_op_def::LOG_SEMANTIC_FILTER))) {
+        op.get_type() != log_op_def::LOG_SEMANTIC_FILTER &&
+        op.get_type() != log_op_def::LOG_SEMANTIC_RANK))) {
     ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "row asynchronous execution requires serial text MAP/FILTER stages");
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "row asynchronous execution requires serial text MAP/FILTER/RANK stages");
   } else if (OB_SUCC(ret) && !op.proxy_configs().empty() &&
       op.proxy_configs().count() != op.semantic_exprs().count()) {
     ret = OB_ERR_UNEXPECTED;
@@ -1124,6 +1139,13 @@ int ObStaticEngineCG::generate_spec(LogSemanticMap &op, SemanticMapSpec &spec,
 }
 
 int ObStaticEngineCG::generate_spec(LogSemanticFilter &op, SemanticFilterSpec &spec,
+                                    const bool in_root_job)
+{
+  UNUSED(in_root_job);
+  return generate_semantic_spec(op, spec);
+}
+
+int ObStaticEngineCG::generate_spec(LogSemanticRank &op, SemanticRankSpec &spec,
                                     const bool in_root_job)
 {
   UNUSED(in_root_job);
@@ -6535,6 +6557,10 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
     }
     case log_op_def::LOG_SEMANTIC_JOIN: {
       type = PHY_SEMANTIC_JOIN;
+      break;
+    }
+    case log_op_def::LOG_SEMANTIC_RANK: {
+      type = PHY_SEMANTIC_RANK;
       break;
     }
     case log_op_def::LOG_WINDOW_FUNCTION: {

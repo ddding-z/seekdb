@@ -375,6 +375,7 @@ SemanticSuspendScope::SemanticSuspendScope(ObPhyOperatorType type, bool opening,
     : blocked_(opening || (!resumable && type != PHY_SEMANTIC_MAP && type != PHY_SEMANTIC_FILTER &&
                             type != PHY_SEMANTIC_JOIN &&
                             type != PHY_SEMANTIC_AGGREGATE &&
+                            type != PHY_SEMANTIC_RANK &&
                             type != PHY_TABLE_SCAN))
 {
   if (blocked_) {

@@ -123,7 +123,7 @@ class SemanticProxySmoke(unittest.TestCase):
         return (f"AI_FILTER({quote(self.models[0])}, AI_INPUT({quote(instruction)}, {document}), "
                 f"{quote(json.dumps(config))})")
 
-    def statement(self, *, fields="id, prompt", where=None, hints=None):
+    def statement(self, *, fields="id, prompt", where=None, hints=None, suffix="ORDER BY id"):
         options = {
             "enable_semantic_cache": "true",
             "enable_semantic_proxy": "true",
@@ -138,7 +138,7 @@ class SemanticProxySmoke(unittest.TestCase):
             for name, value in options.items() if value is not None)
         predicate = self.filter_call() if where is None else where
         return (f"SELECT /*+ PARALLEL(1) OPT_PARAM('rowsets_max_rows', {BATCH_ROWS}) "
-                f"{parameters} */ {fields} FROM proxy_inputs WHERE {predicate} ORDER BY id")
+                f"{parameters} */ {fields} FROM proxy_inputs WHERE {predicate} {suffix}")
 
     def work(self, offsets=(0, 0), *, map_instruction=None):
         main_requests, embedding_requests = (

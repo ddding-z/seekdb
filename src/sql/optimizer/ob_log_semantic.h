@@ -3,6 +3,7 @@
 
 #include "sql/optimizer/ob_logical_operator.h"
 #include "sql/engine/basic/ob_semantic_proxy.h"
+#include "sql/engine/basic/ob_semantic_runtime.h"
 
 namespace oceanbase
 {
@@ -13,7 +14,8 @@ class LogSemantic : public ObLogicalOperator
 public:
   explicit LogSemantic(ObLogPlan &plan)
       : ObLogicalOperator(plan), query_task_count_(1), lifted_join_count_(0),
-        lift_stop_reason_(nullptr), function_cache_enabled_(false), row_async_enabled_(false) {}
+        lift_stop_reason_(nullptr), function_cache_enabled_(false), row_async_enabled_(false),
+        output_order_(SemanticOutputOrder::INPUT_ORDER) {}
   int add_expression(ObRawExpr *expr);
   int add_shared_expression(ObRawExpr *expr);
   int add_carried_expression(ObRawExpr *expr);
@@ -29,6 +31,8 @@ public:
   bool function_cache_enabled() const { return function_cache_enabled_; }
   void set_row_async_enabled(bool enabled) { row_async_enabled_ = enabled; }
   bool row_async_enabled() const { return row_async_enabled_; }
+  void set_output_order(SemanticOutputOrder order) { output_order_ = order; }
+  SemanticOutputOrder output_order() const { return output_order_; }
   const common::ObIArray<SemanticProxyConfig> &proxy_configs() const { return proxy_configs_; }
   int set_proxy_config(const ObRawExpr &expr, const SemanticProxyConfig &config);
   int64_t proxy_count() const;
@@ -40,6 +44,7 @@ public:
   int allocate_expr_pre(ObAllocExprContext &ctx) override;
   int allocate_expr_post(ObAllocExprContext &ctx) override;
   int is_my_fixed_expr(const ObRawExpr *expr, bool &fixed) override;
+  int compute_op_ordering() override;
   int est_cost() override;
   int do_re_est_cost(EstimateCostInfo &param, double &card, double &op_cost, double &cost) override;
 private:
@@ -56,6 +61,7 @@ private:
   const char *lift_stop_reason_;
   bool function_cache_enabled_;
   bool row_async_enabled_;
+  SemanticOutputOrder output_order_;
   common::ObSEArray<SemanticProxyConfig, 8> proxy_configs_;
 };
 
@@ -69,6 +75,12 @@ class LogSemanticFilter : public LogSemantic
 {
 public:
   explicit LogSemanticFilter(ObLogPlan &plan) : LogSemantic(plan) {}
+};
+
+class LogSemanticRank : public LogSemantic
+{
+public:
+  explicit LogSemanticRank(ObLogPlan &plan) : LogSemantic(plan) {}
 };
 
 class LogSemanticJoin : public LogSemantic

@@ -1114,6 +1114,35 @@ int ObSelectResolver::resolve(const ParseNode &parse_tree)
       }
     }
   }
+  if (OB_SUCC(ret)) {
+    const ObOptParamHint &options = select_stmt->get_query_ctx()->get_global_hint().opt_params_;
+    bool unordered_output = false;
+    bool row_async_enabled = false;
+    if (OB_FAIL(options.get_semantic_unordered_output(unordered_output))) {
+      LOG_WARN("failed to read semantic output order", K(ret));
+    } else if (unordered_output) {
+      if (OB_FAIL(options.get_bool_opt_param(ObOptParamHint::ENABLE_SEMANTIC_ROW_ASYNC,
+                                            row_async_enabled))) {
+        LOG_WARN("failed to read row asynchronous execution option", K(ret));
+      } else if (!row_async_enabled) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                       "semantic_output_order='unordered' requires enable_semantic_row_async='true'");
+      } else if (!select_stmt->is_single_table_stmt() ||
+                 !select_stmt->get_table_item(0)->is_basic_table() ||
+                 select_stmt->is_set_stmt() || select_stmt->has_order_by() ||
+                 select_stmt->has_group_by() || select_stmt->get_aggr_item_size() != 0 ||
+                 select_stmt->has_having() || select_stmt->has_distinct() ||
+                 select_stmt->has_window_function() || select_stmt->has_for_update() ||
+                 select_stmt->has_select_into() || select_stmt->get_subquery_expr_size() != 0) {
+        // Check before rewriting can erase a derived table, join, grouping or ordering boundary.
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       "unordered semantic execution requires a simple single-base-table SELECT");
+        LOG_WARN("unsupported unordered semantic statement shape", K(ret));
+      }
+    }
+  }
 
   return ret;
 }

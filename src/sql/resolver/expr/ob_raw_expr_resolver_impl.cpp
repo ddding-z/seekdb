@@ -5486,7 +5486,8 @@ int ObRawExprResolverImpl::process_fun_sys_node(const ParseNode *node,
       }
     } else {
       const ObItemType type = func_expr->get_expr_type();
-      if (type == T_FUN_SYS_AI_MAP || type == T_FUN_SYS_AI_FILTER || type == T_FUN_SYS_AI_JOIN) {
+      if (type == T_FUN_SYS_AI_MAP || type == T_FUN_SYS_AI_FILTER ||
+          type == T_FUN_SYS_AI_JOIN || type == T_FUN_SYS_AI_RANK) {
         const int64_t begin = type == T_FUN_SYS_AI_JOIN ? 2 : 1;
         const int64_t end = type == T_FUN_SYS_AI_JOIN ? 4 : 2;
         for (int64_t index = begin; OB_SUCC(ret) && index < end &&

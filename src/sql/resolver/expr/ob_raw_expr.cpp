@@ -931,6 +931,7 @@ int ObRawExpr::is_const_inherit_expr(bool &is_const_inherit,
       || T_FUN_SYS_AI_MAP == type_
       || T_FUN_SYS_AI_FILTER == type_
       || T_FUN_SYS_AI_JOIN == type_
+      || T_FUN_SYS_AI_RANK == type_
       || T_FUN_AI_AGG == type_
       || T_OP_ASSIGN == type_
       || T_FUN_SYS_REMOVE_CONST == type_
@@ -1017,6 +1018,7 @@ int ObRawExpr::is_non_pure_sys_func_expr(bool &is_non_pure) const
         || T_FUN_SYS_AI_MAP == type_
         || T_FUN_SYS_AI_FILTER == type_
         || T_FUN_SYS_AI_JOIN == type_
+        || T_FUN_SYS_AI_RANK == type_
         || T_FUN_AI_AGG == type_
         || T_FUN_SYS_LAST_INSERT_ID == type_
         || T_FUN_SYS_ROW_COUNT == type_

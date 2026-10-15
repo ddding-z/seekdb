@@ -35,6 +35,7 @@
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/engine/ob_physical_plan_ctx.h"
 #include "sql/engine/sort/ob_sort_op.h"
+#include "sql/resolver/dml/ob_hint.h"
 #include "sql/session/ob_sql_session_info.h"
 
 using namespace oceanbase::common;
@@ -796,6 +797,64 @@ void test_row_async_spec_detection()
   require(!root.has_row_async_semantic_operator(), "disabled stages restore default buffering");
 }
 
+void test_rank_spec_detection()
+{
+  ObArenaAllocator allocator("SemanticTest");
+  ObOpSpec root(allocator, PHY_SORT);
+  SemanticRankSpec rank(allocator, PHY_SEMANTIC_RANK);
+  ObOpSpec *children[] = {&rank};
+  require_equal(root.set_children_pointer(children, 1), OB_SUCCESS, "bind numeric rank stage");
+  require(root.has_semantic_operator(), "rank participates in semantic execution detection");
+  require(!root.has_row_async_semantic_operator(), "rank row publication defaults to disabled");
+  rank.row_async_enabled_ = true;
+  require(root.has_row_async_semantic_operator(), "rank prefix flushing is detected through ancestors");
+  rank.row_async_enabled_ = false;
+  require(!root.has_row_async_semantic_operator(), "disabled rank keeps normal row buffering");
+}
+
+void test_semantic_output_order()
+{
+  ObArenaAllocator allocator("SemanticTest");
+  SemanticMapSpec map(allocator, PHY_SEMANTIC_MAP);
+  SemanticFilterSpec filter(allocator, PHY_SEMANTIC_FILTER);
+  SemanticRankSpec rank(allocator, PHY_SEMANTIC_RANK);
+  require(!map.unordered_output() && !filter.unordered_output() && !rank.unordered_output(),
+          "all semantic stages preserve input order by default");
+  map.row_async_enabled_ = true;
+  map.output_order_ = SemanticOutputOrder::READY_ORDER;
+  require(map.unordered_output(), "unordered delivery is independent of request publication");
+  std::vector<char> bytes(map.get_serialize_size());
+  int64_t position = 0;
+  require_equal(map.serialize(bytes.data(), bytes.size(), position), OB_SUCCESS,
+                "serialize unordered semantic spec");
+  require_equal(position, bytes.size(), "spec serialization size");
+  SemanticMapSpec decoded(allocator, PHY_SEMANTIC_MAP);
+  position = 0;
+  require_equal(decoded.deserialize(bytes.data(), bytes.size(), position), OB_SUCCESS,
+                "deserialize unordered semantic spec");
+  require_equal(position, bytes.size(), "decode the complete semantic spec");
+  require(decoded.unordered_output() && decoded.row_async_enabled_,
+          "spec round trip preserves publication and delivery policy");
+}
+
+void test_semantic_output_order_hint()
+{
+  ObOptParamHint hints;
+  bool unordered = true;
+  require_equal(hints.get_semantic_unordered_output(unordered), OB_SUCCESS, "default output policy");
+  require(!unordered, "missing output policy means ordered");
+  ObObj value;
+  value.set_varchar("UnOrDeReD");
+  require_equal(hints.add_opt_param_hint(ObOptParamHint::SEMANTIC_OUTPUT_ORDER, value), OB_SUCCESS,
+                "accept a case-insensitive output policy");
+  require_equal(hints.get_semantic_unordered_output(unordered), OB_SUCCESS, "read output policy");
+  require(unordered, "unordered hint is not interpreted as a boolean");
+  ObOptParamHint invalid;
+  value.set_int(1);
+  require_equal(invalid.add_opt_param_hint(ObOptParamHint::SEMANTIC_OUTPUT_ORDER, value),
+                OB_INVALID_ARGUMENT, "reject a numeric output policy");
+}
+
 void test_sort_suspension_capability()
 {
   ObArenaAllocator allocator("SemanticTest");
@@ -854,6 +913,9 @@ const TestCase TESTS[] = {
   {"semantic_join_bindings", test_semantic_join_bindings},
   {"semantic_join_detection", test_semantic_join_detection},
   {"row_async_spec_detection", test_row_async_spec_detection},
+  {"rank_spec_detection", test_rank_spec_detection},
+  {"semantic_output_order", test_semantic_output_order},
+  {"semantic_output_order_hint", test_semantic_output_order_hint},
   {"sort_suspension_capability", test_sort_suspension_capability},
 };
 } // namespace

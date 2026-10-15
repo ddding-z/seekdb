@@ -170,6 +170,19 @@ int LogSemantic::is_my_fixed_expr(const ObRawExpr *expr, bool &fixed)
   return OB_SUCCESS;
 }
 
+int LogSemantic::compute_op_ordering()
+{
+  int ret = OB_SUCCESS;
+  if (output_order_ == SemanticOutputOrder::READY_ORDER) {
+    reset_op_ordering();
+    set_is_local_order(false);
+    set_is_range_order(false);
+  } else {
+    ret = ObLogicalOperator::compute_op_ordering();
+  }
+  return ret;
+}
+
 int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item)
 {
   int ret = OB_SUCCESS;
@@ -215,8 +228,10 @@ int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_ite
       }
     }
     if (OB_SUCC(ret) && row_async_enabled_) {
-      ret = BUF_PRINTF("%srow_async=ORDERED_PREFIX",
-                       placement || function_cache_enabled_ || has_embedding_proxy() ? ", " : "");
+      ret = BUF_PRINTF("%srow_async=%s",
+                       placement || function_cache_enabled_ || has_embedding_proxy() ? ", " : "",
+                       output_order_ == SemanticOutputOrder::READY_ORDER
+                           ? "UNORDERED_READY" : "ORDERED_PREFIX");
     }
     END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
   }

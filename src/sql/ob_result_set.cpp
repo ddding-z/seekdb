@@ -48,7 +48,7 @@ int find_semantic_cache_tasks(const ObOpSpec *spec, int64_t &tasks)
   int ret = OB_SUCCESS;
   if (nullptr != spec) {
     if (spec->type_ == PHY_SEMANTIC_MAP || spec->type_ == PHY_SEMANTIC_FILTER ||
-        spec->type_ == PHY_SEMANTIC_JOIN) {
+        spec->type_ == PHY_SEMANTIC_JOIN || spec->type_ == PHY_SEMANTIC_RANK) {
       const auto &semantic = *static_cast<const SemanticSpec *>(spec);
       if (!semantic.memoized_exprs_.empty()) {
         tasks = std::max(tasks, semantic.query_task_count_);

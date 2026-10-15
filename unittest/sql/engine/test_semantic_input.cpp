@@ -229,6 +229,54 @@ void test_shared_boolean_parser()
   }
 }
 
+void test_rank_numeric_values()
+{
+  const std::pair<const char *, double> fixtures[] = {
+    {"{\"value\":0}", 0},
+    {"{\"value\":1}", 1},
+    {"{\"value\":-2}", -2},
+    {"{\"value\":4.5}", 4.5},
+    {" \n {\"v\\u0061lue\" \t: \r -4.5e-2 \n} \t", -4.5e-2},
+    {"{\"value\":-0.0}", -0.0},
+    {"{\"value\":10}", 10},
+    {"{\"value\":-1.25e100}", -1.25e100},
+    {"{\"value\":18446744073709551615}", static_cast<double>(UINT64_MAX)},
+    {"{\"value\":1.7976931348623157e308}", std::numeric_limits<double>::max()},
+    {"{\"value\":4.9406564584124654e-324}", std::numeric_limits<double>::denorm_min()},
+  };
+  for (const auto &fixture : fixtures) {
+    ObArenaAllocator allocator;
+    double value = -99;
+    require(OB_SUCCESS == SemanticExprUtils::parse_rank_result(
+        allocator, ObString(fixture.first), value), "rank accepts representable JSON numbers");
+    require(std::isfinite(value) && value == fixture.second,
+            "rank preserves numeric values without range clamping");
+    require(OB_SUCCESS == SemanticExprUtils::validate_result(
+        T_FUN_SYS_AI_RANK, allocator, ObString(fixture.first)),
+        "cached rank uses the same numeric result contract");
+  }
+}
+
+void test_rank_invalid_results()
+{
+  for (const char *fixture : {"", "4.5", "null", "[]", "{}", "{\"score\":4.5}",
+      "{\"value\":true}", "{\"value\":false}", "{\"value\":null}",
+      "{\"value\":\"4.5\"}", "{\"value\":[]}", "{\"value\":{}}",
+      "{\"value\":4,\"extra\":0}", "{\"value\":4,\"value\":5}",
+      "{\"value\":4,\"v\\u0061lue\":5}",
+      "{\"value\":NaN}", "{\"value\":Infinity}", "{\"value\":1e309}",
+      "{\"value\":-1e309}", "{\"value\":1e-400}", "{"}) {
+    ObArenaAllocator allocator;
+    double value = -99;
+    require(OB_SUCCESS != SemanticExprUtils::parse_rank_result(
+        allocator, ObString(fixture), value), fixture);
+    require(value == -99, "invalid rank output does not fabricate a score");
+    require(OB_SUCCESS != SemanticExprUtils::validate_result(
+        T_FUN_SYS_AI_RANK, allocator, ObString(fixture)),
+        "cache never publishes malformed numeric scores");
+  }
+}
+
 void test_image_body()
 {
   ObArenaAllocator allocator;
@@ -505,6 +553,8 @@ const TestCase TESTS[] = {
   {"text_rendering", test_text_rendering},
   {"text_rendering_rejects_media", test_text_rendering_rejects_media},
   {"shared_boolean_parser", test_shared_boolean_parser},
+  {"rank_numeric_values", test_rank_numeric_values},
+  {"rank_invalid_results", test_rank_invalid_results},
   {"image_body", test_image_body},
   {"audio_body", test_audio_body},
   {"join_roles", test_join_roles},

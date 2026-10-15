@@ -4,7 +4,196 @@ Legacy baseline validation (2026-09-29): the Debug build, all **105 SQL contract
 
 For the current architecture, code map, maintenance invariants and handoff checklist, see the [Chinese maintenance handoff](../../../../../docs/developer-guide/zh/ai-function-runtime-handoff.md).
 
-## Opt-in Ordered Row-Asynchronous MAP/FILTER
+## Native Semantic Rank: Numeric Per-Row Scoring
+
+`AI_RANK(model, input[, options])` implements SemBench's numeric `AI.SCORE`
+semantics. It returns a native SQL **DOUBLE**, not text or a SQL cast of
+`AI_MAP`. It is not the existing `AI_RERANK` interface, pairwise comparison
+ranking, or a specialized Top-K search algorithm.
+
+SemBench movie Q9 scores each review; Q10 averages those scores per movie:
+
+```sql
+SELECT reviewId,
+       AI_RANK('judge_model',
+               AI_INPUT('Rate this review from 1 to 5: ', reviewText)) AS reviewScore
+FROM reviews;
+
+SELECT movieId,
+       AVG(AI_RANK('judge_model',
+                   AI_INPUT('Rate this review from 1 to 5: ', reviewText))) AS movieScore
+FROM reviews
+GROUP BY movieId;
+
+SELECT reviewId,
+       AI_RANK('judge_model',
+               AI_INPUT('Rate this review from 1 to 5: ', reviewText)) AS reviewScore
+FROM reviews
+ORDER BY reviewScore DESC, reviewId
+LIMIT 10;
+```
+
+The prompt defines the rubric and intended score range; the engine does not
+enforce 1-5, clamp scores, or supply a default score on failure. Negative,
+fractional and large finite scores are valid. SQL explicitly selects ascending
+or descending order. Ties and duplicate SQL rows retain normal SQL semantics.
+Score-dependent Top-K must still score all demanded candidates. In contrast,
+a projection after a relational ORDER BY/LIMIT only scores surviving rows.
+
+The provider must support strict structured output. The engine installs:
+
+```json
+{"type":"json_schema","json_schema":{"name":"ai_rank","strict":true,"schema":{
+  "type":"object","properties":{"value":{"type":"number"}},
+  "required":["value"],"additionalProperties":false
+}}}
+```
+
+Only one numeric `value` is accepted. Scalars, strings, booleans, nulls, extra
+or duplicate fields, nonfinite values, DOUBLE overflow and nonzero underflow
+to zero fail explicitly. Ordinary DOUBLE rounding is allowed. Refusal,
+truncation and malformed provider responses remain errors, including after a
+client-visible prefix; no invalid score is cached as a successful result.
+Provider errors may precede the numeric parser and retain their original SQL
+error code. A matching schema with strict=true and a nonempty caller name is
+preserved; conflicting schemas and the reserved `Schema` option are rejected.
+
+Models/options must be static. Text, ordered `AI_INPUT`, tuple and eligible
+FILE inputs use the same native request protocol as MAP. CASE and Boolean
+guards retain demand semantics; constant prompts are not folded into one
+query-wide model call when caching is off. Scoring materialization appears as
+`SEMANTIC RANK`; a rank-dependent WHERE/HAVING remains `SEMANTIC FILTER`.
+This reuses the bounded asynchronous runtime, cancellation, query cache and
+eligible resumable local PX path. Cache identity includes function kind even
+when MAP and RANK have identical HTTP bodies.
+
+Serial TEXT RANK is also accepted by `enable_semantic_row_async`, with the
+same ordered-prefix contract below; FILE and PX remain outside that option.
+An independent FILTER proxy can reject rows before a separate RANK stage
+scores survivors. RANK itself cannot use `semantic_proxy`. Existing lifting
+guards still apply. Cached scoring comparisons admit finite, nonthrowing
+implicit integer-to-DOUBLE coercions, including parameterized thresholds;
+explicit casts, potentially failing conversions and guarded recipes do not
+gain general lifting permission.
+
+Deterministic SQL/mock entry point:
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_rank.py \
+  --binary build_debug/bin/src/observer/seekdb
+```
+
+`--list-cases` starts no services; repeat `--case` for focused selection.
+`--binary` owns a private deployment; `--socket` never stops the supplied
+server and skips owned-deployment-only FILE/PX evidence. `--log-dir` retains
+private deployment logs in a new directory.
+
+Validation:
+
+- Debug build and **27/27 rank SQL/mock contracts** passed: Q9/Q10,
+  protocol DOUBLE metadata, numeric sort/Top-K, aliases, guards, dependencies,
+  exact cache/lifting request counts and SQL bags, strict errors, retries,
+  cancellation, visible prefixes, FILE, actual local PX, FILTER proxy and
+  native JOIN/FILTER followed by per-pair scoring and grouped AVG.
+- **83 existing SQL contracts** passed during this change: runtime 39,
+  row-async 20, cache/lift/JOIN 16 and eight targeted placement safety gates.
+  The cache suite and placement gates were rerun on the final build.
+- Native input/provider/proxy/scoring **22/22** and native resources
+  **18 cases repeated twice (36 executions)** passed.
+
+These are functional contracts, not a real-model accuracy, SemBench quality,
+latency or specialized Top-K pruning result. Sanitizer validation is not claimed.
+
+## Opt-in Unordered Ready-Row Output
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','unordered')
+           OPT_PARAM('rowsets_max_rows',16) */
+       id, AI_RANK('judge_model', AI_INPUT('Score relevance: ', content)) AS score
+FROM documents
+WHERE AI_FILTER('selector', AI_INPUT('Relevant? ', content))
+LIMIT 5;
+```
+
+`semantic_output_order` accepts quoted, case-insensitive `ordered` or
+`unordered`. The default is `ordered`; the default for row-async remains
+false. Invalid policy values, numeric values and `unordered` without
+`enable_semantic_row_async='true'` fail with 1210 rather than falling back.
+
+| Row-async | Output policy | Delivery |
+| --- | --- | --- |
+| Off/default | Ordered/default | Existing batch-completion path |
+| On | Ordered/default | `row_async=ORDERED_PREFIX` |
+| On | Unordered | `row_async=UNORDERED_READY` |
+
+Unordered delivery does not wait for an input prefix: any accepted terminal
+row can be delivered, including from a later slot while the first slot is
+held. A SQL-worker-owned, duplicate-protected ready-slot queue rotates
+between ready slots. Fully consumed terminal slots are reclaimed independently
+of the head by permuting slot pointers, not moving slot objects. Returned
+datums stay pinned until the next pull; a partial slot retains its arena and
+outstanding work. Rejected rows count toward completion but are never output.
+This is not a strict ordering of HTTP completion timestamps.
+
+V1 supports a serial, single-base-table TEXT MAP/FILTER/RANK pipeline, optional
+ordinary filters/projection/LIMIT, static models/options, guarded/nested
+expressions, query caching and independent reject-only FILTER proxies. Explicit
+ORDER BY/Top-N, GROUP BY/HAVING/aggregate, DISTINCT, JOIN (including ordinary
+joins), FILE, AI_JOIN/AI_AGG, PX/exchange, derived tables/CTEs, scalar subqueries,
+set/window queries and locking/output SELECTs are rejected with 1235 before
+model requests. The resolver checks shape before rewriting can erase a
+boundary; the planner also checks the serial operator whitelist. Unordered
+logical stages clear inherited ordering, local-order and range-order
+properties before parents compute theirs.
+
+The existing fixed HTTP groups, retries, query-wide cache ownership and
+slot/task/byte budgets are reused; no coroutine runtime or new HTTP
+request-credit limit is introduced. Active retained slots remain bounded,
+but total requests admitted while the first slot is held can exceed two
+batches: a later slot can be consumed and reused repeatedly. This cumulative
+count must not be mistaken for the instantaneous resource bound. A slow row
+can still retain its own slot's memory.
+
+Full, successful execution preserves row values and bag multiplicity, not
+input order. LIMIT may select fast matches and is latency-biased, not random
+sampling or stable pagination; cancellation can leave speculative requests.
+Projection-only MAP/RANK after a relational LIMIT still evaluates only the
+selected rows. This option does not move model work across that LIMIT.
+`AI_RANK` remains scoring, not an unordered specialized Top-K algorithm.
+Client buffering can hide progress. After any visible rows, the client must
+still consume the final status: validation errors, deadlines and cancellation
+remain failures, not successful partial results.
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_unordered.py \
+  --binary build_debug/bin/src/observer/seekdb
+```
+
+The entry point reuses the existing loopback cache/rank/proxy fixtures.
+`--list-cases`, repeatable `--case`, `--socket` and private `--log-dir` have the
+same ownership rules as the rank suite. Validation on the final Debug build:
+
+- **22/22 new SQL/mock contracts** passed, including actual small-row
+  SSCursor visibility past a held first row, overtaking a held first slot,
+  repeated non-head slot reuse, FILTER-to-MAP/RANK, LIMIT/cancellation,
+  duplicate bags/cache on and off, guarded branches, retry, large carried
+  values, proxy composition, quota failures, errors, timeout/kill/recovery,
+  option validation and zero-request unsupported-shape rejection.
+- Six critical gate contracts passed in two additional fresh deployments:
+  **12/12 repeat executions**.
+- **86 existing SQL contracts** passed: ordered row-async 20, rank 27 and
+  default semantic runtime 39.
+- Native input/provider/proxy/scoring **22/22** and resources **20 cases
+  repeated twice (40 executions)** passed. Resource coverage includes output
+  policy defaults, strict hint typing and serialized spec round trips.
+
+These are deterministic functional results, not a real-model latency,
+SemBench quality or sanitizer claim. FILE row-async and general order-restoring
+plans remain outside V1.
+
+## Opt-in Ordered Row-Asynchronous MAP/FILTER/RANK
 
 ```sql
 SELECT /*+ PARALLEL(1)
@@ -19,8 +208,9 @@ LIMIT 5;
 The new option defaults to **false**. It accepts quoted, case-insensitive
 `true`/`false`; invalid values and explicitly unsupported shapes fail rather
 than silently using the old publication path. EXPLAIN identifies enabled
-stages with `row_async=ORDERED_PREFIX`. Initial scope is serial native TEXT
-MAP/FILTER with static model/options, with or without query caching and the
+stages with `row_async=ORDERED_PREFIX` when `semantic_output_order` is omitted
+or `ordered`; the unordered policy above is separately opt-in. Current scope is serial native TEXT
+MAP/FILTER/RANK with static model/options, with or without query caching and the
 existing reject-only FILTER proxies. FILE, AI_JOIN, AI_AGG and PX/exchange
 plans are not enabled by this option. Ordinary SQL joins remain possible in
 serial plans, subject to their existing suspension guards.
@@ -71,7 +261,8 @@ actual small-row SSCursor visibility, exact bag/counts, retries, cache/proxy
 composition, invalid settings, errors, deadline, kill and connection recovery.
 `--log-dir` retains only the owned deployment's logs in a new directory.
 
-Validation for this implementation:
+Historical validation for the initial MAP/FILTER implementation (the RANK
+extension is validated separately above):
 
 - Debug seekdb build and **20/20 SQL/mock contracts** passed, including
   two-stage EXPLAIN markers and rejection of a serial semantic stage above

@@ -218,6 +218,13 @@ ObLogicalOperator *ObLogOperatorFactory::allocate(ObLogPlan &plan, ObLogOpType t
     }
     break;
   }
+  case LOG_SEMANTIC_RANK: {
+    ptr = allocator_.alloc(sizeof(LogSemanticRank));
+    if (NULL != ptr) {
+      ret_op = new (ptr) LogSemanticRank(plan);
+    }
+    break;
+  }
   case LOG_MATERIAL: {
     ptr = allocator_.alloc(sizeof(ObLogMaterial));
     if (NULL != ptr) {

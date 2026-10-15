@@ -41,10 +41,12 @@ class LogSemantic;
 class LogSemanticMap;
 class LogSemanticFilter;
 class LogSemanticJoin;
+class LogSemanticRank;
 class SemanticSpec;
 class SemanticMapSpec;
 class SemanticFilterSpec;
 class SemanticJoinSpec;
+class SemanticRankSpec;
 class ObLogSort;
 class ObSortSpec;
 class ObLogSet;
@@ -290,6 +292,7 @@ private:
   int generate_spec(LogSemanticMap &op, SemanticMapSpec &spec, const bool in_root_job);
   int generate_spec(LogSemanticFilter &op, SemanticFilterSpec &spec, const bool in_root_job);
   int generate_spec(LogSemanticJoin &op, SemanticJoinSpec &spec, const bool in_root_job);
+  int generate_spec(LogSemanticRank &op, SemanticRankSpec &spec, const bool in_root_job);
 
   int generate_spec(ObLogSort &op, ObSortSpec &spec, const bool in_root_job);
 

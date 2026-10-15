@@ -74,6 +74,10 @@ public:
                                      common::ObString &left, common::ObString &right);
   static int parse_boolean_result(ObItemType type, common::ObIAllocator &allocator,
                                   const common::ObString &result, bool &value);
+  static int parse_rank_result(common::ObIAllocator &allocator,
+                               const common::ObString &result, double &value);
+  static int validate_result(ObItemType type, common::ObIAllocator &allocator,
+                             const common::ObString &result);
   static int set_result(const ObExpr &expr, ObEvalCtx &ctx, common::ObDatum &datum,
                         const common::ObString &result);
 private:
@@ -113,6 +117,23 @@ public:
                                   const ObBitVector &skip, int64_t size);
 private:
   DISALLOW_COPY_AND_ASSIGN(ExprAIFilter);
+};
+
+class ExprAIRank : public ObFuncExprOperator
+{
+public:
+  explicit ExprAIRank(common::ObIAllocator &allocator);
+  virtual ~ExprAIRank() {}
+  virtual int calc_result_typeN(ObExprResType &type, ObExprResType *types,
+                                int64_t param_num, common::ObExprTypeCtx &type_ctx) const override;
+  virtual int cg_expr(ObExprCGCtx &expr_cg_ctx, const ObRawExpr &raw_expr,
+                      ObExpr &rt_expr) const override;
+  virtual bool need_rt_ctx() const override { return true; }
+  static int eval_ai_rank(const ObExpr &expr, ObEvalCtx &ctx, common::ObDatum &result);
+  static int eval_ai_rank_batch(const ObExpr &expr, ObEvalCtx &ctx,
+                                const ObBitVector &skip, int64_t size);
+private:
+  DISALLOW_COPY_AND_ASSIGN(ExprAIRank);
 };
 
 class ExprAIJoin : public ObFuncExprOperator
