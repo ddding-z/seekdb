@@ -603,6 +603,36 @@ void test_row_async_static_call_guards()
   require(!SemanticExprUtils::supports_row_async(join), "FILE eligibility does not admit row-async JOIN");
 }
 
+void test_unordered_aggregate_eligibility()
+{
+  ObArenaAllocator allocator;
+  ObColumnRefRawExpr input(allocator);
+  input.set_data_type(ObDoubleType);
+  for (ObItemType kind : {T_FUN_COUNT, T_FUN_SUM, T_FUN_AVG, T_FUN_MIN, T_FUN_MAX}) {
+    ObAggFunRawExpr aggregate(allocator);
+    aggregate.set_expr_type(kind);
+    require(SemanticExprUtils::supports_unordered_aggregate(aggregate),
+            "ordinary commutative aggregates admit unordered input");
+    aggregate.set_param_distinct(true);
+    require(!SemanticExprUtils::supports_unordered_aggregate(aggregate),
+            "aggregate DISTINCT needs its own resumability contract");
+    aggregate.set_param_distinct(false);
+    OrderItem ordering;
+    ordering.expr_ = &input;
+    ordering.order_type_ = default_asc_direction();
+    require(OB_SUCCESS == aggregate.add_order_item(ordering), "ordered aggregate fixture");
+    require(!SemanticExprUtils::supports_unordered_aggregate(aggregate),
+            "aggregate ordering remains an explicit boundary");
+  }
+  for (ObItemType kind : {T_FUN_AI_AGG, T_FUN_GROUP_CONCAT, T_FUN_JSON_ARRAYAGG}) {
+    ObAggFunRawExpr aggregate(allocator);
+    aggregate.set_expr_type(kind);
+    require(!SemanticExprUtils::supports_unordered_aggregate(aggregate),
+            "order-sensitive and semantic aggregates remain unsupported");
+  }
+  require(!SemanticExprUtils::supports_unordered_aggregate(input), "a scalar is not an aggregate");
+}
+
 struct TestCase
 {
   const char *name_;
@@ -635,6 +665,7 @@ const TestCase TESTS[] = {
   {"row_async_file_eligibility_is_not_function_cache_eligibility",
    test_row_async_file_eligibility_is_not_function_cache_eligibility},
   {"row_async_static_call_guards", test_row_async_static_call_guards},
+  {"unordered_aggregate_eligibility", test_unordered_aggregate_eligibility},
 };
 
 int run_tests()

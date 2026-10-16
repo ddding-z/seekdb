@@ -51,6 +51,7 @@ public:
   virtual int inner_rescan() override;
   virtual int inner_get_next_row() override;
   virtual int inner_get_next_batch(const int64_t max_row_cnt) override;
+  virtual bool supports_semantic_suspend() const override;
   virtual void destroy() override;
 
 private:
@@ -82,6 +83,7 @@ private:
   bool iter_end_;
   bool child_op_is_end_;
   bool need_init_; //init 3 arrays before got_row, do not reset in rescan()
+  bool batch_spilled_;
   GetNextRowFunc get_next_row_func_;
   GetNextRowBatchFunc get_next_batch_func_;
   ObSqlWorkAreaProfile profile_;

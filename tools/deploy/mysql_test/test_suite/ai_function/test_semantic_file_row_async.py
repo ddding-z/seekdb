@@ -10,6 +10,8 @@ Default/ordered output retains its prefix. Assertions compare exact SQL bags,
 request identities and query-scoped download counts, not HTTP arrival order.
 Auto permits ready FILE scores below full sort/exact Top-N, but preserves final
 SQL order and selected-row demand for FILE projection after ORDER BY/LIMIT.
+AUTO also composes FILE progress with hash grouping, streaming DISTINCT and a
+retained semantic probe of an ordinary INNER HASH JOIN.
 FILE is completely downloaded and validated before a provider request; these
 contracts do not describe byte/token streaming or FILE model-result caching.
 """
@@ -62,12 +64,15 @@ class SemanticFileRowAsyncContracts(remote.RemoteFileContracts):
             self, kind, expression, provider=provider, options=options_sql)
 
     def statement(self, fields, *, ordering="unordered", caching="false",
-                  where=None, suffix=""):
+                  where=None, suffix="", source="remote_values a", extra_hints="",
+                  enabled_lift=None):
         hints = "PARALLEL(1) OPT_PARAM('enable_semantic_row_async','true')"
         if ordering is not None:
             hints += " OPT_PARAM('semantic_output_order'," + self.literal(ordering) + ")"
+        if extra_hints:
+            hints += " " + extra_hints
         return cache.sql_statement(
-            fields, source="remote_values a", hints=hints, cache=caching,
+            fields, source=source, hints=hints, cache=caching, enabled_lift=enabled_lift,
             where=where, suffix=suffix)
 
     def reply(self, provider, content, value, *, assets=(), kind="map",
@@ -250,6 +255,110 @@ class SemanticFileRowAsyncContracts(remote.RemoteFileContracts):
         self.assertEqual(pending.result(), tuple((index, f"mapped-{index}") for index in selected))
         self.assert_work(before, first=keys.values(),
                          downloads=[assets[index].target for index in selected])
+        self.assert_no_sockets()
+
+    def test_auto_file_rank_hash_grouping_remains_blocking(self):
+        head = self.fixtures.gate()
+        assets = [self.storage.asset(seed=620 + index) for index in range(2)]
+        self.insert([(index, f"group-{index}:", asset.descriptor())
+                     for index, asset in enumerate(assets)])
+        keys = [
+            self.reply(0, [files.text_block(f"group-{index}:"), asset.block()], score,
+                       assets=[asset], kind="rank", options=STATIC_OPTIONS,
+                       gate=head if index == 0 else None)
+            for index, (asset, score) in enumerate(zip(assets, (2.0, 10.0)))
+        ]
+        score = self.call("rank", "AI_INPUT(a.text_value,a.asset)", options=STATIC_OPTIONS)
+        statement = self.statement(
+            "a.id DIV 2 AS bucket,COUNT(*),AVG(" + score + ")", ordering="auto",
+            extra_hints="USE_HASH_AGGREGATION", suffix="GROUP BY a.id DIV 2 ORDER BY bucket",
+            enabled_lift="true")
+        plan = self.explain(statement)
+        stage = plan.one("SEMANTIC RANK")
+        self.assert_auto_policy(stage, "UNORDERED_READY", "HASH_AGGREGATE_INPUT")
+        self.assertTrue(plan.is_above(plan.one("HASH GROUP BY"), stage), plan.text)
+        before = self.work()
+        pending, rows, first = self.stream(statement)
+        self.wait_provider(0, keys[0], pending, before)
+        self.wait_provider(0, keys[1], pending, before, responded=True)
+        self.assertFalse(head.is_set())
+        self.assertFalse(first.wait(0.15), "hash grouping exposed an incomplete group")
+        self.assertEqual(rows, [])
+        self.assertFalse(pending.done.is_set(), repr(pending.error))
+        head.set()
+        self.assertEqual(pending.result(), ((0, 2, 6.0),))
+        self.assert_work(before, first=keys, downloads=[asset.target for asset in assets])
+        self.assert_no_sockets()
+
+    def test_auto_file_hash_distinct_retains_seen_values_across_download_wait(self):
+        head = self.fixtures.gate()
+        assets = [self.storage.asset(seed=630, gate=head), self.storage.asset("jpeg", 631)]
+        self.storage.routes[assets[0].target].before_gate = len(assets[0].raw) - 1
+        self.insert([(index, f"distinct-{index}:", asset.descriptor())
+                     for index, asset in enumerate(assets)])
+        keys = [
+            self.reply(0, [files.text_block(f"distinct-{index}:"), asset.block()], "same",
+                       assets=[asset])
+            for index, asset in enumerate(assets)
+        ]
+        statement = self.statement(
+            "DISTINCT " + self.call("map", "AI_INPUT(a.text_value,a.asset)"),
+            ordering="auto", caching="true", extra_hints="USE_HASH_DISTINCT", enabled_lift="true")
+        plan = self.explain(statement)
+        stage = plan.one("SEMANTIC MAP")
+        self.assert_auto_policy(stage, "UNORDERED_READY", "HASH_DISTINCT_INPUT")
+        self.assertTrue(plan.is_above(plan.one("HASH DISTINCT"), stage), plan.text)
+        before = self.work()
+        pending, rows, first = self.stream(statement)
+        self.wait_download(assets[0], pending, before_gate=len(assets[0].raw) - 1)
+        self.wait_provider(0, keys[1], pending, before, responded=True)
+        self.assert_unrequested(0, keys[0], before)
+        self.assert_visible_peer(pending, rows, first, ("same",), head)
+        head.set()
+        self.assertEqual(pending.result(), (("same",),))
+        self.assert_work(before, first=keys, downloads=[asset.target for asset in assets])
+        self.assert_no_sockets()
+
+    def test_auto_file_probe_hash_join_exposes_ready_text_map(self):
+        head = self.fixtures.gate()
+        assets = [self.storage.asset(seed=640, gate=head), self.storage.asset("jpeg", 641)]
+        self.storage.routes[assets[0].target].before_gate = len(assets[0].raw) - 1
+        self.insert([(index, f"probe-{index}:", asset.descriptor())
+                     for index, asset in enumerate(assets)])
+        vision_keys = [
+            self.reply(0, [files.text_block(f"probe-{index}:"), asset.block()], f"seen-{index}",
+                       assets=[asset])
+            for index, asset in enumerate(assets)
+        ]
+        text_keys = [
+            self.reply(1, f"joined:seen-{index}", f"joined-{index}")
+            for index in range(2)
+        ]
+        vision = self.call("map", "AI_INPUT(a.text_value,a.asset)")
+        source = ("remote_values b JOIN (SELECT id," + vision +
+                  " AS vision_value FROM remote_values a) p ON b.id=p.id")
+        statement = self.statement(
+            "p.id,b.text_value," +
+            self.call("map", "CONCAT('joined:',p.vision_value)", provider=1),
+            ordering="auto", source=source,
+            extra_hints="LEADING(b p) USE_HASH(p) NO_SWAP_JOIN_INPUTS(p) NO_MERGE(p)",
+            enabled_lift="true")
+        plan = self.explain(statement)
+        self.assertTrue(plan.is_above(plan.one("HASH JOIN"), plan.one("SUBPLAN SCAN")), plan.text)
+        self.assertIn("HASH_JOIN_PROBE", plan.text)
+        self.assertNotIn("PX COORDINATOR", plan.text.upper())
+        before = self.work()
+        pending, rows, first = self.stream(statement)
+        self.wait_download(assets[0], pending, before_gate=len(assets[0].raw) - 1)
+        self.wait_provider(1, text_keys[1], pending, before, responded=True)
+        self.assert_unrequested(0, vision_keys[0], before)
+        self.assert_unrequested(1, text_keys[0], before)
+        self.assert_visible_peer(pending, rows, first, (1, "probe-1:", "joined-1"), head)
+        head.set()
+        self.assertCountEqual(pending.result(), tuple(
+            (index, f"probe-{index}:", f"joined-{index}") for index in range(2)))
+        self.assert_work(before, first=vision_keys, second=text_keys,
+                         downloads=[asset.target for asset in assets])
         self.assert_no_sockets()
 
     def test_held_remote_download_allows_unordered_image_and_sql_output(self):

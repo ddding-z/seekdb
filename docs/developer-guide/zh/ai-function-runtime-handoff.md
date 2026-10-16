@@ -1472,8 +1472,9 @@ EXPLAIN 显示有效 `row_async` 模式及 `output_policy=AUTO, order_reason=...
 或 LIMIT。允许 merge 后计划，也验证保留的向量化 SUBPLAN SCAN；后者只在拉取
 子输入前的安全边界挂起，不在 CPU projector 执行一半时恢复。
 
-CTE/物化、stored view、标量子查询、JOIN、GROUP/聚合、DISTINCT、window/set、
-locking/output SELECT 和 PX 仍明确拒绝。prefix/local-merge/partition sort、
+初版 P2 明确拒绝 CTE/物化、stored view、标量子查询、JOIN、GROUP/聚合、DISTINCT、
+window/set、locking/output SELECT 和 PX；第 23 节扩展经验证的 hash 关系边界。
+prefix/local-merge/partition sort、
 WITH TIES、近似 Top-K 和 Top-N filter 不被当作普通顺序恢复边界。
 
 Top-N filter 还可能在较晚的 runtime-filter 分配 pass 中新增，因此
@@ -1508,3 +1509,157 @@ guard/共享表达式、真实派生边界及其 timeout/kill/恢复。两份新
 - 用 512 行及真实统计信息触发较晚的 Top-N filter 分配，负对照先证实仅有早期
   准入检查会漏过该边界；修复后 EXPLAIN/SELECT 在模型请求前明确拒绝。
   ordered 模式保留原功能，显式禁用该 filter 的 auto 精确 Top-N 仍可执行。
+
+## 23. P3：AUTO 接入串行 hash 关系算子
+
+扩展的是 row-async/auto 的适用计划，不是新增普通 SQL 聚合/连接语法。默认
+batch 和 ordered 保留已有路径；strict unordered 仍保持单基表范围，不偷偷
+放宽。以下组合使用显式 auto，仍不纳入 PX 或原生 AI_JOIN/AI_AGG 的新范围。
+
+### 普通 Hash Group By 与 streaming Hash DISTINCT
+
+```sql
+SELECT /*+ PARALLEL(1) USE_HASH_AGGREGATION
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','auto') */
+       movie_id, AVG(AI_RANK('judge_model', review_text)) AS average_score
+FROM reviews
+GROUP BY movie_id
+ORDER BY average_score DESC, movie_id
+LIMIT 10;
+```
+
+普通 COUNT/SUM/AVG/MIN/MAX 的 hash 聚合可消费无序语义输入，复用已有受条件
+限制的聚合挂起状态机。聚合内 DISTINCT/ORDER BY、rollup、AI_AGG、自适应/
+pushdown/三阶段聚合、scalar/merge 聚合不在本轮范围。HAVING 和末端语义投影
+仍遵循原放置需求，不能为提高并发跨 LIMIT 或 guard 提前请求模型。
+
+streaming Hash DISTINCT 接收已物化的语义值，去重由 SQL 算子完成。关闭函数缓存时，
+即使后面会 DISTINCT，不同输入行仍保留各自的模型调用需求。blocking/merge/pushdown
+DISTINCT 不在 AUTO 准入内，也不是自动可替代的恢复路径。
+
+Hash Group By / streaming DISTINCT 每次拉取 child 时重新检查 suspension capability。
+运行时开始 spill 后，改为在受保护调用内 inline wait，不再从 spill 状态向祖先传播
+pending wait；这不是异步 spill 支持，也不是输出策略或缓存策略的静默降级。
+内存分配、spill I/O、模型、超时和取消错误仍然传播。
+检查同时覆盖 live chunk-store override 和已初始化 store 捕获的实际 memory
+limit；动态全局配置恢复为零，不会让仍持有强制 limit 的 store 重新允许挂起。
+
+GROUP BY/DISTINCT 保持 SQL NULL 和 collation 规则；collation 等价值的代表行
+不承诺固定来源。浮点 SUM/AVG 与普通无序 SQL 聚合一样可能有累加顺序舍入差异，
+auto 不提供逐 bit 浮点复现。Hash Group By 仍是阻塞边界，输入可推进不代表最终
+分组结果可以提前返回。
+
+### 受限 INNER HASH JOIN
+
+首版只接入串行普通 INNER 等值 hash join：build 子树为不含原生语义阶段的普通
+关系输入，probe 子树可含合格语义阶段；连接上方的语义投影/筛选也可使用。
+需要真实 hash 路径和固定关系 build 侧时可使用 LEADING/USE_HASH/NO_SWAP_JOIN_INPUTS；
+不把 nested-loop/merge 路径静默当成已经验证的 hash 执行。本阶段验证已构造的
+物理路径，尚未实现剔除全部不支持候选后再自动搜索可行替代路径。
+
+暂不开放 outer/semi/anti、cross product、shared/PX、参数化 rescan、late
+materialization 和 join runtime filter。连接重复数仍是普通 SQL bag；策略 pass
+不把 per-source-row 模型需求挪成 per-pair，或反过来。关系 ORDER BY/LIMIT
+之后的语义投影仍只处理选中对。Hash join 不继承输入顺序承诺，最终 SQL 排序由
+显式 Sort 恢复。
+
+物理 hash join 的 opt-in 标志默认 false，只为通过 AUTO 准入的计划启用。
+纯关系 build 和 hash-table 后处理必须在首次语义 probe 拉取前完成；只允许
+fresh probe fetch 挂起，bucket 遍历和结果组装继续受保护。不支持磁盘分区重放、
+dumped partition、cache-aware 或 hash join 内部的 nested-loop 处理。与聚合的
+受保护 spill inline wait 不同，带标志 join 进入未覆盖的动态状态会明确返回 SQL
+错误，不把异步 spill 当成已经实现的能力。
+
+EXPLAIN 的新输入区域原因：
+
+| reason | 输入需求 |
+| --- | --- |
+| `HASH_AGGREGATE_INPUT` | 普通 hash 聚合不要求输入顺序 |
+| `HASH_DISTINCT_INPUT` | hash 去重不要求输入顺序 |
+| `HASH_JOIN_PROBE` | 经准入的 hash join 可消费无序 probe 区域 |
+
+原始 query block 的边界在重写前递归检查，允许简单派生关系块，但仍拒绝内层
+ORDER BY/LIMIT、CTE/物化、stored view、标量子查询、window/set、locking/output
+SELECT。SQL 形态准入不等于任意物理算法都可挂起；语义上提后还会重新验证所选
+计划并刷新每阶段输出策略，不能留下过时的顺序承诺。
+
+确定性 SQL/mock 入口：
+[test_semantic_relational_aggregate.py](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_relational_aggregate.py)、
+[test_semantic_relational_join.py](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_relational_join.py)。
+错误、deadline、kill 仍是查询失败；不引入协程、新结果缓存策略或新的全查询
+HTTP 请求 credit，也不宣称实现语义 Top-K 剪枝。
+
+### 可复现异步 microbenchmark
+
+[benchmark_semantic_async.py](../../../tools/deploy/mysql_test/test_suite/ai_function/benchmark_semantic_async.py)
+只使用 loopback TEXT fixture，在相同 batch/slot/串行 DOP 下比较 default batch、
+ordered row-async、strict unordered、auto。五项场景覆盖全量 MAP、关系 ORDER BY/
+LIMIT 后 MAP、FILTER/MAP/LIMIT、精确 RANK sort、精确 RANK Top-N：
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/benchmark_semantic_async.py --list-cases
+python tools/deploy/mysql_test/test_suite/ai_function/benchmark_semantic_async.py --self-test
+python tools/deploy/mysql_test/test_suite/ai_function/benchmark_semantic_async.py \
+  --binary build_debug/bin/src/observer/seekdb --run-label local_fixture \
+  --rows 19 --limit 3 --offset 1 --first-k 3 \
+  --batch-rows 8 --slots 2 --repeats 2 \
+  --fast-delay-ms 15 --slow-delay-ms 150 --query-timeout-s 20 \
+  --output /tmp/semantic-async-smoke.json \
+  --log-dir /tmp/semantic-async-smoke-logs
+```
+
+输出/log 路径必须未存在，JSON 以带版本的 atomic/no-clobber 方式发布。不指定
+case/mode 时记录 17 个支持组合及 3 个明确不支持的 unordered/ORDER BY 组合。
+输入、score、选择率、延迟分配固定，不提供随机 seed 或独立的 concurrency knob。
+
+用真实 SSCursor 记录首行、前 K 行、EOF 总时延、返回行数、模型请求数及实测
+provider peak；不足 K 行时该指标为 null。对可比较场景校验精确 bag/顺序与调用
+需求。无序 FILTER/MAP/LIMIT 可选择不同合法子集，因此不做同答案 speedup 宣称。
+fixture 数据不是实际模型/SemBench 性能或质量结论；不伪造内存、取消 credit 等
+没有测量的计数。
+
+### P3 验证快照
+
+协同 Debug 构建及最终私有部署验证通过：
+
+| 覆盖 | 通过 |
+| --- | ---: |
+| 普通聚合 / streaming DISTINCT | 18 |
+| 受限 INNER HASH JOIN | 23 |
+| FILE 行间异步，含三项新的关系组合 | 21 |
+| AUTO 策略 | 22 |
+| 原 ordered / strict unordered | 20 / 22 |
+| 原 native RANK / default semantic runtime | 27 / 39 |
+| native 输入 / 聚合资格 | 25 |
+| native 资源 / hash 能力 / captured store limit | 24 项重复两轮，共 48 次 |
+| benchmark 无服务自测 | 16 |
+| benchmark 实际 SQL trials | 17 个支持组合重复两轮，共 34 次 |
+
+SQL 契约合计 192 项。FILE 三种 hash 组合还开启了
+`enable_semantic_lift='true'`，在新私有部署重复 gate，验证放置后的区域原因、
+真实 SQL 可见性和精确调用需求。JOIN 包括 nullable NSEQ、嵌套 hash join、
+大语义值穿过重复链、后续 grouped RANK、空 build、可见前缀后的错误、kill/
+deadline/恢复及原执行模式。
+
+真实执行曾暴露串行 guard 的错误代理：codegen 无条件设置 `is_use_px()`，
+不能用它证明实际 PX。修复为真实 DOP 与 SQC handler 检查，并保留全部
+逻辑/物理准入和模式/状态/spill 限制；修复后 TEXT 与 FILE 正对照均已重跑。
+
+最终 fixture 为 19 行、重复两轮、batch 8、slots 2、fast/slow reply 15/150 ms、
+first-K=3，以下为实测中位数，单位 ms：
+
+| 场景 | default 首行 | AUTO 首行 | default 总时延 | AUTO 总时延 |
+| --- | ---: | ---: | ---: | ---: |
+| 全量 MAP | 337.42 | 29.84 | 337.57 | 337.00 |
+| 关系 LIMIT 后 MAP | 169.28 | 33.90 | 169.32 | 169.14 |
+| FILTER/MAP/LIMIT，不同合法子集 | 330.01 | 56.35 | 330.05 | 75.35 |
+| 精确 RANK sort | 333.18 | 338.75 | 333.37 | 338.93 |
+| 精确 RANK Top-N | 334.31 | 337.08 | 334.35 | 337.12 |
+
+主要证实的是更早可见的进展，不是所有查询总时延都会下降。FILTER/LIMIT 的
+default/ordered 选中 {0,3,6}，unordered/auto 选中 {3,6,9}，只能描述时延，
+不宣称同答案加速。关系 LIMIT 后 MAP 每次严格 3 个调用，两个 RANK 场景都
+评分全部 19 个候选。34 trials 审计了 550 次 HTTP attempt；不支持组合没有
+样本，EOF 时仍有 outstanding response 不等于取消计数。私有服务、模型 socket、
+gate 和 worker 清理通过。未宣称 sanitizer、真实模型质量、异步 spill 或 PX 扩展。

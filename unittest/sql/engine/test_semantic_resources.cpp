@@ -25,6 +25,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include "share/config/ob_server_config.h"
 #include <thread>
 #include <utility>
 #include <vector>
@@ -36,6 +37,9 @@
 #include "sql/engine/ob_physical_plan_ctx.h"
 #include "sql/engine/sort/ob_sort_op.h"
 #include "sql/engine/subquery/ob_subplan_scan_op.h"
+#include "sql/engine/aggregate/ob_hash_distinct_op.h"
+#include "sql/engine/aggregate/ob_hash_groupby_op.h"
+#include "sql/engine/basic/ob_chunk_datum_store.h"
 #include "sql/resolver/dml/ob_hint.h"
 #include "sql/session/ob_sql_session_info.h"
 
@@ -908,6 +912,86 @@ void test_subplan_scan_suspension_capability()
   require(scan.supports_semantic_suspend(), "vectorized simple derived scans are resumable");
 }
 
+void check_forced_chunk_store_suspension_guard(ObOperator &op)
+{
+  const std::string saved(GCONF._chunk_row_store_mem_limit.str());
+  const bool configured = GCONF._chunk_row_store_mem_limit.set_value("1M");
+  const bool protected_mode = !op.supports_semantic_suspend();
+  const bool restored = GCONF._chunk_row_store_mem_limit.set_value(saved.c_str());
+  require(configured, "configure forced chunk-store limit");
+  require(restored, "restore chunk-store limit");
+  require(protected_mode, "forced chunk-store limits stay protected");
+  require(op.supports_semantic_suspend(), "restored chunk-store configuration permits suspension");
+}
+
+void test_hash_distinct_suspension_capability()
+{
+  ObArenaAllocator allocator("SemanticTest");
+  ExecutionFixture fixture(execution_id());
+  ObHashDistinctSpec spec(allocator, PHY_HASH_DISTINCT);
+  spec.max_batch_size_ = 16;
+  ObHashDistinctOp distinct(fixture.context(), spec, nullptr);
+  require(distinct.supports_semantic_suspend(), "ordinary vectorized streaming DISTINCT is resumable");
+  spec.max_batch_size_ = 0;
+  require(!distinct.supports_semantic_suspend(), "scalar DISTINCT stays protected");
+  spec.max_batch_size_ = 16;
+  spec.is_block_mode_ = true;
+  require(!distinct.supports_semantic_suspend(), "blocking DISTINCT stays protected");
+  spec.is_block_mode_ = false;
+  spec.by_pass_enabled_ = true;
+  require(!distinct.supports_semantic_suspend(), "bypass DISTINCT stays protected");
+  spec.by_pass_enabled_ = false;
+  spec.is_push_down_ = true;
+  require(!distinct.supports_semantic_suspend(), "pushdown stays protected independently of bypass");
+  spec.is_push_down_ = false;
+  require(distinct.supports_semantic_suspend(), "ordinary flags restore initial DISTINCT capability");
+  check_forced_chunk_store_suspension_guard(distinct);
+}
+
+void test_hash_group_by_suspension_capability()
+{
+  ObArenaAllocator allocator("SemanticTest");
+  ExecutionFixture fixture(execution_id());
+  ObHashGroupBySpec spec(allocator, PHY_HASH_GROUP_BY);
+  spec.max_batch_size_ = 16;
+  ObHashGroupByOp group(fixture.context(), spec, nullptr);
+  require(group.supports_semantic_suspend(), "ordinary vectorized hash aggregation is resumable");
+  spec.max_batch_size_ = 0;
+  require(!group.supports_semantic_suspend(), "scalar hash aggregation stays protected");
+  spec.max_batch_size_ = 16;
+  spec.by_pass_enabled_ = true;
+  require(!group.supports_semantic_suspend(), "bypass hash aggregation stays protected");
+  spec.by_pass_enabled_ = false;
+  check_forced_chunk_store_suspension_guard(group);
+}
+
+void test_chunk_store_captured_limit()
+{
+  ObArenaAllocator allocator("SemanticTest");
+  ObChunkDatumStore distinct_store("SemanticTest", &allocator);
+  ObChunkDatumStore group_store("SemanticTest", &allocator);
+  const std::string saved(GCONF._chunk_row_store_mem_limit.str());
+  const bool configured = GCONF._chunk_row_store_mem_limit.set_value("1M");
+  const int distinct_ret = distinct_store.init(
+      INT64_MAX, ObCtxIds::DEFAULT_CTX_ID, "SemanticTest", false);
+  const int group_ret = group_store.init(
+      0, ObCtxIds::DEFAULT_CTX_ID, "SemanticTest", false);
+  const bool restored = GCONF._chunk_row_store_mem_limit.set_value(saved.c_str());
+  require(configured, "configure captured chunk-store limit");
+  require(restored, "restore global chunk-store limit before assertions");
+  require(distinct_ret == OB_SUCCESS && group_ret == OB_SUCCESS, "initialize forced-limit stores");
+  require(distinct_store.get_mem_limit() == 1024 * 1024, "DISTINCT store retains captured forced limit");
+  require(group_store.get_mem_limit() == 1024 * 1024, "group store retains captured forced limit");
+  distinct_store.reset();
+  group_store.reset();
+  require(distinct_store.init(INT64_MAX, ObCtxIds::DEFAULT_CTX_ID, "SemanticTest", false) == OB_SUCCESS,
+          "reinitialize ordinary DISTINCT store");
+  require(group_store.init(0, ObCtxIds::DEFAULT_CTX_ID, "SemanticTest", false) == OB_SUCCESS,
+          "reinitialize ordinary group store");
+  require(distinct_store.get_mem_limit() == INT64_MAX, "DISTINCT store restores ordinary limit");
+  require(group_store.get_mem_limit() == 0, "group store restores ordinary limit");
+}
+
 struct TestCase
 {
   const char *name_;
@@ -937,6 +1021,9 @@ const TestCase TESTS[] = {
   {"semantic_output_order_hint", test_semantic_output_order_hint},
   {"sort_suspension_capability", test_sort_suspension_capability},
   {"subplan_scan_suspension_capability", test_subplan_scan_suspension_capability},
+  {"hash_distinct_suspension_capability", test_hash_distinct_suspension_capability},
+  {"hash_group_by_suspension_capability", test_hash_group_by_suspension_capability},
+  {"chunk_store_captured_limit", test_chunk_store_captured_limit},
 };
 } // namespace
 

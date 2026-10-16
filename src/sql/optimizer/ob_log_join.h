@@ -70,6 +70,7 @@ namespace sql
      *  Get the nl params
      */
     inline common::ObIArray<ObExecParamRawExpr *> &get_nl_params() { return nl_params_; }
+    inline const common::ObIArray<ObExecParamRawExpr *> &get_nl_params() const { return nl_params_; }
     /**
      *  Set the nl params
      */
@@ -126,7 +127,7 @@ namespace sql
     ObOpPseudoColumnRawExpr *get_partition_id_expr() { return partition_id_expr_; }
     virtual int compute_property(Path *path) override;
 
-    inline bool enable_px_batch_rescan() { return enable_px_batch_rescan_; }
+    inline bool enable_px_batch_rescan() const { return enable_px_batch_rescan_; }
     inline void set_px_batch_rescan(bool flag) { enable_px_batch_rescan_ = flag; }
 
     int set_join_filter_infos(const common::ObIArray<JoinFilterInfo> &infos) { return join_filter_infos_.assign(infos); }

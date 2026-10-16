@@ -5382,11 +5382,12 @@ int check_semantic_output_plan(const ObLogicalOperator &node, bool automatic)
   if ((type != LOG_TABLE_SCAN && type != LOG_EXPR_VALUES &&
        type != LOG_LIMIT && type != LOG_SEMANTIC_MAP &&
        type != LOG_SEMANTIC_FILTER && type != LOG_SEMANTIC_RANK &&
-       !(automatic && (type == LOG_SORT || type == LOG_SUBPLAN_SCAN))) ||
-      node.get_num_of_child() > 1) {
+       !(automatic && (type == LOG_SORT || type == LOG_SUBPLAN_SCAN ||
+                        type == LOG_GROUP_BY || type == LOG_DISTINCT || type == LOG_JOIN))) ||
+      node.get_num_of_child() > (automatic && type == LOG_JOIN ? 2 : 1)) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, automatic
-        ? "automatic semantic output supports a serial single-scan pipeline, ordinary sort, LIMIT and simple derived scans only"
+        ? "automatic semantic output requires verified serial sort, hash aggregation, hash DISTINCT, INNER HASH JOIN and simple derived scans"
         : "unordered semantic execution supports a serial single-scan pipeline with optional LIMIT only");
     LOG_WARN("unsupported semantic output plan boundary", K(ret), K(automatic), "operator_type", type);
   } else if (type == LOG_SORT) {
@@ -5397,6 +5398,57 @@ int check_semantic_output_plan(const ObLogicalOperator &node, bool automatic)
       ret = OB_NOT_SUPPORTED;
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "automatic semantic output currently requires an ordinary full sort or exact Top-N");
       LOG_WARN("unsupported automatic semantic sort boundary", K(ret));
+    }
+  } else if (type == LOG_GROUP_BY) {
+    const auto &group = static_cast<const ObLogGroupBy &>(node);
+    if (group.get_algo() != HASH_AGGREGATE || group.has_rollup() ||
+        group.is_adaptive_aggregate() || group.is_three_stage_aggr() || group.is_push_down()) {
+      ret = OB_NOT_SUPPORTED;
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && index < group.get_aggr_funcs().count(); ++index) {
+      const ObRawExpr *aggregate = group.get_aggr_funcs().at(index);
+      if (nullptr == aggregate || !SemanticExprUtils::supports_unordered_aggregate(*aggregate)) {
+        ret = OB_NOT_SUPPORTED;
+      }
+    }
+    if (ret == OB_NOT_SUPPORTED) {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "automatic semantic output requires ordinary non-adaptive hash aggregation without rollup, DISTINCT or aggregate ordering");
+      LOG_WARN("unsupported automatic semantic aggregation boundary", K(ret));
+    }
+  } else if (type == LOG_DISTINCT) {
+    const auto &distinct = static_cast<const ObLogDistinct &>(node);
+    if (distinct.get_algo() != HASH_AGGREGATE || distinct.get_block_mode() ||
+        distinct.is_push_down() || distinct.force_push_down()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "automatic semantic output requires ordinary streaming hash DISTINCT");
+      LOG_WARN("unsupported automatic semantic DISTINCT boundary", K(ret));
+    }
+  } else if (type == LOG_JOIN) {
+    const auto &join = static_cast<const ObLogJoin &>(node);
+    if (join.get_join_type() != INNER_JOIN || join.get_join_algo() != HASH_JOIN ||
+        join.get_equal_join_conditions().empty() || join.is_shared_hash_join() ||
+        join.is_late_mat() || join.enable_px_batch_rescan() || !join.get_nl_params().empty() ||
+        !join.get_join_filter_infos().empty() ||
+        node.get_num_of_child() != 2 || nullptr == node.get_child(0) ||
+        semantic_plan_present(*node.get_child(0))) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "automatic semantic output requires serial INNER HASH JOIN with a relational build input and ordinary equality keys");
+      LOG_WARN("unsupported automatic semantic join boundary", K(ret));
+    }
+    const auto &equal_conditions = join.get_equal_join_conditions();
+    const auto &other_conditions = join.get_other_join_conditions();
+    for (int64_t index = 0; OB_SUCC(ret) &&
+         index < equal_conditions.count() + other_conditions.count(); ++index) {
+      ObRawExpr *condition = index < equal_conditions.count()
+          ? equal_conditions.at(index) : other_conditions.at(index - equal_conditions.count());
+      ObSEArray<ObRawExpr *, 4> calls;
+      if (OB_FAIL(collect_semantic_calls(condition, calls))) {
+        LOG_WARN("failed to inspect automatic hash join condition", K(ret));
+      } else if (!calls.empty()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "automatic hash join conditions require materialized relational values");
+        LOG_WARN("raw semantic call remains in automatic hash join condition", K(ret));
+      }
     }
   }
   for (int64_t index = 0; OB_SUCC(ret) && index < node.get_num_of_child(); ++index) {
@@ -5423,6 +5475,15 @@ int assign_semantic_auto_output(ObLogicalOperator &node, bool ordered, const cha
     // A full sort establishes its own order; prefix/merge sorts are excluded by admission.
     ordered = false;
     reason = "SORT_RESTORES_ORDER";
+  } else if (node.get_type() == LOG_GROUP_BY) {
+    ordered = false;
+    reason = "HASH_AGGREGATE_INPUT";
+  } else if (node.get_type() == LOG_DISTINCT) {
+    ordered = false;
+    reason = "HASH_DISTINCT_INPUT";
+  } else if (node.get_type() == LOG_JOIN) {
+    ordered = false;
+    reason = "HASH_JOIN_PROBE";
   }
   for (int64_t index = 0; OB_SUCC(ret) && index < node.get_num_of_child(); ++index) {
     ObLogicalOperator *child = node.get_child(index);
@@ -5433,9 +5494,15 @@ int assign_semantic_auto_output(ObLogicalOperator &node, bool ordered, const cha
       ret = SMART_CALL(assign_semantic_auto_output(*child, ordered, reason));
     }
   }
-  if (OB_SUCC(ret) && OB_FAIL(node.compute_op_ordering())) {
+  if (OB_SUCC(ret) && (node.get_type() == LOG_GROUP_BY || node.get_type() == LOG_DISTINCT ||
+                       node.get_type() == LOG_JOIN)) {
+    node.reset_op_ordering();
+    node.set_is_local_order(false);
+    node.set_is_range_order(false);
+  } else if (OB_SUCC(ret) && OB_FAIL(node.compute_op_ordering())) {
     LOG_WARN("failed to refresh automatic semantic ordering", K(ret));
-  } else if (OB_SUCC(ret) && OB_FAIL(node.compute_op_interesting_order_info())) {
+  }
+  if (OB_SUCC(ret) && OB_FAIL(node.compute_op_interesting_order_info())) {
     LOG_WARN("failed to refresh automatic semantic interesting order", K(ret));
   }
   return ret;
@@ -6114,6 +6181,21 @@ int ObSelectLogPlan::place_semantic_stages()
         get_optimizer_context().set_plan_type(root->get_phy_plan_type(),
                                               root->get_location_type(),
                                               root->is_exchange_allocated());
+      }
+    }
+  }
+  if (OB_SUCC(ret) && row_async_enabled && nullptr != root) {
+    ObOptParamHint::SemanticOutputPolicy policy = ObOptParamHint::SemanticOutputPolicy::ORDERED;
+    if (OB_FAIL(get_optimizer_context().get_global_hint().opt_params_
+        .get_semantic_output_policy(policy))) {
+      LOG_WARN("failed to read final semantic output policy", K(ret));
+    } else if (policy == ObOptParamHint::SemanticOutputPolicy::AUTO) {
+      const bool ordered = get_stmt()->has_order_by();
+      if (OB_FAIL(check_semantic_output_plan(*root, true))) {
+        LOG_WARN("selected plan is outside automatic semantic output capabilities", K(ret));
+      } else if (OB_FAIL(assign_semantic_auto_output(*root, ordered,
+          ordered ? "FINAL_SQL_ORDER" : "NO_ORDER_REQUIREMENT"))) {
+        LOG_WARN("failed to refresh semantic output policies after placement", K(ret));
       }
     }
   }

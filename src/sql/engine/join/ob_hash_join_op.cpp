@@ -17,6 +17,9 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "sql/engine/join/ob_hash_join_op.h"
+#include "sql/engine/basic/ob_semantic_runtime.h"
+#include "sql/engine/ob_physical_plan.h"
+#include "lib/worker.h"
 #include "sql/engine/px/ob_px_util.h"
 #include "sql/engine/px/ob_px_util.h"
 
@@ -110,7 +113,8 @@ ObHashJoinSpec::ObHashJoinSpec(common::ObIAllocator &alloc, const ObPhyOperatorT
   adaptive_hj_scan_cols_(alloc),
   adaptive_nlj_scan_cols_(alloc),
   is_adaptive_(false),
-  left_join_row_(alloc)
+  left_join_row_(alloc),
+  semantic_suspend_(false)
 {
 }
 
@@ -126,7 +130,8 @@ OB_SERIALIZE_MEMBER((ObHashJoinSpec, ObJoinSpec),
                     adaptive_hj_scan_cols_,
                     adaptive_nlj_scan_cols_,
                     is_adaptive_,
-                    left_join_row_);
+                    left_join_row_,
+                    semantic_suspend_);
 
 int ObHashJoinOp::PartHashJoinTable::init(ObIAllocator &alloc)
 {
@@ -262,7 +267,8 @@ ObHashJoinOp::ObHashJoinOp(ObExecContext &ctx_, const ObOpSpec &spec, ObOpInput 
   non_preserved_side_is_not_empty_(false),
   null_random_hash_value_(0),
   skip_left_null_(false),
-  skip_right_null_(false)
+  skip_right_null_(false),
+  semantic_suspend_error_(OB_SUCCESS)
 {
   /*
                         read_left_row -> build_hash_table
@@ -374,7 +380,8 @@ int ObHashJoinOp::inner_open()
 {
   int ret = OB_SUCCESS;
   ObSQLSessionInfo *session = NULL;
-  if (OB_FAIL(set_shared_info())) {
+  if (MY_SPEC.semantic_suspend_ && OB_FAIL(check_semantic_suspend_mode())) {
+  } else if (OB_FAIL(set_shared_info())) {
   } else if (is_shared_ && OB_FAIL(sync_wait_open())) {
     is_shared_ = false;
     LOG_WARN("failed to sync open for shared hj", K(ret));
@@ -395,7 +402,8 @@ int ObHashJoinOp::inner_open()
     first_get_row_ = true;
     force_hash_join_spill_ = GCONF._force_hash_join_spill;
     hash_join_processor_ = GCONF._enable_hash_join_processor;
-    if (0 == (hash_join_processor_ & HJ_PROCESSOR_MASK)) {
+    if (MY_SPEC.semantic_suspend_ && OB_FAIL(check_semantic_suspend_mode())) {
+    } else if (0 == (hash_join_processor_ & HJ_PROCESSOR_MASK)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpect hash join processor", K(ret), K(hash_join_processor_));
     } else if (OB_FAIL(set_hash_function())) {
@@ -658,7 +666,10 @@ int ObHashJoinOp::part_rescan(bool reset_all)
 int ObHashJoinOp::inner_rescan()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(part_rescan(true))) {
+  if (MY_SPEC.semantic_suspend_) {
+    ret = unsupported_semantic_suspend("semantic row-async INNER HASH JOIN rescan");
+    semantic_suspend_error_ = ret;
+  } else if (OB_FAIL(part_rescan(true))) {
   } else if (OB_FAIL(ObJoinOp::inner_rescan())) {
   } else {
     batch_round_ = 1;
@@ -667,6 +678,57 @@ int ObHashJoinOp::inner_rescan()
     non_preserved_side_is_not_empty_ = false;
   }
   return ret;
+}
+
+bool ObHashJoinOp::supports_semantic_suspend() const
+{
+  return MY_SPEC.supports_semantic_suspend() && is_vectorized() && !is_shared_
+      && nullptr != MY_SPEC.get_phy_plan() && nullptr == ctx_.get_sqc_handler()
+      && MY_SPEC.get_phy_plan()->get_px_dop() <= 1
+      && !force_hash_join_spill_ && !GCONF._force_hash_join_spill
+      && 0 == GCONF._chunk_row_store_mem_limit
+      && 0 == part_level_ && 1 == batch_round_
+      && nullptr == left_batch_ && nullptr == right_batch_
+      && !opt_cache_aware_ && !enable_batch_
+      && cur_dumped_partition_ == max_partition_count_per_level_
+      && (NONE == hj_processor_ || RECURSIVE == hj_processor_);
+}
+
+int ObHashJoinOp::unsupported_semantic_suspend(const char *reason) const
+{
+  int ret = OB_NOT_SUPPORTED;
+  LOG_USER_ERROR(OB_NOT_SUPPORTED, reason);
+  LOG_WARN("unsupported semantic hash join execution mode", K(ret), K(reason),
+           K(hj_state_), K(state_), K(hj_processor_), K(part_level_), K(batch_round_),
+           K(cur_dumped_partition_), K(max_partition_count_per_level_), K(is_shared_),
+           K(opt_cache_aware_), K(enable_batch_), K(force_hash_join_spill_));
+  return ret;
+}
+
+int ObHashJoinOp::check_semantic_suspend_mode() const
+{
+  int ret = OB_SUCCESS;
+  if (MY_SPEC.semantic_suspend_
+      && (force_hash_join_spill_ || GCONF._force_hash_join_spill)) {
+    ret = unsupported_semantic_suspend("semantic row-async INNER HASH JOIN with forced spill");
+  } else if (MY_SPEC.semantic_suspend_ && 0 != GCONF._chunk_row_store_mem_limit) {
+    ret = unsupported_semantic_suspend(
+        "semantic row-async INNER HASH JOIN with a finite chunk-store memory limit");
+  } else if (MY_SPEC.semantic_suspend_ && !supports_semantic_suspend()) {
+    ret = unsupported_semantic_suspend(
+        "semantic row-async requires a serial vectorized nonspill INNER HASH JOIN");
+  }
+  return ret;
+}
+
+bool ObHashJoinOp::is_semantic_suspended(int ret) const
+{
+  lib::RequestAwait *await = lib::RequestAwait::current();
+  return OB_EAGAIN == ret && supports_semantic_suspend()
+      && JS_READ_RIGHT == state_ && !first_get_row_ && postprocessed_left_
+      && 0 == right_selector_cnt_
+      && nullptr != await && await->owns(&ctx_) && await->is_pending()
+      && OB_SUCCESS == await->cancel_ret();
 }
 
 int ObHashJoinOp::do_sync_wait_all()
@@ -739,17 +801,21 @@ int ObHashJoinOp::next()
   int func = -1;
   while(OB_SUCC(ret) && !need_return_) {
     state_operation = this->ObHashJoinOp::state_operation_func_[state];
+    const bool can_fetch = MY_SPEC.semantic_suspend_ && JS_READ_RIGHT == state;
     if (OB_ISNULL(state_operation)) {
       ret = OB_BAD_NULL_ERROR;
       LOG_WARN("state_operation is null", K(ret), K(state));
-    } else if (OB_ITER_END == (ret = (this->*state_operation)())) {
-      func = FT_ITER_END;
-      ret = OB_SUCCESS;
-    } else if (OB_FAIL(ret)) {
     } else {
-      func = FT_ITER_GOING;
+      SemanticSuspendScope operation_scope(MY_SPEC.type_, false, can_fetch);
+      if (OB_ITER_END == (ret = (this->*state_operation)())) {
+        func = FT_ITER_END;
+        ret = OB_SUCCESS;
+      } else if (OB_SUCC(ret)) {
+        func = FT_ITER_GOING;
+      }
     }
     if (OB_SUCC(ret)) {
+      SemanticSuspendScope transition_scope(MY_SPEC.type_);
       state_function = this->ObHashJoinOp::state_function_func_[state][func];
       if (OB_FAIL((this->*state_function)())) {
         if (OB_ITER_END == ret) {
@@ -799,7 +865,7 @@ int ObHashJoinOp::inner_get_next_row()
         ret = OB_SUCCESS;
       } else if (OB_SUCCESS == ret) {
         exit_while = true;
-      } else {
+      } else if (!is_semantic_suspended(ret)) {
         LOG_WARN("fail to get next row", K(ret));
       }
       break;
@@ -1763,6 +1829,10 @@ int ObHashJoinOp::init_join_partition()
           &sql_mem_processor_,
           sql_mem_processor_.get_dir_id(),
           &io_event_observer_))) {
+        } else if (MY_SPEC.semantic_suspend_
+            && 0 != hj_part_array_[i].get_batch()->get_chunk_row_store().get_mem_limit()) {
+          ret = unsupported_semantic_suspend(
+              "semantic row-async INNER HASH JOIN with a finite build chunk-store memory limit");
         }
       }
     }
@@ -1789,6 +1859,10 @@ int ObHashJoinOp::init_join_partition()
             &sql_mem_processor_,
             sql_mem_processor_.get_dir_id(),
             &io_event_observer_))) {
+          } else if (MY_SPEC.semantic_suspend_
+              && 0 != right_hj_part_array_[i].get_batch()->get_chunk_row_store().get_mem_limit()) {
+            ret = unsupported_semantic_suspend(
+                "semantic row-async INNER HASH JOIN with a finite probe chunk-store memory limit");
           }
         }
       }
@@ -1948,7 +2022,9 @@ int ObHashJoinOp::asyn_dump_partition(
       ObHashJoinPartition &dump_part = dumped_parts[i];
       bool tmp_part_dump = dump_part.is_dumped();
       if ((nullptr == pred || pred(i)) && (dump_part.has_switch_block() || (tmp_dump_all && 0 < dump_part.get_size_in_memory()))) {
-        if (OB_FAIL(dump_part.dump(tmp_dump_all, 1))) {
+        if (MY_SPEC.semantic_suspend_) {
+          ret = unsupported_semantic_suspend("semantic row-async INNER HASH JOIN spill");
+        } else if (OB_FAIL(dump_part.dump(tmp_dump_all, 1))) {
         } else if (dump_part.is_dumped() && !tmp_part_dump) {
           // Set a limit, subsequent automatic dump
           dump_part.get_batch()->set_memory_limit(1);
@@ -3539,6 +3615,11 @@ int ObHashJoinOp::get_next_right_batch_na()
 int ObHashJoinOp::get_next_right_batch()
 {
   int ret = OB_SUCCESS;
+  if (MY_SPEC.semantic_suspend_ && (!postprocessed_left_ || first_get_row_
+      || JS_READ_RIGHT != state_ || 0 != right_selector_cnt_)) {
+    return unsupported_semantic_suspend(
+        "semantic row-async HASH JOIN probe fetch with an unfinished build or bucket chain");
+  }
   clear_evaluated_flag();
   right_read_from_stored_ =  right_batch_ != NULL;
   right_batch_traverse_cnt_ = 0;
@@ -3557,8 +3638,13 @@ int ObHashJoinOp::get_next_right_batch()
       right_brs_ = &child_brs_;
       const_cast<ObBatchRows *>(right_brs_)->size_ = 0;
       const_cast<ObBatchRows *>(right_brs_)->end_ = true;
-    } else if (OB_FAIL(OB_I(t1) right_->get_next_batch(max_output_cnt_, right_brs_))) {
-    } else if (right_brs_->end_ && 0 == right_brs_->size_) {
+    } else {
+      // A child may release its preceding output only after all bucket chains drain.
+      right_brs_ = nullptr;
+      SemanticSuspendScope fetch_scope(MY_SPEC.type_, false, supports_semantic_suspend());
+      ret = OB_I(t1) right_->get_next_batch(max_output_cnt_, right_brs_);
+    }
+    if (OB_SUCC(ret) && right_brs_->end_ && 0 == right_brs_->size_) {
       // When reach here, projected flag has been set to false.
       // In the hash join operator, the datum corresponding to
       // the child output expr may be covered from the datum store;
@@ -4053,6 +4139,7 @@ int ObHashJoinOp::read_right_operate()
 {
   int ret = OB_SUCCESS;
   if (first_get_row_) {
+    SemanticSuspendScope build_scope(MY_SPEC.type_);
     int tmp_ret = OB_SUCCESS;
     bool need_not_read_right = false;
     if (HJProcessor::NEST_LOOP == hj_processor_) {
@@ -4091,8 +4178,17 @@ int ObHashJoinOp::read_right_operate()
         }
       }
     }
+    if (OB_SUCC(ret) && MY_SPEC.semantic_suspend_) {
+      // The legacy path finalizes the build after fetching the first probe batch.
+      if (OB_FAIL(check_semantic_suspend_mode())) {
+      } else if (!postprocessed_left_ && OB_FAIL(recursive_postprocess())) {
+        LOG_WARN("failed to complete hash build before semantic probe", K(ret));
+      }
+    }
   }
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret) && MY_SPEC.semantic_suspend_
+      && OB_FAIL(check_semantic_suspend_mode())) {
+  } else if (OB_SUCC(ret)) {
     if (is_vectorized()) {
       if (OB_FAIL((this->*get_next_right_batch_func_)())) {
       } else if (right_brs_->size_ == 0 && right_brs_->end_) {
@@ -4280,7 +4376,9 @@ int ObHashJoinOp::finish_dump(bool for_left, bool need_dump, bool force /* false
     for (int64_t i = 0; i < part_count_ && OB_SUCC(ret); i ++) {
       if (force) {
         // finish dump if there was no previous dump, it will not force a dump, so we need to dump first
-        if (OB_FAIL(part_array[i].dump(true, INT64_MAX))) {
+        if (MY_SPEC.semantic_suspend_) {
+          ret = unsupported_semantic_suspend("semantic row-async INNER HASH JOIN forced spill");
+        } else if (OB_FAIL(part_array[i].dump(true, INT64_MAX))) {
         } else if (cur_dumped_partition_ >= i) {
           cur_dumped_partition_ = i - 1;
         }
@@ -5440,8 +5538,35 @@ int ObHashJoinOp::fill_left_end()
 
 int ObHashJoinOp::inner_get_next_batch(const int64_t max_row_cnt)
 {
-  max_output_cnt_ = min(max_row_cnt, MY_SPEC.max_batch_size_);
-  return inner_get_next_row();
+  int ret = MY_SPEC.semantic_suspend_ ? semantic_suspend_error_ : OB_SUCCESS;
+  lib::RequestAwait *await = lib::RequestAwait::current();
+  if (OB_FAIL(ret)) {
+  } else if (MY_SPEC.semantic_suspend_ && nullptr != await && await->owns(&ctx_)
+      && OB_FAIL(await->cancel_ret())) {
+  } else if (MY_SPEC.semantic_suspend_ && OB_FAIL(check_semantic_suspend_mode())) {
+  } else {
+    max_output_cnt_ = min(max_row_cnt, MY_SPEC.max_batch_size_);
+    ret = inner_get_next_row();
+  }
+  if (MY_SPEC.semantic_suspend_ && OB_FAIL(ret)) {
+    brs_.size_ = 0;
+    brs_.end_ = false;
+    await = lib::RequestAwait::current();
+    if (nullptr != await && await->owns(&ctx_) && OB_SUCCESS != await->cancel_ret()) {
+      ret = await->cancel_ret();
+    }
+    if (!is_semantic_suspended(ret)) {
+      if (OB_EAGAIN == ret) {
+        const int mode_ret = check_semantic_suspend_mode();
+        ret = OB_SUCCESS == mode_ret ? OB_ERR_UNEXPECTED : mode_ret;
+        LOG_WARN("hash join suspended outside its probe fetch contract", K(ret),
+                 K(state_), K(first_get_row_), K(postprocessed_left_), K(right_selector_cnt_));
+      }
+      semantic_suspend_error_ = ret;
+      LOG_WARN("semantic hash join failed", K(ret), K(state_), K(hj_state_));
+    }
+  }
+  return ret;
 }
 
 int ObHashJoinOp::read_hashrow_batch_for_left_semi_anti()

@@ -3,8 +3,9 @@
 All model work uses held loopback fixtures. Auto may reorder a region before
 a full sort, but must preserve final SQL order and projection demand after
 LIMIT. Strict unordered and default ordered behavior keep their contracts.
-Only simple single-input derived tables are admitted, not CTE/materialization
-or derived ORDER BY/LIMIT, joins, grouping, DISTINCT, windows or PX.
+Ordinary hash aggregation/DISTINCT and restricted INNER HASH JOIN are tested
+separately. CTE/materialization, derived ORDER BY/LIMIT, ordered aggregates,
+unsupported join/aggregate algorithms, windows and PX remain excluded.
 """
 
 import argparse
@@ -355,16 +356,19 @@ class SemanticOutputPolicyContracts(rank.SemanticRankContracts):
         sources = (
             "(SELECT id,prompt FROM cache_inputs LIMIT 1) a",
             "(SELECT id,prompt FROM cache_inputs ORDER BY id) a",
-            "(SELECT id,MAX(prompt) AS prompt FROM cache_inputs GROUP BY id) a",
-            "(SELECT DISTINCT id,prompt FROM cache_inputs) a",
-            "cache_inputs a JOIN cache_right b ON a.id=b.join_id",
+            "(SELECT id,GROUP_CONCAT(prompt ORDER BY id) AS prompt FROM cache_inputs GROUP BY id) a",
+            "(SELECT DISTINCT id,prompt FROM cache_inputs LIMIT 1) a",
+            "cache_inputs a LEFT JOIN cache_right b ON a.id=b.join_id",
+            "cache_inputs a,cache_right b",
+            "cache_inputs a JOIN cache_right b ON 1=1",
         )
         statements = [self.statement(fields, source=source) for source in sources]
         statements.extend([
             self.statement("a.id"),
-            self.statement("DISTINCT " + self.call("map")),
+            self.statement("COUNT(DISTINCT " + self.rank() + ")"),
             self.statement("AVG(" + self.rank() + ")"),
-            self.statement("a.guard_flag," + self.call("map"), suffix="GROUP BY a.guard_flag,a.prompt"),
+            self.statement("a.guard_flag," + self.call("map"),
+                           suffix="GROUP BY a.guard_flag,a.prompt WITH ROLLUP"),
             self.statement(fields + ",ROW_NUMBER() OVER (ORDER BY a.id)"),
             self.statement(fields + ",(SELECT MAX(row_id) FROM cache_right)"),
             self.statement(fields, suffix="FOR UPDATE"),

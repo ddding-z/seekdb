@@ -17,7 +17,9 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "sql/engine/aggregate/ob_hash_distinct_op.h"
+#include "sql/engine/basic/ob_semantic_runtime.h"
 #include "sql/engine/px/ob_px_util.h"
+#include "lib/worker.h"
 
 namespace oceanbase
 {
@@ -41,6 +43,7 @@ ObHashDistinctOp::ObHashDistinctOp(ObExecContext &exec_ctx, const ObOpSpec &spec
     iter_end_(false),
     child_op_is_end_(false),
     need_init_(true),
+    batch_spilled_(false),
     get_next_row_func_(nullptr),
     profile_(ObSqlWorkAreaType::HASH_WORK_AREA),
     sql_mem_processor_(profile_, op_monitor_info_),
@@ -99,6 +102,8 @@ void ObHashDistinctOp::reset()
 {
   first_got_row_ = true;
   has_got_part_ = false;
+  child_op_is_end_ = false;
+  batch_spilled_ = false;
   group_cnt_ = 0;
   hp_infras_.reset();
   bypass_ctrl_.reset();
@@ -289,16 +294,39 @@ int ObHashDistinctOp::build_distinct_data_for_batch(const int64_t batch_size, bo
       clear_evaluated_flag();
       if (child_op_is_end_) {
         finish_turn = true;
-      } else if (OB_FAIL(child_->get_next_batch(batch_size, child_brs))) {
-      } else if (OB_FAIL(hp_infras_.calc_hash_value_for_batch(MY_SPEC.distinct_exprs_,
-                                                              child_brs->size_,
-                                                              child_brs->skip_,
-                                                              hash_values_for_batch_))) {
       } else {
-        //child_op_is_end_ means last batch data is return, finish_turn means no data to process
-        child_op_is_end_ = child_brs->end_ && (child_brs->size_ != 0);
-        finish_turn = child_brs->end_ && (0 == child_brs->size_);
-        read_rows = child_brs->size_;
+        lib::RequestAwait *await = lib::RequestAwait::current();
+        const bool can_suspend = supports_semantic_suspend();
+        if (nullptr != await && await->owns(&ctx_) && OB_FAIL(await->cancel_ret())) {
+          LOG_WARN("hash distinct input collection cancelled", K(ret));
+        } else if (OB_FAIL(try_check_status())) {
+        } else {
+          {
+            SemanticSuspendScope fetch_scope(MY_SPEC.type_, false, can_suspend);
+            ret = child_->get_next_batch(batch_size, child_brs);
+          }
+          await = lib::RequestAwait::current();
+          if (nullptr != await && await->owns(&ctx_) && OB_SUCCESS != await->cancel_ret()) {
+            ret = await->cancel_ret();
+          } else if (OB_EAGAIN == ret && can_suspend && nullptr != await
+                     && await->owns(&ctx_) && await->is_pending()) {
+            brs_.size_ = 0;
+            brs_.end_ = false;
+            return ret;
+          }
+        }
+        SemanticSuspendScope hash_scope(MY_SPEC.type_);
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(hp_infras_.calc_hash_value_for_batch(MY_SPEC.distinct_exprs_,
+                                                                child_brs->size_,
+                                                                child_brs->skip_,
+                                                                hash_values_for_batch_))) {
+        } else {
+          //child_op_is_end_ means last batch data is return, finish_turn means no data to process
+          child_op_is_end_ = child_brs->end_ && (child_brs->size_ != 0);
+          finish_turn = child_brs->end_ && (0 == child_brs->size_);
+          read_rows = child_brs->size_;
+        }
       }
     } else if (OB_FAIL(hp_infras_.get_left_next_batch(MY_SPEC.distinct_exprs_,
                                                       batch_size,
@@ -312,6 +340,7 @@ int ObHashDistinctOp::build_distinct_data_for_batch(const int64_t batch_size, bo
         LOG_WARN("failed to get next batch from hp infra", K(ret));
       }
     }
+    SemanticSuspendScope store_scope(MY_SPEC.type_);
     if (OB_SUCC(ret) && finish_turn) {
       ret = OB_SUCCESS;
       finish_turn = false;
@@ -362,6 +391,8 @@ int ObHashDistinctOp::build_distinct_data_for_batch(const int64_t batch_size, bo
       group_cnt_ += got_rows;
       got_batch = (got_rows != 0);
     }
+    batch_spilled_ = batch_spilled_ || hp_infras_.has_left_dumped()
+        || hp_infras_.has_dumped_partitions();
   }
   if (OB_ITER_END == ret) {
     ret = OB_SUCCESS;
@@ -468,6 +499,7 @@ int ObHashDistinctOp::do_unblock_distinct_for_batch(const int64_t batch_size)
 {
   int ret = OB_SUCCESS;
   if (first_got_row_) {
+    SemanticSuspendScope init_scope(MY_SPEC.type_);
     if (OB_FAIL(init_hash_partition_infras_for_batch())) {
     }
     first_got_row_ = false;
@@ -577,6 +609,14 @@ int ObHashDistinctOp::do_block_distinct_for_batch(const int64_t batch_size) {
   }
 
   return ret;
+}
+
+bool ObHashDistinctOp::supports_semantic_suspend() const
+{
+  return is_vectorized() && !MY_SPEC.is_block_mode_ && !MY_SPEC.by_pass_enabled_
+      && !MY_SPEC.is_push_down_ && !bypass_ctrl_.by_pass_ && !batch_spilled_ && !has_got_part_
+      && (first_got_row_ || hp_infras_.get_hash_store_mem_limit() == INT64_MAX)
+      && GCONF._chunk_row_store_mem_limit == 0;
 }
 
 int ObHashDistinctOp::inner_get_next_row()

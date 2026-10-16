@@ -54,7 +54,7 @@ public:
   inline void set_algo_type(AggregateAlgo type) { algo_ = type; }
   inline AggregateAlgo get_algo() const { return algo_; }
   inline void set_block_mode(bool is_block_mode) { is_block_mode_ = is_block_mode; }
-  inline bool get_block_mode() { return is_block_mode_; }
+  inline bool get_block_mode() const { return is_block_mode_; }
   virtual int est_cost() override;
   virtual int est_width() override;
   virtual int do_re_est_cost(EstimateCostInfo &param, double &card, double &op_cost, double &cost) override;

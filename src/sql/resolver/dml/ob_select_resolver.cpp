@@ -27,6 +27,7 @@
 #include "sql/resolver/cmd/ob_load_data_stmt.h"
 #include "sql/engine/expr/ob_expr_regexp_context.h"
 #include "sql/engine/expr/ob_json_param_type.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_semantic.h"
 #include "sql/parser/ob_parser_utils.h"
 
 #include "sql/executor/ob_memory_tracker.h"
@@ -40,26 +41,80 @@ namespace sql
 
 namespace
 {
-int check_semantic_auto_select(const ObSelectStmt &stmt, bool derived = false)
+int check_semantic_auto_select(const ObSelectStmt &stmt, bool derived = false);
+
+int check_semantic_auto_join_key(const ObRawExpr &expr, bool &has_key)
 {
   int ret = OB_SUCCESS;
-  const TableItem *source = stmt.get_table_size() == 1 ? stmt.get_table_item(0) : nullptr;
-  if (!stmt.is_single_table_stmt() || nullptr == source ||
-      stmt.is_set_stmt() || stmt.has_group_by() || stmt.get_aggr_item_size() != 0 ||
-      stmt.has_having() || stmt.has_distinct() || stmt.has_window_function() ||
-      stmt.has_for_update() || stmt.has_select_into() || stmt.get_subquery_expr_size() != 0 ||
-      stmt.get_cte_definition_size() != 0 || (derived && (stmt.has_order_by() || stmt.has_limit()))) {
-    ret = OB_NOT_SUPPORTED;
-  } else if (source->is_basic_table()) {
-  } else if (source->is_generated_table() && source->cte_type_ == TableItem::NOT_CTE &&
-             !source->is_view_table_ && nullptr != source->ref_query_) {
-    ret = SMART_CALL(check_semantic_auto_select(*source->ref_query_, true));
+  if ((expr.get_expr_type() == T_OP_EQ || expr.get_expr_type() == T_OP_NSEQ) &&
+      expr.get_param_count() == 2 && nullptr != expr.get_param_expr(0) &&
+      nullptr != expr.get_param_expr(1)) {
+    has_key = !expr.get_param_expr(0)->is_const_expr() && !expr.get_param_expr(1)->is_const_expr();
+  } else if (expr.get_expr_type() == T_OP_AND) {
+    for (int64_t index = 0; OB_SUCC(ret) && !has_key && index < expr.get_param_count(); ++index) {
+      if (nullptr != expr.get_param_expr(index)) {
+        ret = SMART_CALL(check_semantic_auto_join_key(*expr.get_param_expr(index), has_key));
+      }
+    }
+  }
+  return ret;
+}
+
+int check_semantic_auto_source(const TableItem &source)
+{
+  int ret = OB_SUCCESS;
+  if (source.is_basic_table()) {
+  } else if (source.is_generated_table() && source.cte_type_ == TableItem::NOT_CTE &&
+             !source.is_view_table_ && nullptr != source.ref_query_) {
+    ret = SMART_CALL(check_semantic_auto_select(*source.ref_query_, true));
+  } else if (source.is_joined_table()) {
+    const auto &join = static_cast<const JoinedTable &>(source);
+    bool has_key = false;
+    for (int64_t index = 0; OB_SUCC(ret) && !has_key && index < join.get_join_conditions().count(); ++index) {
+      const ObRawExpr *condition = join.get_join_conditions().at(index);
+      if (nullptr != condition) {
+        ret = check_semantic_auto_join_key(*condition, has_key);
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (!join.is_inner_join() || !has_key ||
+        nullptr == join.left_table_ || nullptr == join.right_table_) {
+      ret = OB_NOT_SUPPORTED;
+    } else if (OB_FAIL(SMART_CALL(check_semantic_auto_source(*join.left_table_)))) {
+    } else {
+      ret = SMART_CALL(check_semantic_auto_source(*join.right_table_));
+    }
   } else {
     ret = OB_NOT_SUPPORTED;
   }
+  return ret;
+}
+
+int check_semantic_auto_select(const ObSelectStmt &stmt, bool derived)
+{
+  int ret = OB_SUCCESS;
+  const TableItem *source = nullptr;
+  if (stmt.get_from_item_size() == 1) {
+    const FromItem &from = stmt.get_from_item(0);
+    source = from.is_joined_ ? stmt.get_joined_table(from.table_id_) :
+        stmt.get_table_item_by_id(from.table_id_);
+  }
+  if (nullptr == source || stmt.is_set_stmt() || stmt.has_rollup() || stmt.has_window_function() ||
+      stmt.has_for_update() || stmt.has_select_into() || stmt.get_subquery_expr_size() != 0 ||
+      stmt.get_cte_definition_size() != 0 || (derived && (stmt.has_order_by() || stmt.has_limit()))) {
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    ret = check_semantic_auto_source(*source);
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && index < stmt.get_aggr_item_size(); ++index) {
+    const ObAggFunRawExpr *aggregate = stmt.get_aggr_item(index);
+    if (nullptr == aggregate || !SemanticExprUtils::supports_unordered_aggregate(*aggregate)) {
+      ret = OB_NOT_SUPPORTED;
+    }
+  }
   if (ret == OB_NOT_SUPPORTED) {
     LOG_USER_ERROR(OB_NOT_SUPPORTED,
-                   "automatic semantic output supports a single-table SELECT with ordering, LIMIT or simple derived inputs; derived inputs must not contain ordering or LIMIT");
+                   "automatic semantic output supports serial ordinary hash aggregation, hash DISTINCT, INNER HASH JOIN and simple derived inputs; aggregate DISTINCT/ORDER BY, rollup and derived ordering/LIMIT are not supported");
     LOG_WARN("unsupported automatic semantic statement boundary", K(ret), K(derived));
   }
   return ret;

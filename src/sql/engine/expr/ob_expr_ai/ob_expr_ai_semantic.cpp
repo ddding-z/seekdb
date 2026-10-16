@@ -762,6 +762,19 @@ bool SemanticExprUtils::supports_row_async(const ObRawExpr &expr)
           expr.get_expr_type() == T_FUN_SYS_AI_RANK) && semantic_static_call(expr, true);
 }
 
+bool SemanticExprUtils::supports_unordered_aggregate(const ObRawExpr &expr)
+{
+  bool supported = expr.is_aggr_expr() &&
+      (expr.get_expr_type() == T_FUN_COUNT || expr.get_expr_type() == T_FUN_SUM ||
+       expr.get_expr_type() == T_FUN_AVG || expr.get_expr_type() == T_FUN_MIN ||
+       expr.get_expr_type() == T_FUN_MAX);
+  if (supported) {
+    const auto &aggregate = static_cast<const ObAggFunRawExpr &>(expr);
+    supported = !aggregate.is_param_distinct() && aggregate.get_order_items().empty();
+  }
+  return supported;
+}
+
 int SemanticExprUtils::prepare_join_proxy_input(const ObExpr &expr, ObEvalCtx &ctx,
                                                MultimodeAlloctor &allocator,
                                                ObString &left, ObString &right)

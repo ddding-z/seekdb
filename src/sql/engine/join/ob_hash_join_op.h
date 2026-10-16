@@ -269,6 +269,16 @@ public:
   bool is_adaptive_;
   // placeholder
   ExprFixedArray left_join_row_;
+  bool semantic_suspend_;
+
+  bool supports_semantic_suspend() const
+  {
+    return semantic_suspend_ && max_batch_size_ > 0 && INNER_JOIN == join_type_
+        && !is_naaj_ && !is_sna_ && !is_shared_ht_ && !is_adaptive_
+        && !equal_join_conds_.empty() && all_join_keys_.count() > 0
+        && 0 == all_join_keys_.count() % 2
+        && all_join_keys_.count() == all_hash_funcs_.count();
+  }
 };
 
 // hash join has no expression result overwrite problem:
@@ -784,6 +794,7 @@ public:
   virtual int inner_drain_exch() override;
   virtual int inner_get_next_row() override;
   virtual int inner_get_next_batch(const int64_t max_row_cnt) override;
+  virtual bool supports_semantic_suspend() const override;
   virtual void destroy() override;
   virtual int inner_close() override;
 
@@ -793,6 +804,9 @@ public:
   }
 
 private:
+  int check_semantic_suspend_mode() const;
+  int unsupported_semantic_suspend(const char *reason) const;
+  bool is_semantic_suspended(int ret) const;
   void calc_cache_aware_partition_count();
   int recursive_postprocess();
   int insert_batch_row(const int64_t cur_partition_in_memory);
@@ -1262,6 +1276,7 @@ private:
   bool skip_left_null_;
   bool skip_right_null_;
   ObChunkDatumStore::IterationAge iter_age_;
+  int semantic_suspend_error_;
 };
 
 inline int ObHashJoinOp::init_mem_context()

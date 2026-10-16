@@ -189,12 +189,13 @@ EXPLAIN shows both the effective `row_async` mode and
 | `SORT_RESTORES_ORDER` | `UNORDERED_READY` below an ordinary full sort/exact Top-N |
 | `FINAL_SQL_ORDER` | `ORDERED_PREFIX` in the final order-preserving region |
 
-P2 admits serial single-input MAP/FILTER/RANK plans, ordinary full sort,
+The initial P2 scope admits serial single-input MAP/FILTER/RANK plans, ordinary full sort,
 exact Top-N, LIMIT and simple derived scans. The resolver checks original
 query-block boundaries before rewrites. Derived inputs must have no ORDER BY
 or LIMIT; stored views, CTEs/materialization, scalar subqueries, JOIN,
 grouping/aggregates, DISTINCT, windows, sets, locking/output SELECT and PX are
-not in the auto scope. Prefix/local-merge/partition sorts, WITH TIES,
+not in that initial scope; the P3 extension below adds verified hash relational
+boundaries. Prefix/local-merge/partition sorts, WITH TIES,
 approximate Top-K and pushed Top-N filters fail explicitly. Both merged
 derived inputs and retained vectorized SUBPLAN SCAN are covered; a retained
 scan suspends only before consuming child output, not midway through its
@@ -240,6 +241,196 @@ Final P1/P2 Debug validation:
   insertion bypassing early plan admission before the final fix. Both EXPLAIN
   and SELECT now reject it before model work; ordered mode and explicit
   filter-disabled auto exact Top-N remain covered positive controls.
+
+## Relational Automatic Output Boundaries (P3)
+
+The extension is to **row-async/auto plan eligibility**, not new SQL syntax or
+a claim that ordinary GROUP BY/JOIN were previously unexecutable. Default
+batch and ordered paths keep their existing contracts. Strict `unordered`
+keeps its original single-base-table scope; use explicit `auto` for these
+verified relational plans.
+
+### Ordinary hash aggregation
+
+```sql
+SELECT /*+ PARALLEL(1) USE_HASH_AGGREGATION
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','auto') */
+       movie_id, AVG(AI_RANK('judge_model', review_text)) AS average_score
+FROM reviews
+GROUP BY movie_id
+ORDER BY average_score DESC, movie_id
+LIMIT 10;
+```
+
+Ordinary COUNT/SUM/AVG/MIN/MAX hash aggregation accepts unordered semantic
+input. Aggregate DISTINCT, aggregate ORDER BY, rollup, AI_AGG, adaptive/
+pushed/three-stage aggregation and scalar/merge aggregation are not included.
+Simple HAVING and late semantic projections retain their existing demand
+placement. Hash aggregation is a blocking boundary: allowing its child to
+advance does not make final groups available before collection is complete.
+
+### Streaming Hash DISTINCT
+
+Top-level streaming hash DISTINCT can consume materialized semantic values without
+requiring input order. SQL duplicates are removed by the relational operator,
+not by incorrectly merging model calls: with the function cache disabled,
+separate demanded source rows still call models separately. Blocking, merge or
+pushed DISTINCT are not admitted by AUTO or treated as resumable equivalents.
+
+Group By and streaming DISTINCT reevaluate suspension capability on each child
+pull. Dynamic spill switches to protected inline waiting inside the operator;
+this is not asynchronous spill support or a change of output/cache policy.
+Allocation, spill I/O, model, deadline and cancellation errors still propagate.
+Both the live forced chunk-store override and the store's captured memory limit
+are checked: resetting the dynamic global override does not retroactively make
+an already-initialized forced-limit store resumable.
+
+Grouping and DISTINCT retain SQL null/collation rules. A chosen representative
+among collation-equivalent values is not a stable source-row identity. As with
+ordinary unordered SQL aggregation, floating SUM/AVG rounding can depend on
+input order; auto is not a bitwise floating-point reproducibility option.
+
+### Restricted INNER HASH JOIN
+
+AUTO admits ordinary serial INNER equijoins with a relational build input
+and eligible semantic probe input, or semantic operators above the join.
+The build subtree must contain no native semantic stage. Use appropriate
+LEADING/USE_HASH/NO_SWAP_JOIN_INPUTS hints when an actual hash plan and relational
+build side are required; a nested-loop or merge alternative is not silently
+relabeled as supported hash execution. This phase validates constructed physical
+paths; it does not yet prune every unsupported candidate and search for another
+eligible alternative automatically.
+Outer/semi/anti joins, cross products, shared/PX joins, parameterized rescans,
+late materialization and join runtime filters are not in this first scope.
+This does not expand native AI_JOIN.
+
+The default-false physical join flag is enabled only for admitted AUTO plans.
+Pure build/hash-table completion precedes the first semantic probe pull; only a
+fresh probe fetch can suspend. Bucket traversal and output assembly stay
+protected. This first scope excludes disk partition replay, dumped partitions,
+cache-aware processing and nested-loop hash-join processing. Unlike guarded
+aggregation spill, reaching an unsupported flagged join state is an explicit
+SQL error, not an inline-wait claim of supported asynchronous spilling.
+
+Join multiplicity remains normal SQL bag multiplicity. The policy pass does
+not move a model call from per-source-row to per-pair demand, or vice versa.
+Projection after relational ORDER BY/LIMIT only calls models for selected
+pairs. A hash join provides no inherited input-order promise; explicit
+sorting restores final SQL order.
+
+EXPLAIN adds input-region reasons:
+
+| Reason | Meaning |
+| --- | --- |
+| `HASH_AGGREGATE_INPUT` | Ordinary hash aggregation does not require ordered input |
+| `HASH_DISTINCT_INPUT` | Hash DISTINCT does not require ordered input |
+| `HASH_JOIN_PROBE` | The admitted hash join can consume an unordered probe region |
+
+The resolver still checks original query-block boundaries before rewriting.
+Simple derived relational blocks are admitted, but inner ORDER BY/LIMIT,
+CTE/materialization, stored views, scalar subqueries, windows, sets and
+locking/output SELECT remain excluded. Physical-path checks apply as well:
+permitting a SQL shape is not permission to unwind every implementation.
+After semantic placement the selected plan is checked again and effective
+ordering is recomputed, so lifting cannot leave stale stage policies.
+
+Focused deterministic SQL entry points:
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_relational_aggregate.py \
+  --binary build_debug/bin/src/observer/seekdb
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_relational_join.py \
+  --binary build_debug/bin/src/observer/seekdb
+```
+
+Provider failures, cancellation and deadline remain final SQL errors,
+including after any visible prefix. No new coroutine framework, model-result
+cache policy, query-wide request credit or specialized semantic Top-K pruning
+is introduced.
+
+### Reproducible asynchronous microbenchmark
+
+`benchmark_semantic_async.py` uses only the loopback TEXT fixture. It compares
+default batch, ordered row-async, strict unordered and auto with the same batch/
+slot limits and serial DOP. Its five cases cover all-row MAP, MAP after relational
+ORDER BY/LIMIT, FILTER/MAP/LIMIT, exact RANK sort and exact RANK Top-N.
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/benchmark_semantic_async.py --list-cases
+python tools/deploy/mysql_test/test_suite/ai_function/benchmark_semantic_async.py --self-test
+python tools/deploy/mysql_test/test_suite/ai_function/benchmark_semantic_async.py \
+  --binary build_debug/bin/src/observer/seekdb --run-label local_fixture \
+  --rows 19 --limit 3 --offset 1 --first-k 3 \
+  --batch-rows 8 --slots 2 --repeats 2 \
+  --fast-delay-ms 15 --slow-delay-ms 150 --query-timeout-s 20 \
+  --output /tmp/semantic-async-smoke.json \
+  --log-dir /tmp/semantic-async-smoke-logs
+```
+
+Output and log paths must be fresh: existing paths are rejected, and versioned
+JSON publication is atomic/no-clobber. Inputs, scores, selectivity and latency
+assignments are deterministic; no random seed or independent concurrency knob
+is needed. Omitting case/mode selectors records 17 supported combinations and
+three intentionally unsupported unordered/ORDER BY combinations.
+
+Measurements use an actual SSCursor: first returned row, first K rows, complete
+EOF time, returned rows, model requests and observed provider peak concurrency.
+First-K timing is null if fewer than K rows return. Exact bags/order and request
+demand are validated where comparable. Unordered FILTER/MAP/LIMIT may select a
+different legal subset, so this case is not eligible for an exact-answer speedup
+claim. Fixture timings are not real-model SemBench performance/quality results;
+memory, cancellation credits and unobserved resource counters are not invented.
+
+### P3 verification snapshot
+
+The coordinated Debug build and final private-deployment runs passed:
+
+| Coverage | Passed |
+| --- | ---: |
+| Ordinary aggregation / streaming DISTINCT | 18 |
+| Restricted INNER HASH JOIN | 23 |
+| FILE row-async, including the three new relational compositions | 21 |
+| AUTO output policy | 22 |
+| Existing ordered / strict unordered | 20 / 22 |
+| Native RANK / default semantic runtime | 27 / 39 |
+| Native input / aggregate eligibility | 25 |
+| Native resources / hash capabilities / captured store limits | 24 cases, twice (48 executions) |
+| Benchmark service-free tests | 16 |
+| Final benchmark SQL trials | 17 supported combinations, twice (34 trials) |
+
+The SQL contract suites total 192 methods. FILE compositions were also run with
+`enable_semantic_lift='true'`, including a fresh three-gate deployment, to verify
+post-placement input-region reasons, SQL visibility and exact demand. Join
+coverage includes nullable NSEQ keys, nested hash joins, carried large semantic
+datums through duplicate chains, grouped RANK follow-up, empty builds, errors
+after visible rows, kill/deadline/recovery, and unchanged legacy execution.
+
+A real serial-plan negative control caught an invalid runtime guard:
+`is_use_px()` is set unconditionally by codegen and is not proof of actual PX
+execution. The corrected guard uses physical DOP and the absence of an SQC
+handler, alongside logical/physical admission and all mode/state/spill checks.
+Both text and FILE positives were rerun after that correction.
+
+Final fixture observations below use 19 rows, two repeats, batch 8, slots 2,
+15/150 ms fast/slow replies and first-K=3. Values are observed medians in ms:
+
+| Case | Default first row | AUTO first row | Default total | AUTO total |
+| --- | ---: | ---: | ---: | ---: |
+| MAP all rows | 337.42 | 29.84 | 337.57 | 337.00 |
+| MAP after relational LIMIT | 169.28 | 33.90 | 169.32 | 169.14 |
+| FILTER/MAP/LIMIT, different allowed subsets | 330.01 | 56.35 | 330.05 | 75.35 |
+| RANK exact sort | 333.18 | 338.75 | 333.37 | 338.93 |
+| RANK exact Top-N | 334.31 | 337.08 | 334.35 | 337.12 |
+
+The main demonstrated benefit is earlier visible progress, not a universal total
+runtime reduction. FILTER/LIMIT timings are descriptive only: default/ordered
+selected IDs {0,3,6}, unordered/auto selected {3,6,9}. Each relational-LIMIT MAP
+trial made exactly three MAP calls; both RANK cases scored all 19 candidates.
+Across the 34 trials, 550 HTTP attempts were audited. Unsupported combinations
+have no samples; observed outstanding responses at EOF are not cancellation
+counts. Private services, model sockets, gates and worker cleanup passed.
+No sanitizer, real-model quality, asynchronous spilling or PX expansion is claimed.
 
 ## Opt-in Unordered Ready-Row Output
 

@@ -690,6 +690,7 @@ public:
   }
   int64_t get_hash_table_size() const { return hash_table_.size(); }
   int64_t get_hash_store_mem_used() const { return preprocess_part_.store_.get_mem_used(); }
+  int64_t get_hash_store_mem_limit() const { return preprocess_part_.store_.get_mem_limit(); }
   void set_push_down() { is_push_down_ = true; }
   int process_dump(bool is_block, bool &full_by_pass);
   int extend_hash_table_l3()

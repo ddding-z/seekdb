@@ -1603,7 +1603,8 @@ bool ObHashGroupByOp::supports_semantic_suspend() const
       && !aggr_processor_.has_distinct() && !aggr_processor_.has_order_by()
       && !force_dump_ && !dump_started_ && !use_distinct_data_
       && nullptr == batch_collection_.cur_part_ && batch_collection_.part_cnt_ == 0
-      && nullptr == batch_collection_.bloom_filter_ && dumped_group_parts_.is_empty();
+      && nullptr == batch_collection_.bloom_filter_ && dumped_group_parts_.is_empty()
+      && group_store_.get_mem_limit() == 0 && GCONF._chunk_row_store_mem_limit == 0;
 }
 
 int ObHashGroupByOp::finish_batch_collection(bool dump_success)

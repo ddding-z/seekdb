@@ -937,7 +937,19 @@ int ObStaticEngineCG::generate_spec(
   spec.is_push_down_ = op.is_push_down();
   int64_t init_count = op.get_distinct_exprs().count();
   spec.by_pass_enabled_ = (op.is_push_down() && !op.force_push_down());
-  if (1 != op.get_num_of_child()) {
+  ObOptParamHint::SemanticOutputPolicy policy = ObOptParamHint::SemanticOutputPolicy::ORDERED;
+  if (OB_ISNULL(opt_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing optimizer context for hash DISTINCT", K(ret));
+  } else if (OB_FAIL(opt_ctx_->get_global_hint().opt_params_.get_semantic_output_policy(policy))) {
+    LOG_WARN("failed to read hash DISTINCT semantic output policy", K(ret));
+  } else if (policy == ObOptParamHint::SemanticOutputPolicy::AUTO &&
+             (spec.is_block_mode_ || spec.by_pass_enabled_ || spec.is_push_down_)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "automatic semantic output does not support blocking, bypass or pushed hash DISTINCT");
+  }
+  if (OB_FAIL(ret)) {
+  } else if (1 != op.get_num_of_child()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected child count of hash distinct", K(ret), K(op.get_num_of_child()));
   } else if (OB_FAIL(spec.cmp_funcs_.init(init_count))) {
@@ -3825,6 +3837,26 @@ int ObStaticEngineCG::generate_spec(ObLogGroupBy &op, ObHashGroupBySpec &spec,
       }
     }
   }
+  if (OB_SUCC(ret)) {
+    ObOptParamHint::SemanticOutputPolicy policy = ObOptParamHint::SemanticOutputPolicy::ORDERED;
+    if (OB_ISNULL(opt_ctx_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing optimizer context for hash aggregation", K(ret));
+    } else if (OB_FAIL(opt_ctx_->get_global_hint().opt_params_.get_semantic_output_policy(policy))) {
+      LOG_WARN("failed to read hash aggregation semantic output policy", K(ret));
+    } else if (policy == ObOptParamHint::SemanticOutputPolicy::AUTO) {
+      bool supported = !spec.by_pass_enabled_ &&
+          spec.aggr_stage_ == ObThreeStageAggrStage::NONE_STAGE;
+      for (int64_t index = 0; supported && index < spec.aggr_infos_.count(); ++index) {
+        supported = !spec.aggr_infos_.at(index).has_distinct_ &&
+            !spec.aggr_infos_.at(index).has_order_by_;
+      }
+      if (!supported) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "automatic semantic output requires ordinary hash aggregation without bypass, DISTINCT or aggregate ordering");
+      }
+    }
+  }
   return ret;
 }
 
@@ -4154,6 +4186,25 @@ int ObStaticEngineCG::generate_spec(ObLogJoin &op, ObHashJoinSpec &spec, const b
   spec.is_shared_ht_ = HASH_JOIN == op.get_join_algo()
                     && DIST_BC2HOST_NONE == op.get_join_distributed_method();
   OZ (generate_join_spec(op, spec));
+  if (OB_SUCC(ret)) {
+    ObOptParamHint::SemanticOutputPolicy policy = ObOptParamHint::SemanticOutputPolicy::ORDERED;
+    if (OB_ISNULL(opt_ctx_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing optimizer context for hash join", K(ret));
+    } else if (OB_FAIL(opt_ctx_->get_global_hint().opt_params_.get_semantic_output_policy(policy))) {
+      LOG_WARN("failed to read hash join semantic output policy", K(ret));
+    } else if (policy == ObOptParamHint::SemanticOutputPolicy::AUTO) {
+      spec.semantic_suspend_ = true;
+      if (!spec.supports_semantic_suspend() || op.get_parallel() != 1 ||
+          op.is_late_mat() || op.enable_px_batch_rescan() || !op.get_nl_params().empty() ||
+          op.get_equal_join_conditions().empty() || !op.get_join_filter_infos().empty()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "automatic semantic output requires ordinary serial vectorized INNER HASH JOIN");
+        LOG_WARN("unsupported automatic hash join spec", K(ret), K(spec.max_batch_size_),
+                 K(spec.is_adaptive_), K(spec.is_shared_ht_), K(spec.is_naaj_), K(spec.is_sna_));
+      }
+    }
+  }
   return ret;
 }
 
