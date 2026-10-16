@@ -20,7 +20,8 @@ public:
         owned_exprs_(allocator), local_exprs_(allocator),
         shared_exprs_(allocator), carried_exprs_(allocator),
         query_task_count_(1), filter_expr_count_(0), row_async_enabled_(false), memoized_exprs_(allocator),
-        proxy_configs_(allocator), output_order_(SemanticOutputOrder::INPUT_ORDER) {}
+        proxy_configs_(allocator), output_order_(SemanticOutputOrder::INPUT_ORDER),
+        execution_scope_(SemanticExecutionScope::SERIAL) {}
   common::ObFixedArray<ObExpr *, common::ObIAllocator> expressions_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> semantic_exprs_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> owned_exprs_;
@@ -35,6 +36,7 @@ public:
   common::ObFixedArray<ObExpr *, common::ObIAllocator> memoized_exprs_;
   common::ObFixedArray<SemanticProxyConfig, common::ObIAllocator> proxy_configs_;
   SemanticOutputOrder output_order_;
+  SemanticExecutionScope execution_scope_;
   bool unordered_output() const { return output_order_ == SemanticOutputOrder::READY_ORDER; }
   bool has_embedding_proxy() const
   {

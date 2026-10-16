@@ -37,6 +37,7 @@ public:
   virtual int open(ObExecContext &ctx) = 0;
   virtual int get_next_row(ObExecContext &ctx, const common::ObNewRow *&row) = 0;
   virtual int close(ObExecContext &ctx) = 0;
+  virtual bool is_output_batch_exhausted() const { return false; }
 };
 
 class ObExecuteResult : public ObIExecuteResult
@@ -51,6 +52,7 @@ public:
   virtual int open(ObExecContext &ctx) override;
   virtual int get_next_row(ObExecContext &ctx, const common::ObNewRow *&row) override;
   virtual int close(ObExecContext &ctx) override;
+  bool is_output_batch_exhausted() const override;
 
   inline int get_err_code() { return err_code_; }
 

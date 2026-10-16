@@ -22,6 +22,7 @@
 #include "sql/engine/px/ob_px_worker_stat.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
 #include "sql/engine/px/exchange/ob_px_transmit_op.h"
+#include "sql/engine/basic/ob_semantic_op.h"
 #include "sql/engine/basic/ob_temp_table_insert_op.h"
 #include "sql/engine/join/ob_hash_join_op.h"
 #include "sql/engine/pdml/static/ob_px_multi_part_insert_op.h"
@@ -52,8 +53,145 @@ ObPxTaskProcess::~ObPxTaskProcess()
 {
 }
 
+namespace
+{
+bool is_semantic_spec(const ObOpSpec &op)
+{
+  return PHY_SEMANTIC_MAP == op.type_ || PHY_SEMANTIC_FILTER == op.type_ ||
+      PHY_SEMANTIC_RANK == op.type_ || PHY_SEMANTIC_JOIN == op.type_;
+}
+
+bool requires_row_async(const ObOpSpec &op)
+{
+  bool required = false;
+  if (is_semantic_spec(op)) {
+    const SemanticSpec &semantic = static_cast<const SemanticSpec &>(op);
+    required = semantic.row_async_enabled_ ||
+        SemanticExecutionScope::SERIAL != semantic.execution_scope_;
+  }
+  for (int64_t index = 0; !required && index < op.get_child_cnt(); ++index) {
+    const ObOpSpec *child = op.get_child(index);
+    required = nullptr != child && requires_row_async(*child);
+  }
+  return required;
+}
+
+bool is_text_semantic_input(const ObExpr *input)
+{
+  bool supported = nullptr != input;
+  if (supported && ob_is_string_type(input->datum_meta_.type_)) {
+  } else if (supported &&
+             (T_FUN_SYS_AI_INPUT == input->type_ || T_OP_ROW == input->type_)) {
+    supported = input->arg_cnt_ > 0 && nullptr != input->args_;
+    for (uint32_t index = 0; supported && index < input->arg_cnt_; ++index) {
+      supported = nullptr != input->args_[index] &&
+          ob_is_string_type(input->args_[index]->datum_meta_.type_);
+    }
+  } else if (supported && T_FUN_SYS_CAST == input->type_ &&
+             2 == input->arg_cnt_ && nullptr != input->args_ &&
+             nullptr != input->args_[0] &&
+             (T_FUN_SYS_AI_INPUT == input->args_[0]->type_ ||
+              T_OP_ROW == input->args_[0]->type_)) {
+    supported = is_text_semantic_input(input->args_[0]);
+  } else {
+    supported = false;
+  }
+  return supported;
+}
+}
+
+bool ObPxTaskProcess::supports_row_async(const ObOpSpec &root)
+{
+  bool supported = PHY_PX_REDUCE_TRANSMIT == root.type_ &&
+      root.max_batch_size_ > 0 && 1 == root.get_child_cnt();
+  const ObOpSpec *op = nullptr;
+  if (supported) {
+    const ObPxTransmitSpec &transmit = static_cast<const ObPxTransmitSpec &>(root);
+    supported = transmit.is_no_repart_exchange() && !transmit.is_slave_mapping() &&
+        transmit.filters_.empty() &&
+        ObPxSampleType::NOT_INIT_SAMPLE_TYPE == transmit.sample_type_ &&
+        transmit.sampling_saving_row_.empty() && nullptr == transmit.tablet_id_expr_ &&
+        nullptr == transmit.random_expr_ && nullptr == transmit.ddl_slice_id_expr_ &&
+        nullptr == transmit.wf_hybrid_aggr_status_expr_ &&
+        transmit.wf_hybrid_pby_exprs_cnt_array_.empty() && !transmit.is_wf_hybrid_ &&
+        !transmit.need_null_aware_shuffle_;
+    op = supported ? root.get_child() : nullptr;
+  }
+  bool has_semantic = false;
+  while (supported && nullptr != op &&
+         (PHY_SEMANTIC_MAP == op->type_ || PHY_SEMANTIC_FILTER == op->type_ ||
+          PHY_SEMANTIC_RANK == op->type_)) {
+    const SemanticSpec &semantic = static_cast<const SemanticSpec &>(*op);
+    supported = op->max_batch_size_ > 0 && 1 == op->get_child_cnt() &&
+        semantic.row_async_enabled_ &&
+        SemanticExecutionScope::LOCAL_PX_WORKER == semantic.execution_scope_ &&
+        SemanticOutputOrder::READY_ORDER == semantic.output_order_ &&
+        !semantic.has_embedding_proxy() && !semantic.semantic_exprs_.empty();
+    for (int64_t index = 0; supported && index < semantic.semantic_exprs_.count(); ++index) {
+      const ObExpr *expr = semantic.semantic_exprs_.at(index);
+      supported = nullptr != expr &&
+          (T_FUN_SYS_AI_MAP == expr->type_ || T_FUN_SYS_AI_FILTER == expr->type_ ||
+           T_FUN_SYS_AI_RANK == expr->type_) &&
+          (2 == expr->arg_cnt_ || 3 == expr->arg_cnt_) && nullptr != expr->args_ &&
+          nullptr != expr->args_[0] && is_text_semantic_input(expr->args_[1]) &&
+          (2 == expr->arg_cnt_ || nullptr != expr->args_[2]);
+    }
+    has_semantic = true;
+    op = supported ? op->get_child() : nullptr;
+  }
+  bool has_gi = false;
+  while (supported && nullptr != op && PHY_GRANULE_ITERATOR == op->type_) {
+    const ObGranuleIteratorSpec &gi = static_cast<const ObGranuleIteratorSpec &>(*op);
+    supported = op->max_batch_size_ > 0 && 1 == op->get_child_cnt() &&
+        op->filters_.empty() && !gi.partition_wise_join_ && !gi.access_all_ &&
+        !gi.nlj_with_param_down_ && gi.pw_dml_tsc_ids_.empty() &&
+        nullptr == gi.tablet_id_expr_;
+    has_gi = true;
+    op = supported ? op->get_child() : nullptr;
+  }
+  return supported && has_semantic && has_gi && nullptr != op && PHY_TABLE_SCAN == op->type_ &&
+      op->max_batch_size_ > 0 && 0 == op->get_child_cnt();
+}
+
+int ObPxTaskProcess::validate_row_async(const ObPxInitTaskArgs &arg)
+{
+  int ret = OB_SUCCESS;
+  if (nullptr != arg.op_spec_root_ && requires_row_async(*arg.op_spec_root_)) {
+    if (nullptr == arg.sqc_handler_ || nullptr == arg.exec_ctx_ ||
+        nullptr == arg.sqc_task_ptr_ || !supports_row_async(*arg.op_spec_root_)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("unsupported row async PX task or operator path", K(ret), K(arg.task_));
+    } else {
+      ObPxSqcMeta &sqc = arg.sqc_handler_->get_sqc_init_arg().sqc_;
+      const int64_t task_count = sqc.get_task_count();
+      if (1 != sqc.get_sqc_count() || !sqc.adjoining_root_dfo() ||
+          sqc.is_fulltree() || arg.task_.is_fulltree_ ||
+          task_count <= 0 || sqc.get_total_task_count() != task_count ||
+          arg.task_.get_task_id() < 0 || arg.task_.get_task_id() >= task_count ||
+          static_cast<uint64_t>(arg.task_.get_execution_id()) != sqc.get_execution_id() ||
+          arg.task_.get_qc_id() != sqc.get_qc_id() ||
+          arg.task_.get_dfo_id() != sqc.get_dfo_id() ||
+          arg.task_.get_sqc_id() != sqc.get_sqc_id() ||
+          arg.sqc_task_ptr_->get_task_id() != arg.task_.get_task_id() ||
+          arg.task_.is_use_local_thread_ || sqc.transmit_use_interm_result() ||
+          sqc.recieve_use_interm_result() ||
+          !sqc.get_serial_receive_channels().empty() ||
+          sqc.get_receive_channel_msg().has_filled_channel() ||
+          0 != sqc.get_rescan_batch_params().get_count()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("row async requires a local leaf SQC gathering directly to QC",
+                 K(ret), K(arg.task_), K(task_count), K(sqc));
+      }
+    }
+  }
+  return ret;
+}
+
 bool ObPxTaskProcess::supports_resumable(const ObPxInitTaskArgs &arg)
 {
+  if (nullptr != arg.op_spec_root_ && requires_row_async(*arg.op_spec_root_)) {
+    return OB_SUCCESS == validate_row_async(arg);
+  }
   bool supported = nullptr != arg.op_spec_root_ && nullptr != arg.sqc_handler_ &&
       PHY_PX_REDUCE_TRANSMIT == arg.op_spec_root_->type_ &&
       arg.op_spec_root_->max_batch_size_ > 0 && 1 == arg.op_spec_root_->get_child_cnt() &&
@@ -93,7 +231,8 @@ bool ObPxTaskProcess::supports_resumable(const ObPxInitTaskArgs &arg)
 
 bool ObPxTaskProcess::is_suspended(int ret) const
 {
-  return OB_EAGAIN == ret && nullptr != await_ && await_->is_pending();
+  return OB_EAGAIN == ret && nullptr != await_ && await_->owns(arg_.exec_ctx_) &&
+      await_->is_pending();
 }
 
 namespace
@@ -184,6 +323,7 @@ int ObPxTaskProcess::run()
 int ObPxTaskProcess::process()
 {
   int ret = OB_SUCCESS;
+  int execution_ret = OB_SUCCESS;
   common::ob_setup_default_tsi_warning_buffer();
   common::ob_reset_tsi_warning_buffer();
   const bool first_slice = !execution_started_;
@@ -245,6 +385,7 @@ int ObPxTaskProcess::process()
 
       if (OB_FAIL(do_process())) {
       }
+      execution_ret = ret;
       // Monitoring item statistics end
       if (!is_suspended(ret)) {
         exec_end_timestamp_ = ObTimeUtility::current_time();
@@ -355,6 +496,9 @@ int ObPxTaskProcess::process()
     }
   }
   release();
+  if (OB_SUCCESS != execution_ret) {
+    ret = execution_ret;
+  }
   return ret;
 }
 
@@ -396,12 +540,13 @@ int ObPxTaskProcess::execute(const ObOpSpec &root_spec)
     }
     CK(IS_PX_TRANSMIT(root_spec.get_type()));
     if (nullptr != await_) {
-      if (!supports_resumable(arg_) || !root->is_vectorized()) {
+      if (!await_->owns(&ctx) || !supports_resumable(arg_) || !root->is_vectorized()) {
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("unsupported resumable PX operator path", K(ret), K(root_spec.type_));
       } else if (OB_FAIL(await_->cancel_ret())) {
       } else if (!root_opened_) {
-        static_cast<ObPxTransmitOp *>(root)->enable_resumable();
+        static_cast<ObPxTransmitOp *>(root)->enable_resumable(
+            supports_row_async(root_spec));
         root_opened_ = true;
         if (OB_FAIL(root->open())) {
           if (is_suspended(ret)) {
@@ -416,6 +561,11 @@ int ObPxTaskProcess::execute(const ObOpSpec &root_spec)
       if (OB_SUCCESS == ret && await_->is_pending()) {
         ret = OB_ERR_UNEXPECTED;
         LOG_ERROR("PX operator recorded an await without returning pending",
+                  K(ret), K(root_spec.type_));
+      }
+      if (OB_EAGAIN == ret && !is_suspended(ret)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("PX operator returned pending without an owned await",
                   K(ret), K(root_spec.type_));
       }
       if (is_suspended(ret)) {
@@ -469,8 +619,10 @@ int ObPxTaskProcess::execute(const ObOpSpec &root_spec)
         ret = OB_SUCCESS == ret ? tmp_ret : ret;
         LOG_WARN("failed to apply error code", K(ret), K(tmp_ret));
       }
-      if (OB_SUCCESS != (tmp_ret = ObInterruptUtil::interrupt_tasks(arg_.get_sqc_handler()->get_sqc_init_arg().sqc_,
-                                              OB_GOT_SIGNAL_ABORTING))) {
+      const int interrupt_code = supports_row_async(root_spec) ? ret : OB_GOT_SIGNAL_ABORTING;
+      if (OB_SUCCESS != (tmp_ret = ObInterruptUtil::interrupt_tasks(
+              arg_.get_sqc_handler()->get_sqc_init_arg().sqc_, interrupt_code))) {
+        LOG_WARN("interrupt failed PX task peers failed", K(ret), K(tmp_ret));
       }
     }
     if (OB_SUCCESS != (close_ret = root->close())) {
@@ -498,6 +650,11 @@ int ObPxTaskProcess::do_process()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid task id from sqc", K(ret));
   } else if (OB_FAIL(check_inner_stat())) {
+  } else if (OB_FAIL(validate_row_async(arg_))) {
+  } else if (nullptr != arg_.op_spec_root_ && requires_row_async(*arg_.op_spec_root_) &&
+             (nullptr == await_ || !await_->owns(arg_.exec_ctx_))) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("row async PX task requires its own continuation", K(ret), K(arg_.task_));
   } else {
     // 1. Build execution environment
     //   - reference sql/executor/ob_worker_session_guard.cpp
@@ -588,6 +745,10 @@ int ObPxTaskProcess::do_process()
     }
   }
 
+  if (OB_EAGAIN == ret && !is_suspended(ret)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("PX task returned pending without an owned await", K(ret), K(arg_.task_));
+  }
   if (is_suspended(ret)) {
     const int warning_ret = record_user_error_msg(OB_SUCCESS);
     if (OB_SUCCESS != warning_ret) {

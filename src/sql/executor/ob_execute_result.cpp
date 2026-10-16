@@ -93,6 +93,18 @@ int ObExecuteResult::close(ObExecContext &ctx)
   return ret;
 }
 
+bool ObExecuteResult::is_output_batch_exhausted() const
+{
+  const ObBatchRows *batch = br_it_.get_brs();
+  bool exhausted = nullptr != batch;
+  if (nullptr != batch) {
+    for (int64_t row = br_it_.cur_idx() + 1; exhausted && row < batch->size_; ++row) {
+      exhausted = !batch->all_rows_active_ && batch->skip_->at(row);
+    }
+  }
+  return exhausted;
+}
+
 int ObExecuteResult::open() const
 {
   int ret = OB_SUCCESS;

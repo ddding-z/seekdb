@@ -21,6 +21,7 @@
 #include "sql/engine/basic/ob_ai_func_op.h"
 #include "sql/optimizer/ob_log_semantic.h"
 #include "sql/engine/basic/ob_semantic_op.h"
+#include "sql/engine/px/ob_px_task_process.h"
 #include "sql/optimizer/ob_log_group_by.h"
 #include "sql/optimizer/ob_log_sort.h"
 #include "sql/optimizer/ob_log_limit.h"
@@ -115,6 +116,48 @@ using namespace share::schema;
 namespace sql
 {
 
+namespace
+{
+int find_semantic_px_row_scope(const ObOpSpec &spec, bool &present)
+{
+  int ret = OB_SUCCESS;
+  if (spec.type_ == PHY_SEMANTIC_MAP || spec.type_ == PHY_SEMANTIC_FILTER ||
+      spec.type_ == PHY_SEMANTIC_RANK) {
+    const auto &semantic = static_cast<const SemanticSpec &>(spec);
+    present = present || (semantic.row_async_enabled_ &&
+        semantic.execution_scope_ == SemanticExecutionScope::LOCAL_PX_WORKER);
+  }
+  for (uint32_t index = 0; OB_SUCC(ret) && index < spec.get_child_cnt(); ++index) {
+    if (OB_ISNULL(spec.get_child(index))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing physical semantic execution scope input", K(ret));
+    } else {
+      ret = SMART_CALL(find_semantic_px_row_scope(*spec.get_child(index), present));
+    }
+  }
+  return ret;
+}
+
+int validate_semantic_px_row_plan(const ObOpSpec &root, const ObPhysicalPlan &plan)
+{
+  int ret = OB_SUCCESS;
+  bool present = false;
+  if (!root.has_row_async_semantic_operator()) {
+  } else if (OB_FAIL(find_semantic_px_row_scope(root, present))) {
+  } else if (present || plan.get_px_dop() > 1) {
+    if (!present || root.type_ != PHY_PX_FIFO_COORD || root.get_child_cnt() != 1 ||
+        nullptr == root.get_child(0) ||
+        !ObPxTaskProcess::supports_row_async(*root.get_child(0))) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "local PX row asynchronous execution requires a verified FIFO Gather producer pipeline");
+      LOG_WARN("unsupported physical local PX row asynchronous plan", K(ret),
+               "root_type", root.type_, "location_type", plan.get_location_type(),
+               "dop", plan.get_px_dop(), K(present));
+    }
+  }
+  return ret;
+}
+}
 struct ObFilterTSC
 {
 };
@@ -158,6 +201,7 @@ int ObStaticEngineCG::generate(const ObLogPlan &log_plan, ObPhysicalPlan &phy_pl
     phy_plan.set_root_op_spec(root_spec);
     phy_plan.set_is_use_auto_dop(opt_ctx_->is_use_auto_dop());
     if (OB_FAIL(set_properties_post(log_plan, phy_plan))) {
+    } else if (OB_FAIL(validate_semantic_px_row_plan(*root_spec, phy_plan))) {
     }
   }
   return ret;
@@ -1100,17 +1144,22 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
   spec.query_task_count_ = op.query_task_count();
   spec.row_async_enabled_ = op.row_async_enabled();
   spec.output_order_ = op.output_order();
+  spec.execution_scope_ = op.execution_scope();
   spec.filter_expr_count_ = (op.get_type() == log_op_def::LOG_SEMANTIC_FILTER ||
                             op.get_type() == log_op_def::LOG_SEMANTIC_JOIN)
       ? op.expressions().count() : 0;
   if (OB_SUCC(ret) && spec.row_async_enabled_ &&
-      (op.get_parallel() != 1 ||
+      ((spec.execution_scope_ == SemanticExecutionScope::SERIAL && op.get_parallel() != 1) ||
+       (spec.execution_scope_ == SemanticExecutionScope::LOCAL_PX_WORKER &&
+        (op.get_parallel() < 1 || !spec.unordered_output() || op.has_embedding_proxy())) ||
+       (spec.execution_scope_ != SemanticExecutionScope::SERIAL &&
+        spec.execution_scope_ != SemanticExecutionScope::LOCAL_PX_WORKER) ||
        (op.get_type() != log_op_def::LOG_SEMANTIC_MAP &&
         op.get_type() != log_op_def::LOG_SEMANTIC_FILTER &&
         op.get_type() != log_op_def::LOG_SEMANTIC_RANK))) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED,
-                   "row asynchronous execution requires serial MAP/FILTER/RANK stages");
+                   "row asynchronous execution requires serial stages or verified unordered local PX TEXT stages");
   } else if (OB_SUCC(ret) && !op.proxy_configs().empty() &&
       op.proxy_configs().count() != op.semantic_exprs().count()) {
     ret = OB_ERR_UNEXPECTED;
@@ -1119,6 +1168,16 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "embedding proxy V0 requires serial execution");
   } else if (OB_SUCC(ret) && OB_FAIL(spec.proxy_configs_.assign(op.proxy_configs()))) {
+  }
+  for (int64_t index = 0; OB_SUCC(ret) &&
+       spec.execution_scope_ == SemanticExecutionScope::LOCAL_PX_WORKER &&
+       index < op.semantic_exprs().count(); ++index) {
+    const ObRawExpr *call = op.semantic_exprs().at(index);
+    if (nullptr == call || !SemanticExprUtils::supports_row_async(*call) ||
+        !SemanticExprUtils::supports_function_cache(*call)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "local PX row asynchronous execution supports static TEXT MAP/FILTER/RANK calls only");
+    }
   }
   for (int64_t index = 0; OB_SUCC(ret) && index < spec.proxy_configs_.count(); ++index) {
     SemanticProxyConfig &config = spec.proxy_configs_.at(index);

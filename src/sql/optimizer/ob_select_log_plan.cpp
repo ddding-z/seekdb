@@ -5463,6 +5463,144 @@ int check_semantic_output_plan(const ObLogicalOperator &node, bool automatic)
   return ret;
 }
 
+bool semantic_px_gather_exchange(const ObLogExchange &exchange)
+{
+  return exchange.is_pq_local() && !exchange.is_repart_exchange() &&
+      !exchange.is_merge_sort() && !exchange.is_task_order() &&
+      !exchange.is_sort_local_order() && !exchange.is_slave_mapping() &&
+      exchange.get_px_batch_op_id() == OB_INVALID_ID &&
+      exchange.get_filter_exprs().empty() && exchange.get_startup_exprs().empty() &&
+      exchange.get_pushdown_filter_exprs().empty() && exchange.get_num_of_child() == 1;
+}
+
+int check_semantic_px_row_pipeline(ObLogicalOperator &root, bool final)
+{
+  int ret = OB_SUCCESS;
+  ObLogicalOperator *node = &root;
+  const char *unsupported = "local PX row asynchronous execution requires a simple TEXT MAP/FILTER/RANK producer and unordered Gather";
+  // seekdb uses DISTRIBUTED for local multi-tablet sharding; launch validates the actual SQC topology.
+  if (node->get_type() == LOG_EXCHANGE) {
+    const auto &receive = static_cast<const ObLogExchange &>(*node);
+    // QC/rescan annotation is assigned later; final codegen requires the FIFO coordinator.
+    if (!receive.is_consumer() || !semantic_px_gather_exchange(receive)) {
+      ret = OB_NOT_SUPPORTED;
+      unsupported = !receive.is_consumer()
+          ? "local PX row asynchronous execution requires a root QC Gather"
+          : "local PX row asynchronous execution requires an ordinary unordered Gather receiver";
+    } else {
+      node = node->get_child(0);
+      if (nullptr == node || node->get_type() != LOG_EXCHANGE) {
+        ret = OB_NOT_SUPPORTED;
+        unsupported = "local PX row asynchronous execution requires a Gather transmitter below its receiver";
+      } else {
+        const auto &transmit = static_cast<const ObLogExchange &>(*node);
+        if (!transmit.is_producer() || !semantic_px_gather_exchange(transmit)) {
+          ret = OB_NOT_SUPPORTED;
+          unsupported = "local PX row asynchronous execution requires an ordinary no-repartition Gather transmitter";
+        } else {
+          node = node->get_child(0);
+        }
+      }
+    }
+  } else if (final) {
+    ret = OB_NOT_SUPPORTED;
+    unsupported = "local PX row asynchronous execution requires the selected plan to have a root Gather";
+  }
+  bool present = false;
+  while (OB_SUCC(ret) && nullptr != node &&
+         (node->get_type() == LOG_SEMANTIC_MAP || node->get_type() == LOG_SEMANTIC_FILTER ||
+          node->get_type() == LOG_SEMANTIC_RANK)) {
+    auto &stage = static_cast<LogSemantic &>(*node);
+    if (stage.get_num_of_child() != 1 || stage.get_parallel() < 1 ||
+        stage.has_embedding_proxy()) {
+      ret = OB_NOT_SUPPORTED;
+      unsupported = "local PX row asynchronous execution requires unary positive-DOP stages without embedding proxies";
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && index < stage.semantic_exprs().count(); ++index) {
+      const ObRawExpr *call = stage.semantic_exprs().at(index);
+      if (nullptr == call || !SemanticExprUtils::supports_row_async(*call) ||
+          !SemanticExprUtils::supports_function_cache(*call)) {
+        ret = OB_NOT_SUPPORTED;
+        unsupported = "local PX row asynchronous execution requires static TEXT MAP/FILTER/RANK calls";
+      }
+    }
+    if (OB_SUCC(ret)) {
+      present = true;
+      stage.set_execution_scope(SemanticExecutionScope::LOCAL_PX_WORKER);
+      node = node->get_child(0);
+    }
+  }
+  while (OB_SUCC(ret) && nullptr != node && node->get_type() == LOG_GRANULE_ITERATOR) {
+    if (node->get_num_of_child() != 1) {
+      ret = OB_NOT_SUPPORTED;
+      unsupported = "local PX row asynchronous execution requires unary scan granules";
+    } else {
+      node = node->get_child(0);
+    }
+  }
+  if (OB_SUCC(ret) && (!present || nullptr == node || node->get_type() != LOG_TABLE_SCAN ||
+                       node->get_num_of_child() != 0)) {
+    ret = OB_NOT_SUPPORTED;
+    unsupported = !present
+        ? "local PX row asynchronous execution requires a worker semantic stage"
+        : "local PX row asynchronous execution requires a single base-table scan below its semantic stages";
+  }
+  if (ret == OB_NOT_SUPPORTED) {
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, unsupported);
+    LOG_WARN("unsupported local PX semantic pipeline", K(ret), K(final), K(unsupported),
+             "operator", nullptr == node ? nullptr : node->get_name());
+  }
+  return ret;
+}
+
+int set_semantic_execution_scope(ObLogicalOperator &node, SemanticExecutionScope scope)
+{
+  int ret = OB_SUCCESS;
+  if (node.get_type() == LOG_SEMANTIC_MAP || node.get_type() == LOG_SEMANTIC_FILTER ||
+      node.get_type() == LOG_SEMANTIC_RANK) {
+    static_cast<LogSemantic &>(node).set_execution_scope(scope);
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && index < node.get_num_of_child(); ++index) {
+    if (OB_ISNULL(node.get_child(index))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing semantic execution scope input", K(ret));
+    } else {
+      ret = SMART_CALL(set_semantic_execution_scope(*node.get_child(index), scope));
+    }
+  }
+  return ret;
+}
+
+int check_semantic_row_async_plan(ObLogicalOperator &root, const ObSelectStmt &stmt,
+                                 ObOptParamHint::SemanticOutputPolicy policy,
+                                 bool final, bool &local_px)
+{
+  int ret = OB_SUCCESS;
+  bool serial = true;
+  local_px = false;
+  if (OB_FAIL(check_solo_plan(&root, serial))) {
+  } else if (serial) {
+    if (policy != ObOptParamHint::SemanticOutputPolicy::ORDERED &&
+        OB_FAIL(check_semantic_output_plan(root, policy == ObOptParamHint::SemanticOutputPolicy::AUTO))) {
+    } else {
+      ret = set_semantic_execution_scope(root, SemanticExecutionScope::SERIAL);
+    }
+  } else if (policy != ObOptParamHint::SemanticOutputPolicy::AUTO) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "parallel row asynchronous execution requires semantic_output_order='auto'");
+    LOG_WARN("unsupported parallel semantic output policy", K(ret), K(policy));
+  } else if (nullptr == stmt.get_query_ctx() ||
+             !stmt.get_query_ctx()->semantic_px_row_async_eligible_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "parallel row asynchronous execution requires an original single-base-table SELECT without ordering, LIMIT, grouping, DISTINCT or subqueries");
+    LOG_WARN("unsupported original parallel semantic statement", K(ret));
+  } else if (OB_FAIL(check_semantic_px_row_pipeline(root, final))) {
+  } else {
+    local_px = true;
+  }
+  return ret;
+}
+
 int assign_semantic_auto_output(ObLogicalOperator &node, bool ordered, const char *reason)
 {
   int ret = OB_SUCCESS;
@@ -5484,6 +5622,10 @@ int assign_semantic_auto_output(ObLogicalOperator &node, bool ordered, const cha
   } else if (node.get_type() == LOG_JOIN) {
     ordered = false;
     reason = "HASH_JOIN_PROBE";
+  } else if (node.get_type() == LOG_EXCHANGE &&
+             static_cast<const ObLogExchange &>(node).is_producer()) {
+    ordered = false;
+    reason = "PX_GATHER_INPUT";
   }
   for (int64_t index = 0; OB_SUCC(ret) && index < node.get_num_of_child(); ++index) {
     ObLogicalOperator *child = node.get_child(index);
@@ -5693,6 +5835,7 @@ public:
       LOG_WARN("failed to read semantic output order", K(ret));
     }
     ObSEArray<ObRawExpr *, 16> calls;
+    bool local_px = false;
     for (LogSemantic *stage : stages_) {
       if (OB_SUCC(ret)) {
         ret = append_array_no_dup(calls, stage->semantic_exprs());
@@ -5715,14 +5858,11 @@ public:
       group->set_semantic_query_task_count(calls.count());
     }
     if (OB_SUCC(ret) && row_async_enabled && bind_proxy) {
-      bool serial = true;
       if (!aggregate_stages_.empty()) {
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "row asynchronous execution does not support AI_AGG");
-      } else if (OB_FAIL(check_solo_plan(&root, serial))) {
-      } else if (!serial) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "row asynchronous execution requires serial execution");
+      } else if (OB_FAIL(check_semantic_row_async_plan(
+          root, *plan_.get_stmt(), policy, false, local_px))) {
       }
       for (int64_t index = 0; OB_SUCC(ret) && index < calls.count(); ++index) {
         const ObRawExpr &call = *calls.at(index);
@@ -5732,14 +5872,11 @@ public:
                          "row asynchronous execution supports static text or FILE MAP/FILTER/RANK calls only");
         }
       }
-      if (OB_SUCC(ret) && policy != ObOptParamHint::SemanticOutputPolicy::ORDERED) {
-        ret = check_semantic_output_plan(root, policy == ObOptParamHint::SemanticOutputPolicy::AUTO);
-      }
     }
     if (OB_SUCC(ret) && policy == ObOptParamHint::SemanticOutputPolicy::AUTO) {
       const bool ordered = bind_proxy && !before_sort && plan_.get_stmt()->has_order_by();
       ret = assign_semantic_auto_output(root, ordered,
-          ordered ? "FINAL_SQL_ORDER" : "NO_ORDER_REQUIREMENT");
+          local_px ? "PX_GATHER_INPUT" : ordered ? "FINAL_SQL_ORDER" : "NO_ORDER_REQUIREMENT");
     }
     if (OB_SUCC(ret) && proxy_enabled && bind_proxy) {
       bool serial = true;
@@ -6152,13 +6289,11 @@ int ObSelectLogPlan::place_semantic_stages()
   } else if (OB_ISNULL(root)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("missing selected plan for semantic placement", K(ret));
-  } else if ((proxy_enabled || row_async_enabled) &&
+  } else if (proxy_enabled &&
              OB_FAIL(check_solo_plan(root, serial))) {
-  } else if ((proxy_enabled || row_async_enabled) && !serial) {
+  } else if (proxy_enabled && !serial) {
     ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, proxy_enabled
-        ? "embedding proxy V0 requires serial execution"
-        : "row asynchronous execution requires serial execution");
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "embedding proxy V0 requires serial execution");
   } else if (!enabled) {
   } else if (semantic_plan_present(*root)) {
     // Select before mutation: candidate plans can share operator subtrees.
@@ -6186,15 +6321,17 @@ int ObSelectLogPlan::place_semantic_stages()
   }
   if (OB_SUCC(ret) && row_async_enabled && nullptr != root) {
     ObOptParamHint::SemanticOutputPolicy policy = ObOptParamHint::SemanticOutputPolicy::ORDERED;
+    bool local_px = false;
     if (OB_FAIL(get_optimizer_context().get_global_hint().opt_params_
         .get_semantic_output_policy(policy))) {
       LOG_WARN("failed to read final semantic output policy", K(ret));
+    } else if (OB_FAIL(check_semantic_row_async_plan(
+        *root, *get_stmt(), policy, true, local_px))) {
+      LOG_WARN("selected plan is outside row asynchronous execution capabilities", K(ret));
     } else if (policy == ObOptParamHint::SemanticOutputPolicy::AUTO) {
       const bool ordered = get_stmt()->has_order_by();
-      if (OB_FAIL(check_semantic_output_plan(*root, true))) {
-        LOG_WARN("selected plan is outside automatic semantic output capabilities", K(ret));
-      } else if (OB_FAIL(assign_semantic_auto_output(*root, ordered,
-          ordered ? "FINAL_SQL_ORDER" : "NO_ORDER_REQUIREMENT"))) {
+      if (OB_FAIL(assign_semantic_auto_output(*root, ordered,
+          local_px ? "PX_GATHER_INPUT" : ordered ? "FINAL_SQL_ORDER" : "NO_ORDER_REQUIREMENT"))) {
         LOG_WARN("failed to refresh semantic output policies after placement", K(ret));
       }
     }

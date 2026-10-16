@@ -15,11 +15,11 @@
 | 全局 SOLO | 收齐当前 AI 阶段的全部输入，完成一次列重排和行重排后才提交模型请求 |
 | AI_MAP / AI_FILTER | 显式逻辑和物理算子；独立表达式并发、依赖感知的跨批推进、严格布尔过滤 |
 | AI_RANK | SemBench 逐行数值评分；原生 DOUBLE，普通 SQL 完成排序、Top-K 和分组平均，见第 19 节 |
-| 可选行间异步 | 串行文本 MAP/FILTER/RANK 逐请求发布、脏行推进、有序前缀输出；默认关闭，见第 18 节 |
+| 可选行间异步 | 串行 TEXT/FILE MAP/FILTER/RANK 逐请求发布、脏行推进；AUTO 还支持受限本地 PX 文本流水线，默认关闭，见第 18、21、24 节 |
 | 可选无序输出 | 显式 unordered 策略，完成行及后续槽可先交付、非队首槽独立复用；首版限单基表串行文本流水线，见第 20 节 |
 | AI_JOIN | INNER JOIN ON 的显式语义连接；普通 SQL 候选对生成加有界异步判断，不做近似候选裁剪 |
 | AI_AGG | 真正跨行的文本聚合；SQL 分组、小组一次调用、有界确定性归约及共享异步运行时 |
-| 语义 PX | 经校验的 reduce-transmit / semantic / GI / scan 路径保留任务状态并释放物理 worker；同一查询共享预算 |
+| 语义 PX | 经校验的 reduce-transmit / semantic / GI / scan 路径保留任务状态并释放物理 worker；AUTO 文本行间异步接通 Gather 与客户端增量交付，同一查询共享预算，见第 24 节 |
 
 旧 AI Function 与 SOLO、AI_MAP / AI_FILTER / AI_JOIN、可恢复 PX 及原生 FILE 实现均已提交；下文保留旧路径的维护约束，不应把旧 SOLO 的单 worker 限制套到新接口上。
 
@@ -1663,3 +1663,122 @@ default/ordered 选中 {0,3,6}，unordered/auto 选中 {3,6,9}，只能描述时
 评分全部 19 个候选。34 trials 审计了 550 次 HTTP attempt；不支持组合没有
 样本，EOF 时仍有 outstanding response 不等于取消计数。私有服务、模型 socket、
 gate 和 worker 清理通过。未宣称 sanitizer、真实模型质量、异步 spill 或 PX 扩展。
+
+## 24. 本地多 SQL worker 的 TEXT 行间异步
+
+本轮接通单机 local PX 的 MAP/FILTER/RANK 行间异步，不引入第二套线程池或
+协程运行时。默认 batch PX 保持原行为；新增范围必须显式同时启用 row-async
+和 AUTO：
+
+```sql
+SELECT /*+ PARALLEL(4)
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','auto')
+           OPT_PARAM('rowsets_max_rows',16) */
+       id, AI_MAP('extractor', content)
+FROM partitioned_documents
+WHERE AI_FILTER('selector', content);
+```
+
+首版计划为单基表、向量化 `FIFO COORDINATOR -> REDUCE TRANSMIT ->
+SEMANTIC MAP/FILTER/RANK -> 可选简单 GI -> TABLE SCAN`。支持静态模型和
+options、纯文本输入、嵌套调用、guard、函数缓存和原生 DOUBLE RANK。
+每个 worker 内按 ready-row 交付；Gather 不承诺输入顺序或全局 HTTP 完成顺序。
+
+EXPLAIN 为语义阶段增加显式作用域：串行 `execution_scope=SERIAL`，新增
+worker 范围为 `execution_scope=LOCAL_PX_WORKER`；后者同时显示
+`row_async=UNORDERED_READY` 和 AUTO 原因 `PX_GATHER_INPUT`。
+仅有 `PARALLEL(4)` 或 EXPLAIN 的 DOP 标签，不证明语义计算实际分布到四个 worker。
+
+### 准入边界和 seekdb 元数据
+
+- 原始 SQL 不得含 ORDER BY、LIMIT、GROUP BY/聚合、DISTINCT、HAVING、
+  JOIN、派生表/view/CTE/子查询、窗口/集合或 locking/output SELECT。
+  resolver 保留查询级原形资格，不让重写删除边界后误放行。
+- FILE、多模态、embedding proxy、原生 AI_JOIN/AI_AGG、repartition/shared
+  hash、access-all 或参数化 GI、未覆盖 rescan、fulltree/inline task
+  不在新范围内；ordered/strict unordered 的 PX 仍不开放。
+- 依次检查逻辑生产者链、生成完毕的物理 FIFO Gather 和实际本地 SQC/task
+  身份。不能只看一个 scope 标签。运行时还要求 RequestAwait 属于该 task 的
+  ExecContext；不支持时明确失败，不静默切回 batch。
+- seekdb 对多个本地 tablet 使用 DISTRIBUTED location/sharding 元数据以保留
+  PX 计划，它不代表请求发往远端；普通逻辑 location 也可能尚未初始化。
+  同样，codegen 无条件设置的 `is_use_px()` 不能证明实际并行。
+- 分区表的 `PARALLEL(1)` 可能仍走 fulltree/inline PX。验收中的 DOP1 是
+  相同 IDs/prompts 的非分区镜像表，不把它包装成一个已验证的 PX producer。
+
+### 私有状态、共享预算与依赖容量
+
+逻辑 task 私有 ExecContext、表达式 frame、槽、ready queue 和游标。恢复可以
+迁移到其他物理 SQL 线程，但不能让其他 task 的 readiness 去求值本 task 的 frame。
+共享的是同一次 execution 的预算、函数缓存和首个 fatal error；关闭函数缓存时，
+QC 仍持有 query lease，避免早结束/晚启动 worker 间丢失资源身份。
+
+查询总 task/wave 上限仍为 `ai_pipeline_slots * distinct semantic-call count`，
+不乘 DOP。新增 worker 范围还把每个物理调用的窗口限制为查询级
+`ai_pipeline_slots`，key 使用稳定的物理 operator ID 和 expression index。
+不能使用物理线程 ID，也不能把不同深度的同模型调用合并为一个额度组。
+
+这解决了实际 SQL gate 暴露的依赖饥饿：四个 worker 原来能用慢 inner 的四个
+wave 占满双调用查询的全部四个 credits，导致一个已完成行的 outer 仍不能发出。
+现在 inner 最多占两个 wave，为下游留出额度；没有提高总预算。cache-on flight
+使用相同记账，二/三级嵌套、外层重用内层模型也必须能推进。
+
+这里计数的是 wave/task，不是每个 HTTP 请求。batch 16、slots 2 的单 MAP
+全扣住 fixture，在串行和 DOP2/4 均恰好观察到 32 个请求；不能据此宣称已有
+通用的逐 HTTP request-credit 机制。
+
+### Producer、QC 和客户端的三段可见性
+
+只在 producer 刷新 DTL 不够，必须接通：
+
+1. task 在自有 semantic await 处挂起时，提交并刷新已复制的 DTL datum buffer，
+   不发送 EOF，不重放已经输出的行。
+2. 通过准入的 FIFO QC 有可用行即可返回部分 batch，不等待凑满请求大小。
+3. MySQL driver 在该输出 batch 真正耗尽时刷新行包，再进行可能阻塞的下一次
+   DTL 拉取；普通完整 batch 不是逐行强制 flush。
+
+不把生产者的 continuation 或 await 指针跨 Exchange 向上传递。已经读到一行
+也不等于查询成功：provider error、kill、deadline、memory overflow 必须保留
+最终 SQL 错误；首行后不能重试整条查询。
+
+### 验证入口和已测范围
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_px_row_async.py \
+  --binary build_debug/bin/src/observer/seekdb \
+  --log-dir /tmp/semantic-px-row-logs
+```
+
+该套件只启动自己拥有的私有数据库，依赖真实 SQC/task/thread 日志和进程清理
+证据，不接受外部 socket。支持 `--list-cases` 和重复 `--case`。
+
+当前同一个 Debug candidate 在两个全新私有部署通过 **14 项 SQL/mock 方法，
+共 28 次执行**，覆盖：
+
+- 同样 256 行与 256 次模型需求的串行/DOP2/DOP4 精确 bag；实际记录到
+  DOP2 的 2 个 task/2 个准备线程、DOP4 的 4 个 task/4 个准备线程；
+  相同预算下扣住请求均为 32，等待时 task slice 静止。
+- 只有一个小结果完成、其余响应和 EOF 均被扣住时，SSCursor 真正读到该行；
+  同样输入的默认 batch 负对照仍被批屏障阻塞。
+- 跨 worker cache 去重、worker gap、下一次查询隔离；cache-off/on 二/三级
+  嵌套和重用模型、guard 不请求无效输入、FILTER 精确剪枝 MAP、DOUBLE RANK。
+- 可见前缀后的 provider error、全部扣住时 kill/deadline、显式 memory
+  overflow、旧响应不释放时的恢复，以及不支持形态的零模型需求。
+
+同一 binary 的既有 SQL 回归 **252 项**也全部通过：
+
+| 回归范围 | 通过项数 |
+| --- | ---: |
+| 默认 local PX | 15 |
+| FILE row-async | 21 |
+| ordered / strict unordered | 20 / 22 |
+| 串行 AUTO | 22 |
+| native RANK / 默认语义运行时 | 27 / 39 |
+| hash 关系聚合 / join | 18 / 23 |
+| query cache / semantic lifting | 16 / 29 |
+
+native 资源 **30 项重复两轮，共 60 次**、native 输入 **25 项**通过。
+新增 native 包括无缓存 QC lease、task 私有轮询/迁移、scope 序列化、物理路径
+白名单、并发 per-call 额度和三级依赖容量。这里不宣称线性 DOP 加速、真实模型
+SemBench 性能/质量、sanitizer、跨节点 PX、异步 spill 或通用并行关系算子覆盖。

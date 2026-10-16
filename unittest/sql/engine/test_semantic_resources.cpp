@@ -40,6 +40,10 @@
 #include "sql/engine/aggregate/ob_hash_distinct_op.h"
 #include "sql/engine/aggregate/ob_hash_groupby_op.h"
 #include "sql/engine/basic/ob_chunk_datum_store.h"
+#include "sql/engine/px/ob_granule_iterator_op.h"
+#include "sql/engine/px/ob_px_task_process.h"
+#include "sql/engine/px/exchange/ob_px_reduce_transmit_op.h"
+#include "sql/engine/table/ob_table_scan_op.h"
 #include "sql/resolver/dml/ob_hint.h"
 #include "sql/session/ob_sql_session_info.h"
 
@@ -427,6 +431,126 @@ void test_concurrent_shared_budget()
   require_equal(ObAIFuncClient::pipeline_buffer_usage(), baseline, "concurrent global accounting balances");
 }
 
+void test_px_task_group_dependency_capacity()
+{
+  constexpr int64_t SLOTS = 2;
+  constexpr int64_t WORKERS = 4;
+  const SemanticTaskGroup inner(7, 0);
+  const SemanticTaskGroup middle(7, 1);
+  const SemanticTaskGroup outer(9, 0);
+  SemanticQueryBudget budget(execution_id(), 64, 3 * SLOTS, true);
+  Gate held;
+  JoiningThreads threads(held);
+  std::atomic<int64_t> admitted{0};
+  std::vector<int> errors(WORKERS, OB_SUCCESS);
+  for (int64_t worker = 0; worker < WORKERS; ++worker) {
+    threads.start([&, worker] {
+      int64_t owned = 0;
+      for (int64_t attempt = 0; attempt <= SLOTS; ++attempt) {
+        const int ret = budget.acquire_task(inner, SLOTS);
+        if (ret == OB_SUCCESS) {
+          ++owned;
+          ++admitted;
+        } else if (ret != OB_EAGAIN) {
+          errors[worker] = ret;
+        }
+      }
+      held.arrive_and_wait();
+      for (int64_t task = 0; task < owned; ++task) {
+        budget.release_task(inner);
+      }
+    });
+  }
+  require(held.wait_for_arrivals(WORKERS), "workers hold all admitted inner waves");
+  require_equal(admitted.load(), SLOTS, "inner capacity is query-wide, not per worker");
+  require(budget.task_available(), "inner waves leave downstream query capacity");
+  require(!budget.task_available(inner, SLOTS), "held inner quota is not runnable");
+  require_equal(budget.acquire_task(inner, SLOTS), OB_EAGAIN, "inner cannot consume downstream capacity");
+  require_equal(budget.acquire_task(inner, 1), OB_ERR_UNEXPECTED, "worker group limits must agree");
+  for (const auto &group : {middle, outer}) {
+    for (int64_t task = 0; task < SLOTS; ++task) {
+      require(budget.task_available(group, SLOTS), "dependent call has reserved window capacity");
+      require_equal(budget.acquire_task(group, SLOTS), OB_SUCCESS, "dependent wave advances past held siblings");
+    }
+    require_equal(budget.acquire_task(group, SLOTS), OB_EAGAIN, "dependent window remains bounded");
+  }
+  require_equal(budget.active_tasks(), 3 * SLOTS, "grouped waves preserve the total query limit");
+  require_equal(budget.acquire_task(), OB_EAGAIN, "ungrouped callers cannot exceed the global limit");
+  for (const auto &group : {middle, outer}) {
+    for (int64_t task = 0; task < SLOTS; ++task) {
+      budget.release_task(group);
+    }
+  }
+  held.release();
+  threads.join();
+  for (int ret : errors) {
+    require_equal(ret, OB_SUCCESS, "grouped worker admission code");
+  }
+  require_equal(budget.active_tasks(), 0, "all worker and dependent credits release exactly once");
+  for (const auto &group : {inner, middle, outer}) {
+    require(budget.task_available(group, SLOTS), "released group capacity is reusable");
+    require_equal(budget.acquire_task(group, SLOTS), OB_SUCCESS, "reuse a released group");
+  }
+  budget.fail(OB_TIMEOUT);
+  require_equal(budget.acquire_task(inner, SLOTS), OB_TIMEOUT, "fatal failure blocks grouped admission");
+  for (const auto &group : {inner, middle, outer}) {
+    budget.release_task(group);
+  }
+  require_equal(budget.active_tasks(), 0, "failed grouped query releases owned credits");
+}
+
+void test_concurrent_px_task_group_accounting()
+{
+  constexpr int64_t GROUPS = 3;
+  constexpr int64_t SLOTS = 2;
+  constexpr int64_t WORKERS = 12;
+  constexpr int64_t ITERATIONS = 1000;
+  SemanticQueryBudget budget(execution_id(), 64, GROUPS * SLOTS, true);
+  Gate start;
+  JoiningThreads threads(start);
+  std::atomic<int64_t> active[GROUPS]{};
+  std::atomic<int64_t> completed{0};
+  std::atomic<bool> overflow{false};
+  std::vector<int> errors(WORKERS, OB_SUCCESS);
+  for (int64_t worker = 0; worker < WORKERS; ++worker) {
+    threads.start([&, worker] {
+      const int64_t index = worker % GROUPS;
+      const SemanticTaskGroup group(11, index);
+      start.arrive_and_wait();
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      for (int64_t iteration = 0; iteration < ITERATIONS; ++iteration) {
+        int ret = OB_EAGAIN;
+        while (ret == OB_EAGAIN && std::chrono::steady_clock::now() < deadline) {
+          ret = budget.acquire_task(group, SLOTS);
+          if (ret == OB_EAGAIN) {
+            std::this_thread::yield();
+          }
+        }
+        if (ret != OB_SUCCESS) {
+          errors[worker] = ret;
+          break;
+        }
+        if (active[index].fetch_add(1) + 1 > SLOTS || budget.active_tasks() > GROUPS * SLOTS) {
+          overflow.store(true);
+        }
+        std::this_thread::yield();
+        active[index].fetch_sub(1);
+        budget.release_task(group);
+        ++completed;
+      }
+    });
+  }
+  require(start.wait_for_arrivals(WORKERS), "all grouped contenders start together");
+  start.release();
+  threads.join();
+  for (int ret : errors) {
+    require_equal(ret, OB_SUCCESS, "concurrent grouped admission status");
+  }
+  require(!overflow.load(), "concurrent group and query limits remain exact");
+  require_equal(completed.load(), WORKERS * ITERATIONS, "all grouped iterations completed");
+  require_equal(budget.active_tasks(), 0, "concurrent grouped cleanup releases every credit");
+}
+
 void test_fatal_failure_and_cleanup_once()
 {
   const int64_t baseline = ObAIFuncClient::pipeline_buffer_usage();
@@ -583,6 +707,88 @@ void test_concurrent_final_execution_state_teardown()
     }
     require_equal(SemanticExecutionState::query_count(), baseline,
                   iteration + "concurrent final teardown removes all query metadata");
+  }
+}
+
+void test_uncached_coordinator_budget_lease()
+{
+  const int64_t baseline = SemanticExecutionState::query_count();
+  const uint64_t id = execution_id();
+  ExecutionFixture coordinator(id);
+  std::shared_ptr<SemanticExecutionState> state;
+  require_equal(SemanticExecutionState::acquire(coordinator.context(), 4096, 2, state, true),
+                OB_SUCCESS, "acquire uncached coordinator resources");
+  coordinator.context().set_semantic_query_budget(state->budget_handle());
+  const std::weak_ptr<SemanticQueryBudget> budget = state->budget_handle();
+  const SemanticQueryBudget *identity = &state->budget();
+  state.reset();
+  require(!budget.expired(), "coordinator pins an uncached query without a live producer");
+  for (int64_t worker = 0; worker < 4; ++worker) {
+    ExecutionFixture producer(id);
+    require_equal(SemanticExecutionState::acquire(producer.context(), 4096, 2, state, true),
+                  OB_SUCCESS, "late worker rejoins the coordinator budget");
+    require(&state->budget() == identity, "early and late workers retain the same budget");
+    require_equal(state->budget().task_limit(), 2, "DOP does not multiply task credits");
+    require_equal(state->budget().reserve(4096), OB_SUCCESS, "worker can reach exact query byte limit");
+    require_equal(state->budget().reserve(1), OB_SIZE_OVERFLOW, "worker cannot exceed query byte limit");
+    state->budget().release(4096);
+    state.reset();
+    require_equal(SemanticExecutionState::query_count(), baseline + 1,
+                  "coordinator retains one budget between producer lifetimes");
+  }
+  ExecutionFixture failed(id);
+  require_equal(SemanticExecutionState::acquire(failed.context(), 4096, 2, state, true),
+                OB_SUCCESS, "acquire producer before failure");
+  state->budget().fail(OB_TIMEOUT);
+  state.reset();
+  ExecutionFixture late(id);
+  require_equal(SemanticExecutionState::acquire(late.context(), 4096, 2, state, true),
+                OB_SUCCESS, "join already failed anchored query");
+  require(&state->budget() == identity, "failure cannot replace the query budget");
+  require_equal(state->budget().acquire_task(), OB_TIMEOUT, "late producer sees first query failure");
+  state.reset();
+  coordinator.context().set_semantic_query_budget({});
+  require(budget.expired(), "coordinator teardown releases the final uncached lease");
+  require_equal(SemanticExecutionState::query_count(), baseline, "anchored registry cleanup");
+}
+
+void test_worker_private_polling()
+{
+  ExecutionFixture first(execution_id());
+  ExecutionFixture second(first.context().get_execution_id());
+  std::shared_ptr<SemanticExecutionState> states[2];
+  require_equal(SemanticExecutionState::acquire(first.context(), 4096, 2, states[0], true),
+                OB_SUCCESS, "acquire first task state");
+  require_equal(SemanticExecutionState::acquire(second.context(), 4096, 2, states[1], true),
+                OB_SUCCESS, "acquire second task state");
+  require(&states[0]->budget() == &states[1]->budget(), "task states share only query resources");
+  struct Probe
+  {
+    int polls_ = 0;
+    static bool ready(const void *) { return true; }
+    static int poll(void *data, bool &progress)
+    {
+      ++static_cast<Probe *>(data)->polls_;
+      progress = true;
+      return OB_SUCCESS;
+    }
+  } probes[2];
+  for (int64_t worker = 0; worker < 2; ++worker) {
+    require_equal(states[worker]->register_operator(
+        &probes[worker], Probe::ready, Probe::poll), OB_SUCCESS, "register task-private frame");
+  }
+  bool progress = false;
+  require_equal(states[0]->poll_ready_tasks(progress), OB_SUCCESS, "poll first task");
+  require(progress && probes[0].polls_ == 1 && probes[1].polls_ == 0,
+          "first task cannot poll the second task frame");
+  int resumed = OB_ERR_UNEXPECTED;
+  std::thread migrated([&] { resumed = states[0]->poll_ready_tasks(progress); });
+  migrated.join();
+  require_equal(resumed, OB_SUCCESS, "logical task can resume on another physical thread");
+  require(probes[0].polls_ == 2 && probes[1].polls_ == 0,
+          "migration retains the same task-private waiter list");
+  for (int64_t worker = 0; worker < 2; ++worker) {
+    states[worker]->unregister_operator(&probes[worker]);
   }
 }
 
@@ -866,6 +1072,94 @@ void test_semantic_output_order_hint()
                 OB_INVALID_ARGUMENT, "reject a numeric output policy");
 }
 
+void test_semantic_execution_scope()
+{
+  ObArenaAllocator allocator("SemanticTest");
+  SemanticMapSpec map(allocator, PHY_SEMANTIC_MAP);
+  SemanticFilterSpec filter(allocator, PHY_SEMANTIC_FILTER);
+  SemanticRankSpec rank(allocator, PHY_SEMANTIC_RANK);
+  require(map.execution_scope_ == SemanticExecutionScope::SERIAL &&
+          filter.execution_scope_ == SemanticExecutionScope::SERIAL &&
+          rank.execution_scope_ == SemanticExecutionScope::SERIAL,
+          "legacy semantic specs default to serial scope");
+  for (SemanticExecutionScope scope :
+       {SemanticExecutionScope::SERIAL, SemanticExecutionScope::LOCAL_PX_WORKER}) {
+    map.execution_scope_ = scope;
+    map.row_async_enabled_ = true;
+    map.output_order_ = SemanticOutputOrder::READY_ORDER;
+    std::vector<char> bytes(map.get_serialize_size());
+    int64_t position = 0;
+    require_equal(map.serialize(bytes.data(), bytes.size(), position), OB_SUCCESS,
+                  "serialize explicit semantic execution scope");
+    require_equal(position, bytes.size(), "execution scope serialization size");
+    SemanticMapSpec decoded(allocator, PHY_SEMANTIC_MAP);
+    position = 0;
+    require_equal(decoded.deserialize(bytes.data(), bytes.size(), position), OB_SUCCESS,
+                  "deserialize semantic execution scope");
+    require_equal(position, bytes.size(), "execution scope full decode");
+    require(decoded.execution_scope_ == scope && decoded.row_async_enabled_ &&
+            decoded.unordered_output(), "PX transport preserves task execution and output scope");
+  }
+}
+
+void test_local_px_row_pipeline()
+{
+  ObArenaAllocator allocator("SemanticTest");
+  ObPxReduceTransmitSpec transmit(allocator, PHY_PX_REDUCE_TRANSMIT);
+  SemanticMapSpec map(allocator, PHY_SEMANTIC_MAP);
+  ObGranuleIteratorSpec granule(allocator, PHY_GRANULE_ITERATOR);
+  ObTableScanSpec scan(allocator, PHY_TABLE_SCAN);
+  transmit.max_batch_size_ = map.max_batch_size_ = granule.max_batch_size_ = scan.max_batch_size_ = 16;
+  ObExpr model;
+  ObExpr text;
+  model.datum_meta_.type_ = ObVarcharType;
+  text.datum_meta_.type_ = ObVarcharType;
+  ObExpr *arguments[] = {&model, &text};
+  ObExpr call;
+  call.type_ = T_FUN_SYS_AI_MAP;
+  call.arg_cnt_ = 2;
+  call.args_ = arguments;
+  require_equal(map.semantic_exprs_.init(1), OB_SUCCESS, "allocate worker semantic call");
+  require_equal(map.semantic_exprs_.push_back(&call), OB_SUCCESS, "bind TEXT worker call");
+  ObOpSpec *transmit_children[] = {&map};
+  ObOpSpec *map_children[] = {&granule};
+  ObOpSpec *granule_children[] = {&scan};
+  require_equal(transmit.set_children_pointer(transmit_children, 1), OB_SUCCESS, "bind Gather worker");
+  require_equal(map.set_children_pointer(map_children, 1), OB_SUCCESS, "bind worker scan region");
+  require_equal(granule.set_children_pointer(granule_children, 1), OB_SUCCESS, "bind partitioned scan");
+  require(!ObPxTaskProcess::supports_row_async(transmit), "default specs cannot silently enable PX row async");
+  map.row_async_enabled_ = true;
+  map.output_order_ = SemanticOutputOrder::READY_ORDER;
+  map.execution_scope_ = SemanticExecutionScope::LOCAL_PX_WORKER;
+  require(ObPxTaskProcess::supports_row_async(transmit), "bounded TEXT Gather pipeline is supported");
+  for (ObItemType type : {T_FUN_SYS_AI_MAP, T_FUN_SYS_AI_FILTER, T_FUN_SYS_AI_RANK}) {
+    call.type_ = type;
+    require(ObPxTaskProcess::supports_row_async(transmit), "TEXT MAP/FILTER/RANK task bindings are supported");
+  }
+  call.type_ = T_FUN_SYS_AI_MAP;
+  map.output_order_ = SemanticOutputOrder::INPUT_ORDER;
+  require(!ObPxTaskProcess::supports_row_async(transmit), "global ordered publication is not admitted");
+  map.output_order_ = SemanticOutputOrder::READY_ORDER;
+  text.datum_meta_.type_ = ObFileType;
+  require(!ObPxTaskProcess::supports_row_async(transmit), "FILE cannot enter the TEXT worker scope");
+  text.datum_meta_.type_ = ObVarcharType;
+  granule.access_all_ = true;
+  require(!ObPxTaskProcess::supports_row_async(transmit), "access-all granules are rejected");
+  granule.access_all_ = false;
+  granule.nlj_with_param_down_ = true;
+  require(!ObPxTaskProcess::supports_row_async(transmit), "parameter descent is rejected");
+  granule.nlj_with_param_down_ = false;
+  map.max_batch_size_ = 0;
+  require(!ObPxTaskProcess::supports_row_async(transmit), "scalar task frames are rejected");
+  map.max_batch_size_ = 16;
+  ObOpSpec sort(allocator, PHY_SORT);
+  sort.max_batch_size_ = 16;
+  require_equal(map.set_child(0, &sort), OB_SUCCESS, "install unsafe worker boundary");
+  require(!ObPxTaskProcess::supports_row_async(transmit), "unverified worker sorting is rejected");
+  require_equal(map.set_child(0, &granule), OB_SUCCESS, "restore supported worker pipeline");
+  require(ObPxTaskProcess::supports_row_async(transmit), "supported pipeline recovers after guards");
+}
+
 void test_sort_suspension_capability()
 {
   ObArenaAllocator allocator("SemanticTest");
@@ -1005,10 +1299,14 @@ const TestCase TESTS[] = {
   {"client_shared_counter", test_client_shared_counter},
   {"task_admission_boundaries", test_task_admission_boundaries},
   {"task_capacity_independent_of_workers", test_task_capacity_independent_of_workers},
+  {"px_task_group_dependency_capacity", test_px_task_group_dependency_capacity},
+  {"concurrent_px_task_group_accounting", test_concurrent_px_task_group_accounting},
   {"concurrent_shared_budget", test_concurrent_shared_budget},
   {"fatal_failure_and_cleanup_once", test_fatal_failure_and_cleanup_once},
   {"concurrent_failure_no_new_credit", test_concurrent_failure_no_new_credit},
   {"concurrent_final_execution_state_teardown", test_concurrent_final_execution_state_teardown},
+  {"uncached_coordinator_budget_lease", test_uncached_coordinator_budget_lease},
+  {"worker_private_polling", test_worker_private_polling},
   {"completed_producers_release_credits_without_another_pull",
    test_completed_producers_release_credits_without_another_pull},
   {"suspension_scope_defaults_and_override", test_suspension_scope_defaults_and_override},
@@ -1019,6 +1317,8 @@ const TestCase TESTS[] = {
   {"rank_spec_detection", test_rank_spec_detection},
   {"semantic_output_order", test_semantic_output_order},
   {"semantic_output_order_hint", test_semantic_output_order_hint},
+  {"semantic_execution_scope", test_semantic_execution_scope},
+  {"local_px_row_pipeline", test_local_px_row_pipeline},
   {"sort_suspension_capability", test_sort_suspension_capability},
   {"subplan_scan_suspension_capability", test_subplan_scan_suspension_capability},
   {"hash_distinct_suspension_capability", test_hash_distinct_suspension_capability},

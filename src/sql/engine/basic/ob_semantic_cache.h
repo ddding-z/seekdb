@@ -5,6 +5,7 @@
 #include "lib/string/ob_string.h"
 #include "query/engine/expr/ob_expr_operator.h"
 #include "sql/engine/basic/ob_semantic_proxy.h"
+#include "sql/engine/basic/ob_semantic_runtime.h"
 #include <atomic>
 #include <memory>
 #include <vector>
@@ -17,8 +18,6 @@ class ObJsonObject;
 }
 namespace sql
 {
-class SemanticQueryBudget;
-
 class SemanticFunctionCache
 {
   struct Impl;
@@ -62,10 +61,14 @@ public:
              std::vector<Handle> &handles, bool &progress,
              const SemanticProxyConfig *proxy = nullptr,
              const common::ObIArray<common::ObString> *documents = nullptr,
-             const common::ObIArray<common::ObString> *right_documents = nullptr);
+             const common::ObIArray<common::ObString> *right_documents = nullptr,
+             const SemanticTaskGroup &task_group = SemanticTaskGroup(-1, -1),
+             int64_t task_group_limit = 0);
   bool can_submit(uint64_t binding_id, const common::ObString &key,
                   const common::ObString &prompt, int64_t config_bytes,
-                  int64_t proxy_bytes = 0) const;
+                  int64_t proxy_bytes = 0,
+                  const SemanticTaskGroup &task_group = SemanticTaskGroup(-1, -1),
+                  int64_t task_group_limit = 0) const;
   int poll(bool &progress);
   bool is_ready() const;
   bool has_pending() const;

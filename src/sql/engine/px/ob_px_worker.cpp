@@ -192,10 +192,10 @@ public:
   {
     const int ret = check_cancellation();
     if (OB_SUCCESS != ret) {
-      await_.cancel(ret);
+      cancel(ret);
       return true;
     } else if (!await_.is_pending()) {
-      await_.cancel(OB_ERR_UNEXPECTED);
+      cancel(OB_ERR_UNEXPECTED);
       LOG_ERROR_RET(OB_ERR_UNEXPECTED, "PX continuation has no pending await",
                     K(source_arg_.task_));
       return true;
@@ -221,7 +221,7 @@ public:
       const int register_ret = interrupt_checker_.register_checker(
           source_arg_.task_.get_interrupt_id().px_interrupt_id_);
       if (OB_SUCCESS != register_ret) {
-        await_.cancel(register_ret);
+        cancel(register_ret);
         LOG_WARN("register durable PX interrupt checker failed", K(register_ret));
       } else {
         interrupt_registered_ = true;
@@ -238,13 +238,13 @@ public:
     } else {
       await_.reset_pending();
       if (!need_exec) {
-        await_.cancel(OB_CANCELED);
+        cancel(OB_CANCELED);
       } else if (OB_SUCCESS != interrupt_guard.get_interrupt_reg_ret()) {
-        await_.cancel(interrupt_guard.get_interrupt_reg_ret());
+        cancel(interrupt_guard.get_interrupt_reg_ret());
       } else if (IS_INTERRUPTED()) {
-        await_.cancel(GET_INTERRUPT_CODE().code_);
+        cancel(GET_INTERRUPT_CODE().code_);
       } else if (OB_SUCCESS != (ret = check_cancellation())) {
-        await_.cancel(ret);
+        cancel(ret);
       }
       ret = OB_SUCCESS;
       static const uint64_t PROCESS_OWNER_ID = 1;
@@ -281,7 +281,12 @@ public:
               }
               if (OB_SUCC(ret)) {
                 ret = process_->run();
-                suspended = OB_EAGAIN == ret && await_.is_pending();
+                suspended = OB_EAGAIN == ret && await_.owns(runtime_arg_.exec_ctx_) &&
+                    await_.is_pending();
+                if (OB_EAGAIN == ret && !suspended) {
+                  ret = OB_ERR_UNEXPECTED;
+                  LOG_ERROR("PX task returned pending without its own await", K(ret));
+                }
               }
               if (!suspended) {
                 report_unprocessed_result(ret);
@@ -344,6 +349,13 @@ public:
   }
 
 private:
+  void cancel(int ret)
+  {
+    if (OB_SUCCESS == await_.cancel_ret() && OB_SUCCESS != ret) {
+      await_.cancel(ret);
+    }
+  }
+
   int check_cancellation()
   {
     int ret = await_.cancel_ret();
@@ -384,6 +396,13 @@ private:
         }
       }
       if (OB_SUCCESS != ret) {
+        if (nullptr != source_arg_.sqc_handler_) {
+          const int peer_ret = ObInterruptUtil::interrupt_tasks(
+              source_arg_.sqc_handler_->get_sqc_init_arg().sqc_, ret);
+          if (OB_SUCCESS != peer_ret) {
+            LOG_WARN("interrupt peer PX tasks after failure failed", K(ret), K(peer_ret));
+          }
+        }
         const int interrupt_ret = ObInterruptUtil::interrupt_qc(source_arg_.task_, ret);
         if (OB_SUCCESS != interrupt_ret) {
           LOG_WARN("interrupt QC after resumable PX startup failure failed",
@@ -523,7 +542,8 @@ int ObPxThreadWorker::run(ObPxInitTaskArgs &task_arg)
   static constexpr int64_t DEFAULT_PX_GROUP_ID = 0;
   query::ObIQueryRuntimeEnvironment *runtime = OB_ISNULL(task_arg.exec_ctx_)
       ? nullptr : task_arg.exec_ctx_->get_query_runtime_environment();
-  if (OB_ISNULL(runtime)) {
+  if (OB_FAIL(ObPxTaskProcess::validate_row_async(task_arg))) {
+  } else if (OB_ISNULL(runtime)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("query runtime environment is unavailable", K(ret));
   } else {

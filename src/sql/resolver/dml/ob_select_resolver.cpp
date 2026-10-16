@@ -1198,6 +1198,18 @@ int ObSelectResolver::resolve(const ParseNode &parse_tree)
     }
   }
   if (OB_SUCC(ret)) {
+    const bool px_row_async_eligible = select_stmt->is_single_table_stmt() &&
+        select_stmt->get_table_item(0)->is_basic_table() &&
+        !select_stmt->get_table_item(0)->is_view_table_ &&
+        !select_stmt->is_set_stmt() && !select_stmt->has_order_by() &&
+        !select_stmt->has_limit() && !select_stmt->has_group_by() &&
+        !select_stmt->has_rollup() && select_stmt->get_aggr_item_size() == 0 &&
+        !select_stmt->has_having() && !select_stmt->has_distinct() &&
+        !select_stmt->has_window_function() && !select_stmt->has_for_update() &&
+        !select_stmt->has_select_into() && select_stmt->get_subquery_expr_size() == 0 &&
+        select_stmt->get_cte_definition_size() == 0;
+    // Keep the original boundary even if rewriting later eliminates it.
+    select_stmt->get_query_ctx()->semantic_px_row_async_eligible_ &= px_row_async_eligible;
     const ObOptParamHint &options = select_stmt->get_query_ctx()->get_global_hint().opt_params_;
     ObOptParamHint::SemanticOutputPolicy policy = ObOptParamHint::SemanticOutputPolicy::ORDERED;
     bool row_async_enabled = false;

@@ -132,6 +132,52 @@ int SemanticQueryBudget::acquire_task()
   return ret;
 }
 
+int SemanticQueryBudget::acquire_task(const SemanticTaskGroup &group, int64_t group_limit)
+{
+  int ret = failure();
+  if (OB_FAIL(ret)) {
+  } else if (group_limit == 0 && group == SemanticTaskGroup(-1, -1)) {
+    ret = acquire_task();
+  } else if (group.first < 0 || group.second < 0 ||
+             group_limit <= 0 || group_limit > task_limit_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid semantic task group admission", K(ret), K(group.first), K(group.second),
+             K(group_limit), K(task_limit_));
+  } else {
+    std::lock_guard<std::mutex> guard(task_mutex_);
+    try {
+      auto &usage = task_groups_.emplace(group, TaskGroupUsage{group_limit, 0}).first->second;
+      if (usage.limit_ != group_limit) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("semantic workers disagree on task group capacity",
+                 K(ret), K(group_limit), K(usage.limit_));
+      } else if (usage.active_ >= group_limit) {
+        ret = OB_EAGAIN;
+      } else if (OB_SUCC(ret = acquire_task())) {
+        ++usage.active_;
+      }
+    } catch (const std::bad_alloc &) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate semantic task group accounting failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+bool SemanticQueryBudget::task_available(const SemanticTaskGroup &group, int64_t group_limit) const
+{
+  bool ready = task_available();
+  if (group_limit != 0 || group != SemanticTaskGroup(-1, -1)) {
+    std::lock_guard<std::mutex> guard(task_mutex_);
+    const auto entry = task_groups_.find(group);
+    ready = group.first < 0 || group.second < 0 || group_limit <= 0 ||
+        group_limit > task_limit_ ||
+        (entry != task_groups_.end() && entry->second.limit_ != group_limit) ||
+        (ready && (entry == task_groups_.end() || entry->second.active_ < group_limit));
+  }
+  return ready;
+}
+
 void SemanticQueryBudget::release_task()
 {
   const int64_t previous = active_tasks_.fetch_sub(1);
@@ -139,6 +185,21 @@ void SemanticQueryBudget::release_task()
     LOG_ERROR_RET(OB_ERR_UNEXPECTED, "semantic task credit released without ownership",
                   K(execution_id_), K(previous));
   }
+}
+
+void SemanticQueryBudget::release_task(const SemanticTaskGroup &group)
+{
+  if (group != SemanticTaskGroup(-1, -1)) {
+    std::lock_guard<std::mutex> guard(task_mutex_);
+    const auto entry = task_groups_.find(group);
+    if (entry == task_groups_.end() || entry->second.active_ <= 0) {
+      LOG_ERROR_RET(OB_ERR_UNEXPECTED, "semantic task group released without ownership",
+                    K(execution_id_), K(group.first), K(group.second));
+      return;
+    }
+    --entry->second.active_;
+  }
+  release_task();
 }
 
 void SemanticQueryBudget::fail(int ret)

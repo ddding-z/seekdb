@@ -120,6 +120,10 @@ public:
   /// get the next result row
   /// @return OB_ITER_END when no more data available
   int get_next_row(const common::ObNewRow *&row);
+  bool is_output_batch_exhausted() const
+  {
+    return nullptr != exec_result_ && exec_result_->is_output_batch_exhausted();
+  }
   /// close the result set after get all the rows
   int close() { return do_close(NULL); }
   // close result set and rewrite the client ret

@@ -15,7 +15,8 @@ public:
   explicit LogSemantic(ObLogPlan &plan)
       : ObLogicalOperator(plan), query_task_count_(1), lifted_join_count_(0),
         lift_stop_reason_(nullptr), function_cache_enabled_(false), row_async_enabled_(false),
-        output_order_(SemanticOutputOrder::INPUT_ORDER), auto_order_reason_(nullptr) {}
+        output_order_(SemanticOutputOrder::INPUT_ORDER), auto_order_reason_(nullptr),
+        execution_scope_(SemanticExecutionScope::SERIAL) {}
   int add_expression(ObRawExpr *expr);
   int add_shared_expression(ObRawExpr *expr);
   int add_carried_expression(ObRawExpr *expr);
@@ -33,6 +34,8 @@ public:
   bool row_async_enabled() const { return row_async_enabled_; }
   void set_output_order(SemanticOutputOrder order) { output_order_ = order; }
   SemanticOutputOrder output_order() const { return output_order_; }
+  void set_execution_scope(SemanticExecutionScope scope) { execution_scope_ = scope; }
+  SemanticExecutionScope execution_scope() const { return execution_scope_; }
   void set_auto_order_reason(const char *reason) { auto_order_reason_ = reason; }
   const common::ObIArray<SemanticProxyConfig> &proxy_configs() const { return proxy_configs_; }
   int set_proxy_config(const ObRawExpr &expr, const SemanticProxyConfig &config);
@@ -64,6 +67,7 @@ private:
   bool row_async_enabled_;
   SemanticOutputOrder output_order_;
   const char *auto_order_reason_;
+  SemanticExecutionScope execution_scope_;
   common::ObSEArray<SemanticProxyConfig, 8> proxy_configs_;
 };
 

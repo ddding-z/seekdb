@@ -5,7 +5,8 @@ a full sort, but must preserve final SQL order and projection demand after
 LIMIT. Strict unordered and default ordered behavior keep their contracts.
 Ordinary hash aggregation/DISTINCT and restricted INNER HASH JOIN are tested
 separately. CTE/materialization, derived ORDER BY/LIMIT, ordered aggregates,
-unsupported join/aggregate algorithms, windows and PX remain excluded.
+unsupported join/aggregate algorithms and windows remain excluded. Local TEXT
+PX without SQL ordering is covered separately by test_semantic_px_row_async.py.
 """
 
 import argparse
@@ -385,7 +386,8 @@ class SemanticOutputPolicyContracts(rank.SemanticRankContracts):
                     sql_error(self, 1235, lambda: self.execute(prefix + statement))
         self.cursor.executemany("INSERT INTO cache_px_inputs VALUES (%s,%s)",
                                 [(index, "scope") for index in range(256)])
-        parallel = self.statement(fields, source="cache_px_inputs a", hints="PARALLEL(4)")
+        parallel = self.statement(fields, source="cache_px_inputs a", hints="PARALLEL(4)",
+                                  suffix="ORDER BY a.id")
         for prefix in ("EXPLAIN ", ""):
             sql_error(self, 1235, lambda: self.execute(prefix + parallel))
         self.assert_windows(before)

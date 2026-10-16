@@ -76,6 +76,8 @@ public:
   virtual ~ObPxTaskProcess();
   int process();
   int run();
+  static bool supports_row_async(const ObOpSpec &root);
+  static int validate_row_async(const ObPxInitTaskArgs &arg);
   static bool supports_resumable(const ObPxInitTaskArgs &arg);
   void enable_resumable(lib::RequestAwait &await) { await_ = &await; }
   bool has_reported_result() const { return result_reported_; }

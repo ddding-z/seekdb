@@ -142,7 +142,7 @@ public:
   bool is_slave_mapping() const { return SlaveMappingType::SM_NONE != slave_mapping_type_; }
   ObLogicalOperator *get_px_batch_op() { return px_batch_op_; }
   void set_px_batch_op(ObLogicalOperator *op) { px_batch_op_ = op; }
-  int64_t get_px_batch_op_id() { return px_batch_op_id_; }
+  int64_t get_px_batch_op_id() const { return px_batch_op_id_; }
   void set_px_batch_op_id(int64_t id) { px_batch_op_id_ = id; }
   log_op_def::ObLogOpType get_px_batch_op_type() { return px_batch_op_type_;}
   void set_px_batch_op_type(log_op_def::ObLogOpType px_batch_op_type)

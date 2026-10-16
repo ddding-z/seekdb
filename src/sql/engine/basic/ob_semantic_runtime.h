@@ -4,8 +4,10 @@
 #include "lib/ob_errno.h"
 #include "query/engine/ob_phy_operator_type.h"
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace oceanbase
@@ -21,6 +23,15 @@ enum class SemanticOutputOrder : int64_t
   READY_ORDER = 1
 };
 
+enum class SemanticExecutionScope : int64_t
+{
+  SERIAL = 0,
+  LOCAL_PX_WORKER = 1
+};
+
+// Physical operator ID and expression index are stable across serialized PX tasks.
+using SemanticTaskGroup = std::pair<int64_t, int64_t>;
+
 class SemanticQueryBudget
 {
 public:
@@ -30,10 +41,13 @@ public:
   int reserve(int64_t bytes);
   void release(int64_t bytes);
   int acquire_task();
+  int acquire_task(const SemanticTaskGroup &group, int64_t group_limit);
   void release_task();
+  void release_task(const SemanticTaskGroup &group);
   void fail(int ret);
   int failure() const { return failure_.load(); }
   bool task_available() const { return active_tasks_.load() < task_limit_; }
+  bool task_available(const SemanticTaskGroup &group, int64_t group_limit) const;
   int64_t active_tasks() const { return active_tasks_.load(); }
   int64_t memory_used() const;
   int64_t memory_limit() const { return memory_limit_; }
@@ -46,6 +60,11 @@ public:
   bool function_cache_ready() const;
   bool function_cache_pending() const;
 private:
+  struct TaskGroupUsage
+  {
+    int64_t limit_;
+    int64_t active_;
+  };
   uint64_t execution_id_;
   int64_t memory_limit_;
   int64_t task_limit_;
@@ -53,6 +72,8 @@ private:
   int64_t memory_used_;
   std::atomic<int64_t> active_tasks_;
   std::atomic<int> failure_;
+  mutable std::mutex task_mutex_;
+  std::map<SemanticTaskGroup, TaskGroupUsage> task_groups_;
   mutable std::mutex cache_mutex_;
   std::unique_ptr<SemanticFunctionCache> function_cache_;
 };

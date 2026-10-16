@@ -232,6 +232,11 @@ int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_ite
                        placement || function_cache_enabled_ || has_embedding_proxy() ? ", " : "",
                        output_order_ == SemanticOutputOrder::READY_ORDER
                            ? "UNORDERED_READY" : "ORDERED_PREFIX");
+      if (OB_SUCC(ret)) {
+        ret = BUF_PRINTF(", execution_scope=%s",
+            execution_scope_ == SemanticExecutionScope::LOCAL_PX_WORKER
+                ? "LOCAL_PX_WORKER" : "SERIAL");
+      }
     }
     if (OB_SUCC(ret) && nullptr != auto_order_reason_) {
       ret = BUF_PRINTF(", output_policy=AUTO, order_reason=%s", auto_order_reason_);

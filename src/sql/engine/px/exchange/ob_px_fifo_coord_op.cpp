@@ -117,6 +117,7 @@ int ObPxFifoCoordOp::inner_get_next_batch(const int64_t max_row_cnt)
 int ObPxFifoCoordOp::fetch_rows(const int64_t row_cnt)
 {
   int ret = OB_SUCCESS;
+  const bool row_async = MY_SPEC.has_row_async_semantic_operator();
   ObPhysicalPlanCtx *phy_plan_ctx = GET_PHY_PLAN_CTX(ctx_);
   if (iter_end_) {
     ret = OB_ITER_END;
@@ -144,7 +145,7 @@ int ObPxFifoCoordOp::fetch_rows(const int64_t row_cnt)
     // rows must received by coord op instead of receive op, otherwise we will
     // trap in receive op and lose control.
     int64_t left = row_reader_.left_rows();
-    if (left >= row_cnt || (left > 0 && msg_loop_.all_eof(task_channels_.count()))) {
+    if (left >= row_cnt || (left > 0 && (row_async || msg_loop_.all_eof(task_channels_.count())))) {
       clear_evaluated_flag();
       clear_dynamic_const_parent_flag();
       metric_.mark_interval_start();

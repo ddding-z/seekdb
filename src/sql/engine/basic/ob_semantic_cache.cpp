@@ -398,10 +398,10 @@ struct SemanticFunctionCache::Impl
       EMBEDDING,
       JOIN_EMBEDDING
     };
-    Flight(SemanticQueryBudget &budget, int64_t deadline)
+    Flight(SemanticQueryBudget &budget, int64_t deadline, const SemanticTaskGroup &task_group)
         : budget_(budget), deadline_(deadline), arena_("SemanticMemo"),
           allocator_(arena_), batch_(allocator_), busy_(false), phase_(QUEUED),
-          bytes_(0), credit_(false), max_parallel_(1), kind_(COMPLETION),
+          bytes_(0), credit_(false), task_group_(task_group), max_parallel_(1), kind_(COMPLETION),
           includes_query_(false), completed_count_(0)
     {
     }
@@ -410,7 +410,7 @@ struct SemanticFunctionCache::Impl
       batch_.cancel();
       if (credit_)
       {
-        budget_.release_task();
+        budget_.release_task(task_group_);
       }
       if (bytes_ > 0)
       {
@@ -436,6 +436,7 @@ struct SemanticFunctionCache::Impl
     std::atomic<Phase> phase_;
     int64_t bytes_;
     bool credit_;
+    SemanticTaskGroup task_group_;
     int64_t max_parallel_;
     std::shared_ptr<Binding> binding_;
     std::vector<Handle> entries_;
@@ -1339,7 +1340,9 @@ int SemanticFunctionCache::submit(ObItemType type, const ObString &model,
                                   std::vector<Handle> &handles, bool &progress,
                                   const SemanticProxyConfig *proxy,
                                   const ObIArray<ObString> *documents,
-                                  const ObIArray<ObString> *right_documents)
+                                  const ObIArray<ObString> *right_documents,
+                                  const SemanticTaskGroup &task_group,
+                                  int64_t task_group_limit)
 {
   int ret = impl_->budget_.failure();
   const bool use_proxy = nullptr != proxy && proxy->enabled_;
@@ -1468,7 +1471,7 @@ int SemanticFunctionCache::submit(ObItemType type, const ObString &model,
               {
                 if (!flight)
                 {
-                  const int admission = impl_->budget_.acquire_task();
+                  const int admission = impl_->budget_.acquire_task(task_group, task_group_limit);
                   if (admission == OB_EAGAIN)
                   {
                     continue;
@@ -1482,7 +1485,7 @@ int SemanticFunctionCache::submit(ObItemType type, const ObString &model,
                     try
                     {
                       flight = std::make_shared<Impl::Flight>(impl_->budget_,
-                                                              impl_->deadline_);
+                                                              impl_->deadline_, task_group);
                       flight->credit_ = true;
                       flight->binding_ = binding;
                       flight->max_parallel_ = max_parallel;
@@ -1498,7 +1501,7 @@ int SemanticFunctionCache::submit(ObItemType type, const ObString &model,
                     {
                       if (!flight)
                       {
-                        impl_->budget_.release_task();
+                        impl_->budget_.release_task(task_group);
                       }
                       throw;
                     }
@@ -1613,7 +1616,9 @@ int SemanticFunctionCache::submit(ObItemType type, const ObString &model,
 bool SemanticFunctionCache::can_submit(uint64_t binding_id, const ObString &key,
                                        const ObString &prompt,
                                        int64_t config_bytes,
-                                       int64_t proxy_bytes) const
+                                       int64_t proxy_bytes,
+                                       const SemanticTaskGroup &task_group,
+                                       int64_t task_group_limit) const
 {
   std::lock_guard<std::mutex> guard(impl_->mutex_);
   const int64_t retained =
@@ -1624,7 +1629,7 @@ bool SemanticFunctionCache::can_submit(uint64_t binding_id, const ObString &key,
              impl_->entries_.end() ||
          retained > impl_->cache_limit_ - impl_->cache_bytes_ ||
          request > impl_->budget_.memory_limit() ||
-         (impl_->budget_.task_available() &&
+         (impl_->budget_.task_available(task_group, task_group_limit) &&
           (request + retained <=
                impl_->budget_.memory_limit() - impl_->budget_.memory_used() ||
            impl_->budget_.active_tasks() == 0));

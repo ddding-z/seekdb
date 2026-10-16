@@ -116,7 +116,7 @@ public:
   }
 private:
   friend class ObPxTaskProcess;
-  void enable_resumable() { resumable_ = true; }
+  void enable_resumable(bool row_async) { resumable_ = true; row_async_ = row_async; }
 public:
   int init_channel(ObPxTransmitOpInput &trans_input);
   int init_dfc(dtl::ObDtlDfoKey &parent_key, dtl::ObDtlSqcInfo &child_info);
@@ -154,6 +154,7 @@ protected:
   bool is_object_sample();
   bool is_row_sample();
 private:
+  int flush_semantic_rows();
   int next_batch(const int64_t max_row_cnt);
   inline void update_row(const ObExpr *expr, int64_t tablet_id);
   int send_row_normal(int64_t slice_idx,
@@ -197,6 +198,7 @@ protected:
   bool iter_end_;
   bool consume_first_row_;
   bool resumable_;
+  bool row_async_;
   bool first_row_pending_;
   dtl::ObDtlUnblockingMsgP dfc_unblock_msg_proc_;
   dtl::ObDtlFlowControl dfc_;
@@ -315,7 +317,23 @@ int ObPxTransmitOp::send_rows_in_batch(ObSliceIdxCalc &slice_calc)
   ObEvalCtx::BatchInfoScopeGuard batch_info_guard(eval_ctx_);
   while (OB_SUCC(ret)) {
     if (OB_FAIL(next_row())) {
+      lib::RequestAwait *await = lib::RequestAwait::current();
+      if (resumable_ && OB_EAGAIN == ret) {
+        if (nullptr == await || !await->owns(&ctx_) || !await->is_pending()) {
+          ret = common::OB_ERR_UNEXPECTED;
+          LOG_ERROR("PX transmit returned pending without its own await", K(ret));
+        } else if (common::OB_SUCCESS != await->cancel_ret()) {
+          ret = await->cancel_ret();
+        } else if (row_async_ && row_count > 0) {
+          const int flush_ret = flush_semantic_rows();
+          if (common::OB_SUCCESS != flush_ret) {
+            ret = common::OB_EAGAIN == flush_ret ? common::OB_ERR_UNEXPECTED : flush_ret;
+            LOG_WARN("flush ready rows before PX semantic suspension failed", K(ret), K(flush_ret));
+          }
+        }
+      }
       if (!resumable_ || OB_EAGAIN != ret || nullptr == lib::RequestAwait::current() ||
+          !lib::RequestAwait::current()->owns(&ctx_) ||
           !lib::RequestAwait::current()->is_pending()) {
         LOG_WARN("fetch next rows failed", K(ret));
       }

@@ -68,8 +68,9 @@ eligible resumable local PX path. Cache identity includes function kind even
 when MAP and RANK have identical HTTP bodies.
 
 Serial TEXT and FILE RANK are accepted by `enable_semantic_row_async`, with the
-same ordered-prefix contract below; PX remains outside that option. FILE
-preparation and stage-level automatic output policy are described next.
+same ordered-prefix contract below; local TEXT PX additionally requires the
+AUTO policy described in [Local PX Row-Asynchronous Execution](#local-px-row-asynchronous-execution).
+FILE preparation and stage-level automatic output policy are described next.
 An independent FILTER proxy can reject rows before a separate RANK stage
 scores survivors. RANK itself cannot use `semantic_proxy`. Existing lifting
 guards still apply. Cached scoring comparisons admit finite, nonthrowing
@@ -431,6 +432,122 @@ Across the 34 trials, 550 HTTP attempts were audited. Unsupported combinations
 have no samples; observed outstanding responses at EOF are not cancellation
 counts. Private services, model sockets, gates and worker cleanup passed.
 No sanitizer, real-model quality, asynchronous spilling or PX expansion is claimed.
+
+## Local PX Row-Asynchronous Execution
+
+```sql
+SELECT /*+ PARALLEL(4)
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','auto')
+           OPT_PARAM('rowsets_max_rows',16) */
+       id, AI_MAP('extractor', content)
+FROM partitioned_documents
+WHERE AI_FILTER('selector', content);
+```
+
+This opt-in extension admits a single-server, vectorized TEXT MAP/FILTER/RANK
+producer pipeline below a simple FIFO Gather:
+
+```text
+FIFO COORDINATOR
+  REDUCE TRANSMIT
+    SEMANTIC MAP / FILTER / RANK
+      optional simple GRANULE ITERATOR
+        TABLE SCAN
+```
+
+Each semantic stage reports `execution_scope=LOCAL_PX_WORKER`,
+`row_async=UNORDERED_READY` and AUTO reason `PX_GATHER_INPUT`. Merely requesting
+`PARALLEL(n)` does not prove model work ran in multiple SQL workers.
+Serial stages report `execution_scope=SERIAL`; ordered and strict-unordered
+parallel row-async remain rejected. Default batch PX is unchanged.
+
+The admitted original query has one base table, static models/options and no
+ORDER BY, LIMIT, grouping, DISTINCT, HAVING, JOIN, derived/view/CTE/subquery,
+window/set or locking/output SELECT boundary. FILE, embedding proxy, native
+AI_JOIN/AI_AGG, repartition/shared hash, access-all or parameterized GI, unsafe
+rescan and fulltree/inline task execution are not admitted. Original-shape
+eligibility survives rewriting; logical, complete physical and actual
+SQC/task-topology validation each guard their own boundary. Unsupported
+execution fails explicitly rather than silently reverting to batch execution.
+
+In seekdb, multiple local tablets use DISTRIBUTED sharding/location metadata
+to retain PX planning. This is not proof of remote execution. Conversely,
+`is_use_px()` is not proof of actual parallel workers. Admission relies on the
+checked Gather pipeline and actual local SQC/task topology, not either proxy.
+A partitioned DOP=1 fixture can use excluded fulltree/inline PX; the serial
+comparison uses an unpartitioned mirror with identical IDs and prompts.
+
+### Ownership, dependency capacity and visibility
+
+- Each logical producer task owns its ExecContext, frames, slots, row queues,
+  cursors and continuation. It may resume on another physical SQL thread;
+  one task never polls/evaluates another task's frames.
+- All tasks of one execution share memory/task admission, query cache and the
+  first fatal failure. An uncached QC lease also spans early/late worker gaps.
+  The global wave/task limit remains `ai_pipeline_slots * distinct query
+  semantic-call count`, not that value multiplied by DOP.
+- In this new scope, each physical semantic call additionally shares a
+  query-wide `ai_pipeline_slots` wave window. Its stable key is physical
+  operator ID plus expression index, not model/cache identity or thread ID.
+  Otherwise four workers can fill all four credits with held inner calls,
+  starving a ready nested outer call. Per-call windows leave dependency
+  capacity without increasing the existing global limit. Cache-on flights
+  use the same accounting, including reused models at different depths.
+- Credits count request waves/tasks, not individual HTTP requests. With
+  batch 16 and slots 2, the held single-MAP fixture admits exactly 32 HTTP
+  attempts at DOP 1, 2 and 4; this is a fixture observation, not a general
+  request-credit API.
+- Incremental delivery crosses three boundaries: producer commits/flushes
+  copied DTL data on an owned semantic wait without sending EOF; verified
+  FIFO QC returns an available partial batch; the MySQL driver flushes once
+  that output batch is exhausted before the next potentially blocking pull.
+  No producer continuation or semantic await is propagated through Exchange.
+
+Successful execution preserves exact values and bag multiplicity, not input
+or global completion order. A nonbuffering client can see a tiny ready row
+while all other replies remain held, but must still consume the final SQL
+status. Provider failure, KILL, deadline and memory overflow remain errors,
+including after visible rows. This does not promise token streaming or
+linear DOP speedup.
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_px_row_async.py \
+  --binary build_debug/bin/src/observer/seekdb \
+  --log-dir /tmp/semantic-px-row-logs
+```
+
+The suite requires its own private `--binary` deployment for actual task,
+thread, quiescence and cleanup evidence; it does not attach to external
+instances. Repeatable `--case` and `--list-cases` select its 14 local methods.
+
+The Debug candidate passed all **14 SQL/mock methods in two fresh deployments
+(28 executions)**, including equal-budget
+serial/DOP2/DOP4 bags, actual 2/4 producer tasks and preparation threads,
+tiny-row SSCursor visibility with a default-batch negative control,
+cross-worker cache reuse/fresh-query isolation, cache-off/on two- and
+three-level nested calls with a reused model, guarded demand, FILTER-to-MAP,
+native DOUBLE RANK, error-after-prefix, kill/deadline/memory recovery and
+zero-demand unsupported-shape rejection. Native resources passed **30 cases
+twice (60 executions)**, including concurrent per-call admission and
+task-private polling/migration; native input passed **25 cases**.
+
+The same binary also passed all **252 existing SQL methods**:
+
+| Regression coverage | Passed |
+| --- | ---: |
+| Default local PX | 15 |
+| FILE row-async | 21 |
+| Ordered / strict unordered | 20 / 22 |
+| Serial AUTO | 22 |
+| Native RANK / default semantic runtime | 27 / 39 |
+| Relational hash aggregate / join | 18 / 23 |
+| Query cache / semantic lifting | 16 / 29 |
+
+Validation binary SHA-256:
+`c91a30c651475398e095000264e88995ab18647fec7f2c4479e799e44f3994ae`.
+These are deterministic functional/resource contracts, not real-model
+SemBench performance, quality, sanitizer or general PX-plan coverage.
 
 ## Opt-in Unordered Ready-Row Output
 

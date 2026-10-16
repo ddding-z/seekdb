@@ -8,6 +8,7 @@
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_input.h"
+#include "sql/engine/px/ob_px_sqc_handler.h"
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -55,7 +56,7 @@ SemanticRequestMemory request_memory(const SemanticInput &input)
 
 OB_SERIALIZE_MEMBER((SemanticSpec, ObOpSpec), expressions_, semantic_exprs_, owned_exprs_,
                     local_exprs_, shared_exprs_, carried_exprs_, query_task_count_, filter_expr_count_,
-                    memoized_exprs_, proxy_configs_, row_async_enabled_, output_order_);
+                    memoized_exprs_, proxy_configs_, row_async_enabled_, output_order_, execution_scope_);
 OB_SERIALIZE_MEMBER((SemanticMapSpec, SemanticSpec));
 OB_SERIALIZE_MEMBER((SemanticFilterSpec, SemanticSpec));
 OB_SERIALIZE_MEMBER((SemanticRankSpec, SemanticSpec));
@@ -117,10 +118,12 @@ struct SemanticOp::Task
 {
   enum RowState : uint8_t { UNREQUESTED, QUEUED, IN_FLIGHT, COMPLETE, CACHE_WAIT };
   Task(const ObExpr *expr, int64_t max_parallel, bool memoized,
-       const SemanticProxyConfig *proxy)
+       const SemanticProxyConfig *proxy, const SemanticTaskGroup &task_group,
+       int64_t task_group_limit)
       : expression_(expr), request_arena_("SemanticReq"), request_allocator_(request_arena_),
         dispatches_(nullptr), states_(nullptr), results_(nullptr), config_(nullptr), info_(nullptr),
         input_bytes_(0), in_flight_rows_(0), max_parallel_(max_parallel), credit_(false),
+        task_group_(task_group), task_group_limit_(task_group_limit),
         memoized_(memoized), cache_keys_(nullptr), cache_prompts_(nullptr),
         cache_handles_(nullptr), cache_binding_id_(0), proxy_config_(proxy),
         join_proxy_(nullptr != proxy && expr->type_ == T_FUN_SYS_AI_JOIN),
@@ -157,6 +160,8 @@ struct SemanticOp::Task
   int64_t in_flight_rows_;
   int64_t max_parallel_;
   bool credit_;
+  SemanticTaskGroup task_group_;
+  int64_t task_group_limit_;
   bool memoized_;
   ObString *cache_keys_;
   ObString *cache_prompts_;
@@ -283,6 +288,28 @@ int SemanticOp::inner_open()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid semantic output order specification", K(ret), K(spec.output_order_),
              K(spec.row_async_enabled_));
+  } else if (spec.execution_scope_ != SemanticExecutionScope::SERIAL &&
+             spec.execution_scope_ != SemanticExecutionScope::LOCAL_PX_WORKER) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid semantic execution scope", K(ret), K(spec.execution_scope_));
+  } else if (spec.execution_scope_ == SemanticExecutionScope::LOCAL_PX_WORKER &&
+             (!spec.row_async_enabled_ || !spec.unordered_output() || spec.has_embedding_proxy() ||
+              nullptr == ctx_.get_sqc_handler() || ctx_.get_px_task_id() < 0 ||
+              nullptr == ctx_.get_physical_plan_ctx() ||
+              nullptr == ctx_.get_physical_plan_ctx()->get_phy_plan() ||
+              nullptr == lib::RequestAwait::current() ||
+              !lib::RequestAwait::current()->owns(&ctx_) ||
+              (spec_.type_ != PHY_SEMANTIC_MAP && spec_.type_ != PHY_SEMANTIC_FILTER &&
+               spec_.type_ != PHY_SEMANTIC_RANK))) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "local PX row asynchronous execution requires an owned resumable TEXT MAP/FILTER/RANK task");
+    LOG_WARN("invalid local PX semantic execution binding", K(ret), K(spec.execution_scope_),
+             "px_task_id", ctx_.get_px_task_id());
+  } else if (spec.row_async_enabled_ && spec.execution_scope_ == SemanticExecutionScope::SERIAL &&
+             nullptr != ctx_.get_sqc_handler()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "serial row asynchronous stages cannot execute inside PX tasks");
+    LOG_WARN("serial semantic scope entered a PX task", K(ret));
   } else if (OB_FAIL(validate_proxy_configs())) {
   } else if (OB_FAIL(validate_shared_expressions())) {
   } else if (spec_.type_ == PHY_SEMANTIC_JOIN &&
@@ -355,7 +382,7 @@ void SemanticOp::reset_task(Slot &slot, Task &task)
   }
   task.in_flight_rows_ = 0;
   if (task.credit_) {
-    execution_->budget().release_task();
+    execution_->budget().release_task(task.task_group_);
     task.credit_ = false;
   }
   for (SemanticInput *input : task.inputs_) {
@@ -546,8 +573,11 @@ int SemanticOp::allocate_slot(Slot &slot, int64_t size)
       const SemanticProxyConfig *proxy = semantic_spec().proxy_configs_.empty() ||
           !semantic_spec().proxy_configs_.at(index).enabled_
           ? nullptr : &semantic_spec().proxy_configs_.at(index);
+      const bool local_px = semantic_spec().execution_scope_ == SemanticExecutionScope::LOCAL_PX_WORKER;
       auto *task = OB_NEWx(Task, &allocator, expr, size,
-          contains_expression(semantic_spec().memoized_exprs_, expr), proxy);
+          contains_expression(semantic_spec().memoized_exprs_, expr), proxy,
+          local_px ? SemanticTaskGroup(spec_.id_, index) : SemanticTaskGroup(-1, -1),
+          local_px ? slot_count_ : 0);
       if (OB_ISNULL(task)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else {
@@ -644,6 +674,8 @@ int SemanticOp::capture(Slot &slot)
         ret = OB_SIZE_OVERFLOW;
       } else if (OB_FAIL(reserve(slot, bytes))) {
         if (ret == OB_SIZE_OVERFLOW && count_ == 0 &&
+            (semantic_spec().execution_scope_ != SemanticExecutionScope::LOCAL_PX_WORKER ||
+             execution_->budget().active_tasks() == 0) &&
             bytes > execution_->budget().memory_limit() - execution_->budget().memory_used()) {
           LOG_WARN("semantic input cannot fit while its upstream batch is pinned",
                    K(ret), K(bytes), "memory_used", execution_->budget().memory_used());
@@ -861,6 +893,11 @@ int SemanticOp::evaluate(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &result)
       int64_t bytes = 0;
       if (OB_FAIL(SemanticExprUtils::prepare_request_input(expr, ctx, input_allocator,
                                                           model, input, config, first_request))) {
+      } else if (input.has_files_ &&
+                 semantic_spec().execution_scope_ == SemanticExecutionScope::LOCAL_PX_WORKER) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "local PX row asynchronous execution supports TEXT inputs only");
+        LOG_WARN("FILE input in local PX row asynchronous task", K(ret));
       } else if (task->memoized_ && OB_FAIL(SemanticExprUtils::prepare_cache_key(
           expr, ctx, input_allocator, cache_key))) {
       } else if (task->join_proxy_ && OB_FAIL(SemanticExprUtils::prepare_join_proxy_input(
@@ -1286,7 +1323,7 @@ int SemanticOp::submit_cached_tasks(Slot &slot, Task &task, bool &progress)
   } else if (OB_FAIL(function_cache_->submit(task.expression_->type_, task.model_, task.config_,
       keys, prompts, task.max_parallel_, task.cache_binding_id_, handles, progress,
       proxy, nullptr != proxy ? &documents : nullptr,
-      task.join_proxy_ ? &right_documents : nullptr))) {
+      task.join_proxy_ ? &right_documents : nullptr, task.task_group_, task.task_group_limit_))) {
   } else {
     for (int64_t index = 0; index < rows.count(); ++index) {
       if (handles.at(index)) {
@@ -1344,6 +1381,8 @@ int SemanticOp::submit_tasks(Slot &slot, bool &progress)
       }
     }
     if (OB_SUCC(ret) && positions.empty() && minimum != INT64_MAX &&
+        (semantic_spec().execution_scope_ != SemanticExecutionScope::LOCAL_PX_WORKER ||
+         execution_->budget().active_tasks() == 0) &&
         !has_pending_requests() &&
         (!task.media_ || !task.media_->has_pending())) {
       ret = OB_SIZE_OVERFLOW;
@@ -1351,7 +1390,8 @@ int SemanticOp::submit_tasks(Slot &slot, bool &progress)
     }
     if (OB_SUCC(ret) && !positions.empty()) {
       const bool owned_credit = task.credit_;
-      const int admission = owned_credit ? OB_SUCCESS : execution_->budget().acquire_task();
+      const int admission = owned_credit ? OB_SUCCESS :
+          execution_->budget().acquire_task(task.task_group_, task.task_group_limit_);
       if (admission == OB_EAGAIN) {
       } else if (admission != OB_SUCCESS) {
         ret = admission;
@@ -1410,7 +1450,7 @@ int SemanticOp::submit_tasks(Slot &slot, bool &progress)
           }
         }
         if (!owned_credit && nullptr == task.dispatches_) {
-          execution_->budget().release_task();
+          execution_->budget().release_task(task.task_group_);
           task.credit_ = false;
         }
       }
@@ -1626,6 +1666,9 @@ bool SemanticOp::can_resume(const void *data)
     ready = operation.waiting_memory_ <= budget.memory_limit() - budget.memory_used() &&
         operation.waiting_memory_ <= ObAIFuncClient::pipeline_buffer_limit() -
                                      ObAIFuncClient::pipeline_buffer_usage();
+    ready = ready || (operation.semantic_spec().execution_scope_ == SemanticExecutionScope::LOCAL_PX_WORKER &&
+        budget.active_tasks() == 0 &&
+        operation.waiting_memory_ > budget.memory_limit() - budget.memory_used());
   }
   for (int64_t index = 0; !ready && index < operation.count_; ++index) {
     const Slot &slot = *operation.slots_[(operation.head_ + index) % operation.slot_count_];
@@ -1660,7 +1703,7 @@ bool SemanticOp::can_resume(const void *data)
               }
               ready = operation.function_cache_ && operation.function_cache_->can_submit(
                   task.cache_binding_id_, task.cache_keys_[row], task.cache_prompts_[row],
-                  config_bytes, proxy_bytes);
+                  config_bytes, proxy_bytes, task.task_group_, task.task_group_limit_);
             }
             continue;
           }
@@ -1685,11 +1728,19 @@ bool SemanticOp::can_resume(const void *data)
             const SemanticRequestMemory bytes = request_memory(*task.inputs_.at(position));
             const int64_t config_bytes = nullptr == task.config_ ? 0 : task.config_->get_serialize_size();
             const int64_t required = sizeof(Dispatch) + bytes.body_ + bytes.wire_ + 8 * config_bytes;
+            const bool local_px = operation.semantic_spec().execution_scope_ ==
+                SemanticExecutionScope::LOCAL_PX_WORKER;
+            const bool process_memory_available = !local_px ||
+                required <= ObAIFuncClient::pipeline_buffer_limit() -
+                    ObAIFuncClient::pipeline_buffer_usage();
             ready = (task.in_flight_rows_ < task.max_parallel_ &&
-                     (task.credit_ || budget.task_available()) &&
-                     required <= budget.memory_limit() - budget.memory_used()) ||
+                     (task.credit_ || budget.task_available(task.task_group_, task.task_group_limit_)) &&
+                     required <= budget.memory_limit() - budget.memory_used() &&
+                     process_memory_available) ||
                     (!operation.has_pending_requests() &&
-                     (!task.media_ || !task.media_->has_pending()));
+                     (!task.media_ || !task.media_->has_pending()) &&
+                     (!local_px || (budget.active_tasks() == 0 &&
+                         required > budget.memory_limit() - budget.memory_used())));
           }
         }
       }

@@ -145,6 +145,7 @@ int ObQueryDriver::response_query_result(ObResultSet &result,
   const ObPhysicalPlan *plan = result.get_physical_plan();
   const bool row_async = nullptr != plan && nullptr != plan->get_root_op_spec() &&
                         plan->get_root_op_spec()->has_row_async_semantic_operator();
+  const bool px_row_async = row_async && plan->get_root_op_spec()->type_ == PHY_PX_FIFO_COORD;
   ObSqlCtx *sql_ctx = result.get_exec_context().get_sql_ctx();
   bool is_packed = result.get_physical_plan() ? result.get_physical_plan()->is_packed() : false;
   MYSQL_PROTOCOL_TYPE protocol_type = is_ps_protocol ? MYSQL_PROTOCOL_TYPE::BINARY : MYSQL_PROTOCOL_TYPE::TEXT;
@@ -239,6 +240,10 @@ int ObQueryDriver::response_query_result(ObResultSet &result,
         ++row_num;
         if (0 == row_num % RESET_CONVERT_CHARSET_ALLOCATOR_EVERY_X_ROWS) {
           (void) result.get_exec_context().try_reset_convert_charset_allocator();
+        }
+        if (px_row_async && result.is_output_batch_exhausted() &&
+            OB_FAIL(sender_.flush_buffer(false))) {
+          LOG_WARN("flush completed local PX semantic batch failed", K(ret), K(row_num));
         }
       }
     }

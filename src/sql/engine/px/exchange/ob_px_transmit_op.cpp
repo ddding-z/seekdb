@@ -125,6 +125,7 @@ ObPxTransmitOp::ObPxTransmitOp(ObExecContext &exec_ctx, const ObOpSpec &spec, Ob
   iter_end_(false),
   consume_first_row_(false),
   resumable_(false),
+  row_async_(false),
   first_row_pending_(false),
   dfc_unblock_msg_proc_(dfc_),
   loop_(op_monitor_info_),
@@ -305,6 +306,13 @@ int ObPxTransmitOp::init_channel(ObPxTransmitOpInput &trans_input)
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(trans_input.get_data_ch(
               task_ch_set_, phy_plan_ctx->get_timeout_timestamp(), ch_info_))) {
+  } else if (row_async_ &&
+             (nullptr == ch_info_ || 1 != task_ch_set_.count() ||
+              1 != ch_info_->receive_task_layout_.total_task_cnt_ ||
+              1 != ch_info_->receive_task_layout_.prefix_task_counts_.count())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("row async PX transmit requires one local QC receiver",
+             K(ret), K(task_ch_set_), KP(ch_info_));
   } else if (OB_FAIL(trans_input.get_parent_dfo_key(parent_key))) {
   } else if (OB_FAIL(trans_input.get_self_sqc_info(self_info))) {
   } else if (OB_FAIL(init_dfc(parent_key, self_info))) {
@@ -414,6 +422,27 @@ int ObPxTransmitOp::next_batch(const int64_t max_row_cnt)
     ObDatum *datums = MY_SPEC.random_expr_->locate_datums_for_update(eval_ctx_, brs->size_);
     for (int64_t i = 0; i < brs->size_; i++) {
       datums[i].set_int(get_random_seq());
+    }
+  }
+  return ret;
+}
+
+int ObPxTransmitOp::flush_semantic_rows()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(try_wait_channel())) {
+  }
+  for (int64_t index = 0; OB_SUCC(ret) && index < task_channels_.count(); ++index) {
+    ObDtlBasicChannel *channel = static_cast<ObDtlBasicChannel *>(task_channels_.at(index));
+    if (OB_ISNULL(channel)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("null PX channel while flushing ready semantic rows", K(ret), K(index));
+    } else if (!channel->is_drain()) {
+      // Commit the vectorized append buffer without sending an EOF or retaining child datums.
+      if (OB_FAIL(channel->get_datum_writer().handle_eof())) {
+      } else if (OB_FAIL(channel->flush())) {
+        LOG_WARN("flush PX semantic rows failed", K(ret), K(index));
+      }
     }
   }
   return ret;
