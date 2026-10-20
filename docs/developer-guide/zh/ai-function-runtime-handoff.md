@@ -1,6 +1,6 @@
 # AI Function、异步 Semantic Operators 与全局 SOLO 维护交接
 
-更新日期：2026-10-15。实现起点：`2ea8cd37c`，`feat(sql): add native FILE and multimodal semantic execution`。本文包含在该基线上新增的原生文本 AI_AGG 和数值评分 AI_RANK；保留 2026-10-10 真实视觉模型的部分验收及质量边界。
+更新日期：2026-10-20。实现起点：`2ea8cd37c`，`feat(sql): add native FILE and multimodal semantic execution`。本文包含在该基线上新增的原生文本 AI_AGG 和数值评分 AI_RANK；保留 2026-10-10 真实视觉模型的部分验收及质量边界。
 
 本文面向接手实现、调试和回归测试的开发者，覆盖 AI Function 异步运行时及全阻塞 SOLO。这里的 SOLO 是数据库端的输入排列算法，不是推理服务端的 KV cache 实现。
 
@@ -20,6 +20,8 @@
 | AI_JOIN | INNER JOIN ON 的显式语义连接；普通 SQL 候选对生成加有界异步判断，不做近似候选裁剪 |
 | AI_AGG | 真正跨行的文本聚合；SQL 分组、小组一次调用、有界确定性归约及共享异步运行时 |
 | 语义 PX | 经校验的 reduce-transmit / semantic / GI / scan 路径保留任务状态并释放物理 worker；AUTO 文本行间异步接通 Gather 与客户端增量交付，同一查询共享预算，见第 24 节 |
+| 可选 CTE 分支调度 | 一个 SQL worker 轮转推进依赖已满足的本地物化生产者，重叠独立模型调用；默认关闭，见第 25 节 |
+| 可选调度组对照 | 保留 SQL 批处理，在同一查询共享 HTTP 传输层上比较 G=1 与多行组；默认关闭，见第 26 节 |
 
 旧 AI Function 与 SOLO、AI_MAP / AI_FILTER / AI_JOIN、可恢复 PX 及原生 FILE 实现均已提交；下文保留旧路径的维护约束，不应把旧 SOLO 的单 worker 限制套到新接口上。
 
@@ -1782,3 +1784,164 @@ native 资源 **30 项重复两轮，共 60 次**、native 输入 **25 项**通�
 新增 native 包括无缓存 QC lease、task 私有轮询/迁移、scope 序列化、物理路径
 白名单、并发 per-call 额度和三级依赖容量。这里不宣称线性 DOP 加速、真实模型
 SemBench 性能/质量、sanitizer、跨节点 PX、异步 spill 或通用并行关系算子覆盖。
+
+## 25. 受限物化 CTE 分支调度原型
+
+显式启用 `OPT_PARAM('enable_semantic_branch_async','true')`，每个语义 CTE
+内部使用 `SELECT /*+ MATERIALIZE QB_NAME(branch_name) */ ...` 强制物化。
+默认关闭；值必须是带引号的 true/false。EXPLAIN 的 TEMP TABLE TRANSFORMATION
+会显示 `branch_async=dependency_ready`，但该逻辑策略标记不能代替实际请求重叠证据。
+执行时仍有独立的物理计划准入检查，不支持的显式启用计划报错，不静默回退。
+
+这不是把一条查询拆成三个连接，也不是给每个 CTE 新建线程。一个 SQL worker
+按轮转顺序推进就绪生产者；等待模型时返回到分支调度器，让其他就绪生产者发请求。
+每个生产者保留自己的未完成临时表，只有 EOF 后才发布。依赖来自 TEMP TABLE ACCESS
+引用的真实临时表 ID；共同候选和链式上游完成前，下游不能启动。全部生产者完成后，
+原有 JOIN/UNION 等最终消费者才读取临时表。
+
+首版边界：
+
+- 仅串行 SELECT、一个本地向量化物化图、1-63 个非递归生产者；拒绝 PX、
+  分布式物化、变量赋值及图中的未知依赖/环。
+- 原生 MAP/FILTER/RANK、SUBPLAN SCAN 包装及扫描/已物化输入可协作等待。
+  语义阶段下面的普通关系计算仍按原路径执行；等待语义调用上方的
+  JOIN/SET/DISTINCT/AGG，以及原生 semantic JOIN/AGG 不扩展支持。
+- 原有行异步、proxy、cache 准入不放宽；首轮分支实验关闭这些开关，
+  单独测生产者重叠。最终 UNION DISTINCT 已消除重复时，分支内部冗余 DISTINCT
+  可在实验 SQL 中等价移除，不可对一般查询随意删去。
+- 复用现有异步任务、逐算子槽位上限、查询级语义内存预算和错误取消。
+  对此单图 MAP/FILTER/RANK 形态，显式 false/true 都按全查询调用数统一 task
+  credits，避免某个 CTE 的局部调用数导致共享上下文不一致或兄弟饥饿。
+  临时表使用现有 SQL workarea/spill 控制，不属于 `ai_pipeline_memory_limit`。
+- 尚无自动 GPU/端点资源拓扑识别或端点级统一额度。不同模型名可能共享一个 GPU，
+  因此不能把“三分支并发”写成“三块独立 GPU”或承诺 3 倍加速。应控制每调用并发。
+  全部分支等待时短暂休眠并检查 deadline/取消；首版不释放这个 SQL worker。
+
+关键入口是 `configure_semantic_branch_plan`、`SemanticBranchScope`、
+`ObTempTableInsertOp::advance_semantic_branch` 和
+`ObTempTableTransformationOp::materialize_semantic_branches`。前者在完整物理树生成后
+校验形态/依赖并统一预算；后两者保存半成品并调度，不能把 EAGAIN 放行到任意阻塞算子。
+默认路径保持原来顺序物化；错误时不拷贝无效 batch 指针。
+
+测试入口为
+`tools/deploy/mysql_test/test_suite/ai_function/test_semantic_branch_async.py`。
+它用扣住响应的模型证明独立分支均已发请求，同时验证依赖、共同输入、多批、
+重复/NULL/空表、不同 CTE 调用数、FILTER+UNION DISTINCT、LEFT JOIN 不一致判断、
+取消恢复、超时和显式错误。Debug 构建、11 项新 SQL 契约及同一最终二进制上的
+3 项既有行异步定向回归通过；未重跑全部历史测试。
+具体命令及支持边界见 [RUNTIME_TESTS.md](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md)。
+性能数值应另引实验报告，不能把 mock 正确性验证当作真实 SemBench 性能复现。
+
+## 26. 共享传输层上的单行组与多行组对照
+
+这条实验路径用于公平比较“大批内行间异步”和“只在模型调度层拆成单行”。
+不是把 `rowsets_max_rows` 改成 1，也不是把每行交给一个独立 CURLM 或网络线程。
+两边继续使用同一套逐请求完成发布、脏行依赖推进和就绪输出代码，只改变模型请求
+管理组的行数上限。每行仍单独调用一次 completion，不是模型服务器的 GPU batch。
+
+三个独立参数：
+
+| 参数 | 含义 | 对照示例 |
+| --- | --- | --- |
+| B：`rowsets_max_rows` | SQL 输入/输出批上限 | 两边都是 16 |
+| G：`semantic_dispatch_rows` | 一个模型请求管理组最多包含几行 | 1 对比 16 |
+| C：`semantic_request_limit` | 同一查询同时在途的 HTTP attempt 上限 | 两边都是 4 |
+
+G/C 必须同时显式指定，都是 1-256 的整数；均省略时保留旧传输路径。
+G 是上限，依赖就绪、每调用 parallel 和资源预算仍可能形成更小的组。
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('rowsets_max_rows',16)
+           OPT_PARAM('enable_semantic_cache','false')
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','unordered')
+           OPT_PARAM('semantic_dispatch_rows',1)
+           OPT_PARAM('semantic_request_limit',4) */
+       id, AI_MAP('judge_model', prompt)
+FROM inputs;
+```
+
+对照时只把 G 改为 16，模型/options、B/C、内存预算、SQL 和客户端读取方式保持一致。
+不能拿旧传输路径的多行组和新共享传输层的单行组直接比较，然后把所有差异归因于
+组大小。两种模式都启用 row async，是为了复用同一套行完成机制，并不代表比较无效。
+
+### 26.1 工程实现与窗口
+
+- [AIRequestTransport](../../../src/sql/engine/expr/ob_expr_ai/ob_ai_func_client.h)
+  由同一执行上下文共享，持有一个 CURLM/连接池。现有 AINetwork 线程统一推进，
+  按组轮转、逐请求竞争 C；重试退避不占 active attempt，重试发出时重新占额度。
+  不同模型阶段也共用 C，不是各自再拿 C 个请求。
+- scheduler 另有 64 个查询传输上下文槽，而不是让 G=1 的每行消耗一个旧 client 槽。
+  每组仍有 AIFuncBatch/client/provider/config 封装，并非消除了所有组级固定开销。
+  provider 的输出 schema 有自身的 allocator 生命周期，不能只为减少对象数就让其
+  跨已释放 Dispatch 引用；若后续这部分开销主导，应单独 profiling 后再安全复用。
+- [SemanticOp](../../../src/sql/engine/basic/ob_semantic_op.cpp) 仍捕获整个 SQL batch。
+  当尚未 terminal 的行少于 2*C 时允许再读一批，因此待处理行可以达到 2*C+B-1。
+  快行输出、只剩慢尾的旧 frame 不再把原来的两个输入槽全部钉死。
+  物理 frame 池为 `max(ai_pipeline_slots,2*C+B+1)`，基础存储计入查询共享预算。
+- task credits 使用 `max(ai_pipeline_slots,2*C+1)` 乘全查询调用数，
+  [结果集查询 lease](../../../src/sql/ob_result_set.cpp) 与算子使用相同计算，
+  避免“结果集先用旧双槽额度创建预算、算子再以新窗口申请”导致上下文不一致。
+  task credits 和 frame 数都不能当作实际 HTTP 并发数。
+- 输出复用普通向量化接口；同一 frame 的就绪行可以合为多行 SQL batch，
+  但不会为了凑满 B 而扣住唯一就绪行。输出 datum 仍借用 frame arena，
+  父算子完成借用后才能回收。慢尾仍可能钉住整个 arena，不是逐行内存回收。
+- attach/detach 与网络推进互斥；取消一个组不释放其他组的请求。
+  整个传输层错误会显式终止相关组，查询取消、deadline 和服务器停止也清理在途句柄，
+  不把无效结果转成 false 或成功空值。
+
+首轮只接受串行、静态纯 TEXT MAP/FILTER/RANK，要求 unordered 或 AUTO，
+关闭 function cache 和 embedding proxy；FILE、PX、AI_JOIN、AI_AGG 不扩展支持。
+不支持的组合在规划/EXPLAIN 和执行前明确报错，不静默换回旧路径。
+EXPLAIN 显示 `transport=SHARED_QUERY, dispatch_rows=..., request_limit=...`；
+计划标签不能代替实际请求/批统计。
+
+### 26.2 Q3 的普通 COUNT
+
+显式 G/C 路径下，AUTO 额外允许一个普通 scalar COUNT 消费无序输入，标记为
+`SCALAR_COUNT_INPUT`。例如原 Reviews Q3 的本地接口适配：
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('rowsets_max_rows',16)
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','auto')
+           OPT_PARAM('semantic_dispatch_rows',1)
+           OPT_PARAM('semantic_request_limit',4) */
+       COUNT(*) AS positive_review_counts
+FROM Reviews
+WHERE id = 'taken_3'
+  AND AI_FILTER('judge_model',
+                AI_INPUT('Does the movie review have a positive sentiment?',reviewText));
+```
+
+保留 id 谓词及空集返回 0，不能用 GROUP BY 常量代替 scalar COUNT，也不能删掉
+id 条件扩大样本。COUNT DISTINCT、带顺序的聚合、rollup 等不借此开放。
+普通 scalar aggregate 目前仍保留受保护的 inline wait：模型请求可以重叠，
+但还没有把这层改成可以解栈、释放 SQL worker 后恢复的聚合。Q3 应测完整 EOF，
+不能把第一条中间模型结果当作 COUNT 的最终首行收益。
+
+### 26.3 验收与尚未证明的结论
+
+专项入口为
+[test_semantic_dispatch.py](../../../tools/deploy/mysql_test/test_suite/ai_function/test_semantic_dispatch.py)。
+它只启动自有私有数据库和 loopback mock；日志目录必须不存在。
+关闭服务器的用例只正常停止并重启这个私有实例，不操作现有数据库或模型服务。
+具体命令见 [RUNTIME_TESTS.md](../../../tools/deploy/mysql_test/test_suite/ai_function/RUNTIME_TESTS.md#shared-transport-dispatch-comparison)。
+
+查询收尾记录两类统计：`AI shared request transport` 给出实际组数、最大组行数、
+逻辑请求数和 active HTTP 峰值；`semantic shared dispatch batches` 给出输入批数、
+最大输入批、输出批/行数、最大输出批及 pending 行/frame 峰值。不是只查看 hint。
+
+2026-10-20 的最终 Debug 构建通过 16/16 项专项原生 SQL 契约，另通过同一二进制上
+6 项既有行异步、5 项有序/无序、3 项分支调度回归，共 14 项定向回归。
+验证包括 B=16、G=1/16、C=4，以及 C=80 时超过旧 64-client 界限且两边均有
+多行 SQL 输出；还覆盖慢尾滚动补工作、嵌套模型共享 C、数值 RANK、CASE/OR、
+合成 Q3 中 19 个候选的 COUNT=10 与空集 0、重试/重复行、LIMIT、kill、deadline、
+配额/坏响应后的恢复、显式准入拒绝及扣住响应时正常停止服务器。
+
+这只是可核验的对照运行时与正确性验收。尚未重跑全部历史套件、sanitizer，
+没有在本轮调用真实模型测性能，也没有证明多行组一定比单行组更快。
+真实实验还应记录完整 EOF、首行、CPU、请求并发、组/输出批分布和内存，
+区分组级封装成本与网络/推理时间，并对两边使用相同资源窗口。

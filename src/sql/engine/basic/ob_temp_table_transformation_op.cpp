@@ -17,6 +17,11 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "ob_temp_table_transformation_op.h"
+#include "sql/engine/basic/ob_temp_table_insert_op.h"
+#include "sql/engine/basic/ob_temp_table_access_op.h"
+#include "sql/engine/basic/ob_semantic_op.h"
+#include <chrono>
+#include <thread>
 #include "share/rc/ob_server_runtime.h"
 
 namespace oceanbase
@@ -39,7 +44,186 @@ DEF_TO_STRING(ObTempTableTransformationOpSpec)
   return pos;
 }
 
-OB_SERIALIZE_MEMBER_INHERIT(ObTempTableTransformationOpSpec, ObOpSpec);
+OB_SERIALIZE_MEMBER_INHERIT(ObTempTableTransformationOpSpec, ObOpSpec,
+                            branch_async_, semantic_producers_, branch_dependencies_);
+
+namespace
+{
+bool branch_semantic_type(ObPhyOperatorType type)
+{
+  return type == PHY_SEMANTIC_MAP || type == PHY_SEMANTIC_FILTER ||
+      type == PHY_SEMANTIC_RANK;
+}
+
+int inspect_branch(ObOpSpec &node, const ObIArray<uint64_t> &tables,
+                   uint64_t &dependencies, bool &semantic)
+{
+  int ret = OB_SUCCESS;
+  semantic = branch_semantic_type(node.type_);
+  if (!node.is_vectorized() || node.type_ == PHY_TEMP_TABLE_TRANSFORMATION ||
+      node.type_ == PHY_SEMANTIC_JOIN || node.type_ == PHY_SEMANTIC_AGGREGATE ||
+      node.type_ == PHY_AI_FUNC) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (node.type_ == PHY_TEMP_TABLE_ACCESS) {
+    const auto &access = static_cast<const ObTempTableAccessOpSpec &>(node);
+    int64_t index = 0;
+    while (index < tables.count() && tables.at(index) != access.temp_table_id_) {
+      ++index;
+    }
+    if (access.is_distributed_ || index == tables.count()) {
+      ret = OB_NOT_SUPPORTED;
+    } else {
+      dependencies |= uint64_t(1) << index;
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < node.get_child_cnt(); ++i) {
+    bool child_semantic = false;
+    if (OB_ISNULL(node.get_child(i))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(SMART_CALL(inspect_branch(
+        *node.get_child(i), tables, dependencies, child_semantic)))) {
+    } else {
+      semantic |= child_semantic;
+    }
+  }
+  if (OB_SUCC(ret) && semantic && !branch_semantic_type(node.type_) &&
+      node.type_ != PHY_TEMP_TABLE_INSERT && node.type_ != PHY_SUBPLAN_SCAN) {
+    ret = OB_NOT_SUPPORTED;
+  }
+  if (OB_FAIL(ret)) {
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+        "semantic branch producers require vectorized MAP/FILTER/RANK pipelines over local scans; joins, sets and aggregation above a pending semantic call are not supported");
+    LOG_WARN("unsupported semantic CTE producer", K(ret), "operator_type", node.type_);
+  }
+  return ret;
+}
+
+int configure_transformation(ObTempTableTransformationOpSpec &spec)
+{
+  int ret = OB_SUCCESS;
+  const int64_t count = spec.get_child_cnt() - 1;
+  ObSEArray<uint64_t, 8> tables;
+  if (!spec.is_vectorized() || count < 1 || count > 63) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (OB_FAIL(spec.branch_dependencies_.init(count))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+    ObOpSpec *child = spec.get_child(i);
+    if (nullptr == child || child->type_ != PHY_TEMP_TABLE_INSERT ||
+        static_cast<const ObTempTableInsertOpSpec *>(child)->is_distributed_) {
+      ret = OB_NOT_SUPPORTED;
+    } else if (OB_FAIL(tables.push_back(
+        static_cast<const ObTempTableInsertOpSpec *>(child)->temp_table_id_))) {
+    }
+    for (int64_t j = 0; OB_SUCC(ret) && j < i; ++j) {
+      if (tables.at(j) == tables.at(i)) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+    uint64_t dependencies = 0;
+    bool semantic = false;
+    if (OB_FAIL(inspect_branch(*spec.get_child(i), tables, dependencies, semantic))) {
+    } else if (OB_FAIL(spec.branch_dependencies_.push_back(dependencies))) {
+    } else if (semantic) {
+      spec.semantic_producers_ |= uint64_t(1) << i;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    uint64_t dependencies = 0;
+    bool semantic = false;
+    if (OB_FAIL(inspect_branch(
+        *spec.get_child(count), tables, dependencies, semantic))) {
+    } else if (semantic) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED,
+          "semantic calls must be inside materialized producers when branch scheduling is enabled");
+    }
+  }
+  uint64_t done = 0;
+  const uint64_t all = count > 0 && count <= 63 ? (uint64_t(1) << count) - 1 : 0;
+  for (int64_t pass = 0; OB_SUCC(ret) && pass < count && done != all; ++pass) {
+    const uint64_t before = done;
+    for (int64_t i = 0; i < count; ++i) {
+      if ((spec.branch_dependencies_.at(i) & ~done) == 0) {
+        done |= uint64_t(1) << i;
+      }
+    }
+    if (done == before) {
+      ret = OB_NOT_SUPPORTED;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    spec.branch_async_ = true;
+  } else {
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+        "semantic branch scheduling requires 1 to 63 local nonrecursive materialized CTE producers with an acyclic dependency graph");
+    LOG_WARN("invalid semantic CTE dependency graph", K(ret), K(count), K(tables));
+  }
+  return ret;
+}
+
+int collect_branch_plan(ObOpSpec &node, ObIArray<SemanticSpec *> &stages,
+                        int64_t &transformations, bool &other_semantic,
+                        bool enabled, bool in_producer = false)
+{
+  int ret = OB_SUCCESS;
+  if (branch_semantic_type(node.type_)) {
+    if (enabled && !in_producer) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "semantic branch scheduling requires materialized semantic producers");
+    } else {
+      ret = stages.push_back(static_cast<SemanticSpec *>(&node));
+    }
+  } else if (node.type_ == PHY_SEMANTIC_JOIN || node.type_ == PHY_SEMANTIC_AGGREGATE) {
+    other_semantic = true;
+    if (enabled) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "semantic branch scheduling does not support semantic JOIN or AGG");
+    }
+  } else if (node.type_ == PHY_TEMP_TABLE_TRANSFORMATION) {
+    ++transformations;
+    if (enabled) {
+      ret = configure_transformation(static_cast<ObTempTableTransformationOpSpec &>(node));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < node.get_child_cnt(); ++i) {
+    if (OB_ISNULL(node.get_child(i))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      ret = SMART_CALL(collect_branch_plan(
+          *node.get_child(i), stages, transformations, other_semantic, enabled,
+          in_producer || (node.type_ == PHY_TEMP_TABLE_TRANSFORMATION &&
+                          i < node.get_child_cnt() - 1)));
+    }
+  }
+  return ret;
+}
+}
+
+int configure_semantic_branch_plan(ObOpSpec &root, bool enabled)
+{
+  int ret = OB_SUCCESS;
+  int64_t transformations = 0;
+  bool other_semantic = false;
+  ObSEArray<SemanticSpec *, 8> stages;
+  if (OB_FAIL(collect_branch_plan(root, stages, transformations, other_semantic, enabled))) {
+  } else if (enabled && (transformations != 1 || stages.empty())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+        "semantic branch scheduling requires one materialization graph with native semantic producers");
+  } else if (transformations == 1 && !other_semantic) {
+    int64_t calls = 0;
+    for (SemanticSpec *stage : stages) {
+      calls += stage->semantic_exprs_.count();
+    }
+    for (SemanticSpec *stage : stages) {
+      stage->query_task_count_ = calls;
+    }
+  }
+  return ret;
+}
 
 int ObTempTableTransformationOp::inner_rescan()
 {
@@ -52,6 +236,12 @@ int ObTempTableTransformationOp::inner_rescan()
 int ObTempTableTransformationOp::inner_open()
 {
   int ret = OB_SUCCESS;
+  const auto &spec = static_cast<const ObTempTableTransformationOpSpec &>(spec_);
+  if (spec.branch_async_ && (!is_vectorized() || nullptr != ctx_.get_sqc_handler() ||
+      spec.branch_dependencies_.count() != get_child_cnt() - 1)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "semantic branch scheduling requires a serial local materialization graph");
+  }
   return ret;
 }
 
@@ -99,7 +289,10 @@ int ObTempTableTransformationOp::inner_get_next_batch(const int64_t max_row_cnt)
   const ObBatchRows *child_brs = nullptr;
   clear_evaluated_flag();
   clear_datum_eval_flag();
-  if (init_temp_table_) {
+  if (init_temp_table_ &&
+      static_cast<const ObTempTableTransformationOpSpec &>(spec_).branch_async_) {
+    ret = materialize_semantic_branches(max_row_cnt);
+  } else if (init_temp_table_) {
     for (int64_t i = 0; OB_SUCC(ret) && i < get_child_cnt() - 1; ++i) {
       if (OB_ISNULL(children_[i])) {
         ret = OB_ERR_UNEXPECTED;
@@ -117,7 +310,57 @@ int ObTempTableTransformationOp::inner_get_next_batch(const int64_t max_row_cnt)
                  max_row_cnt, child_brs))) {
   } else { /*do nothing.*/
   }
-  (void)brs_.copy(child_brs);
+  if (OB_SUCC(ret) && nullptr != child_brs) {
+    (void)brs_.copy(child_brs);
+  }
+  return ret;
+}
+
+int ObTempTableTransformationOp::materialize_semantic_branches(int64_t max_row_cnt)
+{
+  int ret = OB_SUCCESS;
+  const auto &spec = static_cast<const ObTempTableTransformationOpSpec &>(spec_);
+  const int64_t count = spec.branch_dependencies_.count();
+  const uint64_t all = (uint64_t(1) << count) - 1;
+  while (OB_SUCC(ret) && completed_branches_ != all) {
+    bool progress = false;
+    if (OB_FAIL(ctx_.check_status())) {
+      break;
+    }
+    for (int64_t offset = 0; OB_SUCC(ret) && offset < count; ++offset) {
+      const int64_t index = (next_branch_ + offset) % count;
+      const uint64_t bit = uint64_t(1) << index;
+      if ((completed_branches_ & bit) != 0 ||
+          (spec.branch_dependencies_.at(index) & ~completed_branches_) != 0) {
+        continue;
+      }
+      bool done = false;
+      if ((spec.semantic_producers_ & bit) != 0) {
+        ret = static_cast<ObTempTableInsertOp *>(children_[index])->advance_semantic_branch(
+            max_row_cnt, done, progress);
+      } else {
+        const ObBatchRows *rows = nullptr;
+        if (OB_FAIL(children_[index]->get_next_batch(max_row_cnt, rows))) {
+        } else if (OB_ISNULL(rows) || !rows->end_) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("relational CTE producer did not materialize completely", K(ret), K(index));
+        } else {
+          done = true;
+          progress = true;
+        }
+      }
+      if (OB_SUCC(ret) && done) {
+        completed_branches_ |= bit;
+      }
+    }
+    next_branch_ = (next_branch_ + 1) % count;
+    if (OB_SUCC(ret) && !progress) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    init_temp_table_ = false;
+  }
   return ret;
 }
 

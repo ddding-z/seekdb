@@ -241,6 +241,14 @@ int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_ite
     if (OB_SUCC(ret) && nullptr != auto_order_reason_) {
       ret = BUF_PRINTF(", output_policy=AUTO, order_reason=%s", auto_order_reason_);
     }
+    int64_t dispatch_rows = 0;
+    int64_t request_limit = 0;
+    if (OB_SUCC(ret) && OB_FAIL(get_plan()->get_optimizer_context().get_global_hint()
+        .opt_params_.get_semantic_dispatch_options(dispatch_rows, request_limit))) {
+    } else if (OB_SUCC(ret) && dispatch_rows > 0) {
+      ret = BUF_PRINTF(", transport=SHARED_QUERY, dispatch_rows=%ld, request_limit=%ld",
+                       dispatch_rows, request_limit);
+    }
     END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
   }
   return ret;

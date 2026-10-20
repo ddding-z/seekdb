@@ -12,6 +12,7 @@
 
 namespace oceanbase
 {
+namespace common { class AIRequestTransport; }
 namespace sql
 {
 class ObExecContext;
@@ -98,6 +99,8 @@ public:
   const std::shared_ptr<SemanticQueryBudget> &budget_handle() const { return budget_; }
   int media_runtime(std::shared_ptr<class SemanticMediaRuntime> &runtime);
   int function_cache(SemanticFunctionCache *&cache);
+  int request_transport(int64_t request_limit,
+                        std::shared_ptr<common::AIRequestTransport> &transport);
 private:
   struct Waiter
   {
@@ -110,6 +113,7 @@ private:
   ObExecContext *ctx_;
   std::shared_ptr<SemanticQueryBudget> budget_;
   std::shared_ptr<class SemanticMediaRuntime> media_;
+  std::shared_ptr<common::AIRequestTransport> transport_;
   int64_t deadline_;
   bool registered_;
   std::mutex mutex_;
@@ -127,6 +131,17 @@ public:
 private:
   bool blocked_;
   static thread_local int64_t blocked_depth_;
+};
+
+// Only validated materialized-producer pipelines may yield to a sibling.
+class SemanticBranchScope
+{
+public:
+  SemanticBranchScope();
+  ~SemanticBranchScope();
+  static bool active() { return depth_ > 0; }
+private:
+  static thread_local int64_t depth_;
 };
 
 }

@@ -1786,6 +1786,7 @@ int ObAIFuncModel::start_completion_batch(ObArray<ObString> &prompts, ObJsonObje
     client.set_response_validator(complete_provider);
     if (OB_FAIL(client.init(*allocator_, endpoint_info_.get_url(), headers))) {
     } else {
+      client.transport_ = batch.transport_;
       client.set_incremental_results(batch.incremental_results_);
       if (OB_FAIL(client.send_post_batch_no_wait(body_array))) {
       } else if (OB_FAIL(client.start_async(!batch.nonblocking_admission_))) {

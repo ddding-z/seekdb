@@ -43,7 +43,7 @@ namespace sql
 {
 namespace
 {
-int find_semantic_query_tasks(const ObOpSpec *spec, int64_t &tasks)
+int find_semantic_query_tasks(const ObOpSpec *spec, int64_t &tasks, int64_t &dispatch_slots)
 {
   int ret = OB_SUCCESS;
   if (nullptr != spec) {
@@ -52,10 +52,11 @@ int find_semantic_query_tasks(const ObOpSpec *spec, int64_t &tasks)
       const auto &semantic = *static_cast<const SemanticSpec *>(spec);
       if (semantic.row_async_enabled_ || !semantic.memoized_exprs_.empty()) {
         tasks = std::max(tasks, semantic.query_task_count_);
+        dispatch_slots = std::max(dispatch_slots, semantic.task_slots(0));
       }
     }
     for (uint32_t child = 0; OB_SUCC(ret) && child < spec->get_child_cnt(); ++child) {
-      ret = SMART_CALL(find_semantic_query_tasks(spec->get_child(child), tasks));
+      ret = SMART_CALL(find_semantic_query_tasks(spec->get_child(child), tasks, dispatch_slots));
     }
   }
   return ret;
@@ -65,18 +66,21 @@ int pin_semantic_query(ObExecContext &ctx, const ObOpSpec *root)
 {
   int ret = OB_SUCCESS;
   int64_t tasks = 0;
+  int64_t dispatch_slots = 0;
   int64_t slots = 0;
   int64_t memory = 0;
   std::shared_ptr<SemanticExecutionState> state;
-  if (OB_FAIL(find_semantic_query_tasks(root, tasks))) {
+  if (OB_FAIL(find_semantic_query_tasks(root, tasks, dispatch_slots))) {
   } else if (tasks == 0) {
   } else if (OB_FAIL(ctx.get_my_session()->get_sys_variable(
       share::SYS_VAR_AI_PIPELINE_SLOTS, slots))) {
   } else if (OB_FAIL(ctx.get_my_session()->get_sys_variable(
       share::SYS_VAR_AI_PIPELINE_MEMORY_LIMIT, memory))) {
-  } else if (slots <= 0 || tasks > INT64_MAX / slots) {
+  } else if (slots <= 0 || slots > 1024 ||
+             tasks > INT64_MAX / std::max(slots, dispatch_slots)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(SemanticExecutionState::acquire(ctx, memory, slots * tasks, state,
+  } else if (OB_FAIL(SemanticExecutionState::acquire(ctx, memory,
+                         std::max(slots, dispatch_slots) * tasks, state,
                          nullptr != root && root->has_row_async_semantic_operator()))) {
   } else {
     // Keep one query budget across early/late PX tasks, including uncached execution.

@@ -4,6 +4,141 @@ Legacy baseline validation (2026-09-29): the Debug build, all **105 SQL contract
 
 For the current architecture, code map, maintenance invariants and handoff checklist, see the [Chinese maintenance handoff](../../../../../docs/developer-guide/zh/ai-function-runtime-handoff.md).
 
+## Shared-Transport Dispatch Comparison
+
+This opt-in path separates **B**, the ordinary SQL batch size, **G**, the
+maximum rows in one model-request management group, and **C**, the query-wide
+active HTTP-attempt limit. It does not change one HTTP completion per demanded
+row into provider/GPU batch inference.
+
+```sql
+SELECT /*+ PARALLEL(1)
+           OPT_PARAM('rowsets_max_rows',16)
+           OPT_PARAM('enable_semantic_cache','false')
+           OPT_PARAM('enable_semantic_row_async','true')
+           OPT_PARAM('semantic_output_order','unordered')
+           OPT_PARAM('semantic_dispatch_rows',1)
+           OPT_PARAM('semantic_request_limit',4) */
+       id, AI_MAP('judge_model', prompt)
+FROM inputs;
+```
+
+Compare G=1 with G=16 by changing only `semantic_dispatch_rows`; keep B, C,
+models/options, query memory budget and client consumption policy identical.
+Both variants use the existing per-row completion/dependency logic and one
+query-shared CURLM/connection pool. A singleton group does not consume one of
+the legacy scheduler's 64 client slots; the separate registry holds up to 64
+shared query transports. Each group still owns its batch/client/provider and
+configuration wrapper. Their setup costs have not all been eliminated or
+proven negligible; do not present them as unavoidable scheduling costs.
+
+Both new options are integer values in 1-256 and must be supplied together.
+Omitting both preserves the existing transport. The new path requires row
+async, unordered/AUTO output, serial static TEXT MAP/FILTER/RANK, and disabled
+function cache and proxy. FILE, PX and native AI_JOIN/AI_AGG do not gain support.
+Unsupported combinations fail in EXPLAIN and SELECT before model work.
+EXPLAIN reports `transport=SHARED_QUERY`, `dispatch_rows` and `request_limit`;
+these describe requested policy, not runtime concurrency evidence.
+
+SQL frames remain batched. Ready rows are returned up to the caller's batch
+limit without waiting to fill a batch; singleton dispatch does not force
+single-row SQL pulls. New input is admitted while fewer than 2*C rows remain
+nonterminal, so admitting a complete batch can reach 2*C+B-1 pending rows.
+The physical frame pool is `max(ai_pipeline_slots, 2*C+B+1)`, with its base
+storage charged to the shared query memory budget. Request-bearing task
+credits instead use `max(ai_pipeline_slots, 2*C+1)` times the query call count;
+the result-set query lease uses the same calculation. Neither task credits nor
+frame count is the HTTP limit. A slow row can still pin its batch arena;
+this is not per-row arena reclamation or an RSS/GPU-memory bound.
+
+AUTO additionally admits one ordinary scalar COUNT aggregate for this explicit
+dispatch mode, including a relational predicate plus AI_FILTER and COUNT=0 on
+empty input. DISTINCT/ordered/rollup aggregates remain excluded. Scalar COUNT
+keeps the existing protected inline-wait boundary: model requests overlap, but
+this aggregate has not been made worker-suspend/resume capable.
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_dispatch.py \
+  --binary build_debug/bin/src/observer/seekdb \
+  --log-dir /tmp/semantic-dispatch-results
+```
+
+The entry point owns its isolated deployment and loopback fixtures; the log
+directory must not already exist. `--list-cases` starts no services, and repeat
+`--case` for selection. Its shutdown case normally stops and restarts only that
+private deployment with responses still held. Query teardown logs
+`AI shared request transport` counters for actual group size, logical requests
+and peak active attempts, plus `semantic shared dispatch batches` counters for
+input/output batches, output rows and peak pending rows/frames.
+
+Validation (2026-10-20): Debug build and **16/16 new native SQL contracts**
+passed, with **14/14 selected existing contracts** on the same binary:
+six row-async, five ordered/unordered and three CTE-branch cases. Evidence
+includes B=16/G=1 versus G=16/C=4, 80 simultaneously held requests beyond the
+old client-slot boundary, multirow SQL output in both variants, rolling
+admission past two slow source batches, dependent model stages sharing C,
+numeric RANK, CASE/OR demand, synthetic Q3 COUNT=10 from 19 selected rows and
+COUNT=0 on empty input, retry/duplicates, LIMIT, kill, deadline, quota/error
+recovery, unsupported-mode admission and normal shutdown with held requests.
+No full historical suite, sanitizer, real-model timing or SemBench speedup
+comparison is claimed.
+
+## Restricted Materialized-CTE Branch Scheduling
+
+`OPT_PARAM('enable_semantic_branch_async','true')` opts a serial SELECT into
+dependency-ready producer scheduling. It defaults to false. Force each semantic
+CTE to materialize with `SELECT /*+ MATERIALIZE QB_NAME(branch_name) */ ...`.
+EXPLAIN annotates the transformation with `branch_async=dependency_ready`.
+Unsupported executable plans fail explicitly; the EXPLAIN annotation describes
+the requested logical policy, not proof of runtime overlap.
+
+One SQL worker cooperatively advances ready producers and reuses the existing
+asynchronous model dispatch. A producer yields on model waits, keeps its partial
+temporary store, and publishes that store only at EOF. Its dependants cannot
+start earlier. The ordinary final JOIN/UNION consumer starts after all producers
+finish. This is not three concurrent SQL statements, arbitrary JOIN/PX branch
+execution, or row-asynchronous output.
+
+The prototype accepts one local vectorized materialization graph, 1-63
+nonrecursive producers, and native MAP/FILTER/RANK pipelines over base/temporary
+scans. SUBPLAN SCAN wrappers and completed relational inputs below a semantic
+stage are allowed. Blocking JOIN/SET/DISTINCT/AGG above a pending semantic stage,
+semantic JOIN/AGG, distributed materialization, PX and variable assignments are
+not admitted. Pure relational common-input CTEs retain the ordinary engine path.
+Per-branch DISTINCT can only be removed when a final UNION DISTINCT makes it
+provably redundant.
+
+Use the same explicit option with `'false'` for the paired sequential baseline.
+For this single-graph MAP/FILTER/RANK shape, both values normalize query-wide
+semantic task credits to the same total call count; each operator retains its
+existing slot cap. The semantic memory budget is query-wide. Materialization
+uses the existing, separate SQL temporary-store/workarea and spill controls.
+The prototype does not infer GPU identities or enforce endpoint-wide admission:
+two model bindings may still share one GPU. Keep per-call parallelism bounded.
+The worker checks cancellation/deadlines while waiting, but this first version
+does not return that worker to the tenant when every branch is waiting.
+
+```sh
+python tools/deploy/mysql_test/test_suite/ai_function/test_semantic_branch_async.py \
+  --binary build_debug/bin/src/observer/seekdb
+```
+
+The entry point owns only its private deployment; `--socket` never stops the
+supplied server. Repeat `--case` for focused selection; `--log-dir` requires a
+new directory. Held responses distinguish genuine single-SQL producer overlap
+from response-order differences. Contracts cover the default/off sequential
+path, dependencies, shared inputs, multi-batch bags/duplicates/NULL/empty stores,
+unequal per-CTE task counts, FILTER plus UNION DISTINCT, cancellation/recovery,
+shared-candidate LEFT JOIN mismatch consumers, deadline, fail-fast provider
+errors and zero-model-work unsupported admission.
+These are deterministic correctness contracts, not real-model speedup claims.
+
+Validation (2026-10-18): Debug build and **11/11 focused branch SQL contracts**
+passed, plus **3/3 selected existing row-async contracts** on the same final
+binary (default batch barrier, early LIMIT cancellation and nested row
+dependencies). No full historical suite, sanitizer or distributed branch
+validation is claimed.
+
 ## Native Semantic Rank: Numeric Per-Row Scoring
 
 `AI_RANK(model, input[, options])` implements SemBench's numeric `AI.SCORE`

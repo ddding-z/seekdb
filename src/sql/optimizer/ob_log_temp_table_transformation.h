@@ -42,6 +42,7 @@ public:
   int get_temp_table_exprs(ObIArray<ObRawExpr *> &set_exprs) const;
   int allocate_startup_expr_post() override;
   virtual int get_card_without_filter(double &card) override;
+  virtual int get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item) override;
 };
 
 } // end of namespace sql

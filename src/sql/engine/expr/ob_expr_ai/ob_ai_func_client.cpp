@@ -91,7 +91,7 @@ void ObAIFuncClient::release_pipeline_buffer(int64_t &used, int64_t bytes)
 class AIFuncScheduler final : public lib::Threads
 {
 public:
-  AIFuncScheduler() : lib::Threads(1), clients_{}, started_(false), stopping_(false) {}
+  AIFuncScheduler() : lib::Threads(1), clients_{}, transports_{}, started_(false), stopping_(false) {}
   ~AIFuncScheduler() override { shutdown(); }
 
   void shutdown()
@@ -151,6 +151,39 @@ public:
     return stopping_.load() || std::find(clients_.begin(), clients_.end(), nullptr) != clients_.end();
   }
 
+  int register_transport(AIRequestTransport &transport)
+  {
+    int ret = OB_SUCCESS;
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (stopping_.load()) {
+      ret = OB_CANCELED;
+    } else if (!started_ && OB_FAIL(start())) {
+    } else {
+      started_ = true;
+      auto slot = std::find(transports_.begin(), transports_.end(), nullptr);
+      if (slot == transports_.end()) {
+        ret = OB_SIZE_OVERFLOW;
+        LOG_WARN("shared AI transport capacity exhausted", K(ret));
+      } else {
+        *slot = &transport;
+        changed_.notify_all();
+      }
+    }
+    return ret;
+  }
+
+  void unregister_transport(AIRequestTransport &transport)
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto slot = std::find(transports_.begin(), transports_.end(), &transport);
+    if (slot != transports_.end()) {
+      *slot = nullptr;
+    }
+    changed_.notify_all();
+  }
+
+  void notify() { changed_.notify_all(); }
+
   void wait_for_capacity(int64_t wait_ms)
   {
     std::unique_lock<std::mutex> guard(mutex_);
@@ -196,10 +229,26 @@ public:
           }
         }
       }
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        for (AIRequestTransport *transport : transports_) {
+          if (nullptr != transport) {
+            if (stopping_.load()) {
+              std::lock_guard<std::mutex> transport_guard(transport->mutex_);
+              transport->failure_ = OB_CANCELED;
+            }
+            pending = transport->drive(stopping_.load()) || pending;
+          }
+        }
+      }
       std::unique_lock<std::mutex> guard(mutex_);
       const auto has_clients = [&] {
         return std::any_of(clients_.begin(), clients_.end(),
-                           [](ObAIFuncClient *client) { return nullptr != client; });
+                           [](ObAIFuncClient *client) { return nullptr != client; }) ||
+               std::any_of(transports_.begin(), transports_.end(),
+                           [](AIRequestTransport *transport) {
+                             return nullptr != transport && transport->pending();
+                           });
       };
       if (stopping_.load() && !has_clients()) {
         break;
@@ -216,6 +265,7 @@ private:
   std::mutex mutex_;
   std::condition_variable changed_;
   std::array<ObAIFuncClient *, 64> clients_;
+  std::array<AIRequestTransport *, 64> transports_;
   bool started_;
   std::atomic<bool> stopping_;
 };
@@ -248,6 +298,177 @@ struct ObAIFuncClient::Request
   int64_t started_at_;
   std::atomic<ResultState> result_state_;
 };
+
+AIRequestTransport::AIRequestTransport(uint64_t execution_id, int64_t request_limit)
+    : execution_id_(execution_id), request_limit_(request_limit), curlm_(nullptr),
+      pending_(0), active_(0), next_(0), groups_(0), requests_(0),
+      max_group_rows_(0), peak_active_(0), failure_(OB_SUCCESS), registered_(false)
+{}
+
+int AIRequestTransport::init()
+{
+  int ret = OB_SUCCESS;
+  if (request_limit_ < 1 || request_limit_ > 256 || nullptr != curlm_) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (nullptr == (curlm_ = curl_multi_init())) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (CURLM_OK != curl_multi_setopt(curlm_, CURLMOPT_MAXCONNECTS, static_cast<long>(request_limit_)) ||
+             CURLM_OK != curl_multi_setopt(curlm_, CURLMOPT_MAX_TOTAL_CONNECTIONS, static_cast<long>(request_limit_))) {
+    ret = OB_CURL_ERROR;
+    LOG_WARN("failed to bound shared AI connection pool", K(ret), K(request_limit_));
+  } else if (OB_FAIL(AIFuncScheduler::instance().register_transport(*this))) {
+  } else {
+    registered_ = true;
+  }
+  return ret;
+}
+
+AIRequestTransport::~AIRequestTransport()
+{
+  if (registered_) {
+    AIFuncScheduler::instance().unregister_transport(*this);
+  }
+  OB_ASSERT(clients_.empty());
+  OB_ASSERT(active_ == 0);
+  LOG_INFO("AI shared request transport", K(execution_id_), K(request_limit_),
+           K(groups_), K(requests_), K(max_group_rows_), K(peak_active_), K(failure_));
+  if (nullptr != curlm_) {
+    curl_multi_cleanup(curlm_);
+  }
+}
+
+int AIRequestTransport::attach(ObAIFuncClient &client)
+{
+  int ret = OB_SUCCESS;
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (failure_ != OB_SUCCESS) {
+      ret = failure_;
+    } else if (!registered_ || client.requests_.empty() ||
+               std::find(clients_.begin(), clients_.end(), &client) != clients_.end()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      try {
+        clients_.push_back(&client);
+      } catch (const std::bad_alloc &) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to register shared AI request group", K(ret));
+      }
+      if (OB_SUCC(ret)) {
+        client.curlm_ = curlm_;
+        client.async_mode_ = true;
+        client.async_done_.store(false, std::memory_order_release);
+        ++groups_;
+        requests_ += client.requests_.count();
+        max_group_rows_ = std::max(max_group_rows_, client.requests_.count());
+        pending_.fetch_add(1, std::memory_order_release);
+      }
+    }
+  }
+  AIFuncScheduler::instance().notify();
+  return ret;
+}
+
+void AIRequestTransport::finish(ObAIFuncClient &client, int ret)
+{
+  if (!client.async_done_.load(std::memory_order_acquire)) {
+    for (ObAIFuncClient::Request *request : client.requests_) {
+      if (request->active_) {
+        curl_multi_remove_handle(curlm_, request->handle_);
+        curl_easy_cleanup(request->handle_);
+        request->handle_ = nullptr;
+        request->active_ = false;
+        --active_;
+      }
+    }
+    client.active_count_ = 0;
+    client.batch_ret_ = ret;
+    if (ret != OB_SUCCESS) {
+      client.latch_incremental_error(ret);
+    }
+    client.is_finished_.store(true, std::memory_order_release);
+    client.async_done_.store(true, std::memory_order_release);
+    pending_.fetch_sub(1, std::memory_order_release);
+  }
+}
+
+void AIRequestTransport::detach(ObAIFuncClient &client)
+{
+  std::lock_guard<std::mutex> guard(mutex_);
+  auto found = std::find(clients_.begin(), clients_.end(), &client);
+  if (found != clients_.end()) {
+    finish(client, OB_CANCELED);
+    clients_.erase(found);
+  }
+  client.curlm_ = nullptr;
+  client.async_mode_ = false;
+}
+
+bool AIRequestTransport::drive(bool cancel)
+{
+  std::lock_guard<std::mutex> guard(mutex_);
+  int ret = cancel ? OB_CANCELED : failure_;
+  int running = 0;
+  if (OB_SUCC(ret) && pending() && CURLM_OK != curl_multi_perform(curlm_, &running)) {
+    ret = OB_CURL_ERROR;
+  }
+  int left = 0;
+  CURLMsg *message = nullptr;
+  while (OB_SUCC(ret) && nullptr != (message = curl_multi_info_read(curlm_, &left))) {
+    if (message->msg != CURLMSG_DONE) {
+      continue;
+    }
+    ObAIFuncClient::Request *request = nullptr;
+    if (CURLE_OK != curl_easy_getinfo(message->easy_handle, CURLINFO_PRIVATE, &request) ||
+        nullptr == request) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      --active_;
+      ret = request->owner_.finish_request(*request, message->data.result);
+    }
+  }
+  for (ObAIFuncClient *client : clients_) {
+    if (OB_SUCC(ret) && !client->async_done_.load(std::memory_order_acquire)) {
+      ret = client->check_status();
+    }
+  }
+  bool started = true;
+  while (OB_SUCC(ret) && active_ < request_limit_ && started && !clients_.empty()) {
+    started = false;
+    const int64_t count = clients_.size();
+    for (int64_t i = 0; OB_SUCC(ret) && i < count && active_ < request_limit_; ++i) {
+      ObAIFuncClient &client = *clients_[(next_ + i) % count];
+      if (client.async_done_.load(std::memory_order_acquire) ||
+          client.active_count_ >= (client.max_parallel_ == 0
+              ? client.requests_.count() : client.max_parallel_)) {
+        continue;
+      }
+      for (ObAIFuncClient::Request *request : client.requests_) {
+        if (!request->active_ && !request->done_ &&
+            request->retry_at_ <= ObTimeUtility::current_time()) {
+          ret = client.start_request(*request);
+          if (OB_SUCC(ret)) {
+            ++active_;
+            peak_active_ = std::max(peak_active_, active_);
+            started = true;
+          }
+          break;
+        }
+      }
+    }
+    next_ = (next_ + 1) % count;
+  }
+  if (OB_FAIL(ret)) {
+    failure_ = ret;
+    LOG_WARN("shared AI request transport failed", K(ret), K(execution_id_));
+  }
+  for (ObAIFuncClient *client : clients_) {
+    if (ret != OB_SUCCESS || client->completed_count_ == client->requests_.count()) {
+      finish(*client, ret);
+    }
+  }
+  return pending();
+}
 
 ObAIFuncClient::ObAIFuncClient()
   : allocator_(nullptr), url_(nullptr), header_list_(nullptr), curlm_(nullptr),
@@ -334,6 +555,7 @@ void ObAIFuncClient::reset()
   request_session_ = nullptr;
   batch_ret_ = OB_SUCCESS;
   incremental_results_ = false;
+  transport_.reset();
 }
 
 void ObAIFuncClient::latch_incremental_error(int ret)
@@ -476,7 +698,7 @@ int ObAIFuncClient::send_post_batch_no_wait(ObArray<ObJsonObject *> &data_array)
     ret = OB_INVALID_ARGUMENT;
   } else if (data_array.count() > MAX_BATCH_BYTES / static_cast<int64_t>(sizeof(Request))) {
     ret = OB_SIZE_OVERFLOW;
-  } else if (nullptr == curlm_ && nullptr == (curlm_ = curl_multi_init())) {
+  } else if (!transport_ && nullptr == curlm_ && nullptr == (curlm_ = curl_multi_init())) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
     ret = reserve_buffer(data_array.count() * static_cast<int64_t>(sizeof(Request)));
@@ -496,7 +718,7 @@ int ObAIFuncClient::send_post_batch_no_wait(ObArray<ObJsonObject *> &data_array)
     } else if (OB_FAIL(reserve_buffer(request->body_.length()))) {
     }
   }
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret) && !transport_) {
     ret = advance_batch();
   }
   if (OB_FAIL(ret)) {
@@ -684,6 +906,8 @@ int ObAIFuncClient::start_async(bool wait_for_slot)
   int ret = OB_SUCCESS;
   if (async_mode_ || admission_pending_) {
     ret = OB_INIT_TWICE;
+  } else if (transport_) {
+    ret = transport_->attach(*this);
   } else if (nullptr == curlm_ || requests_.empty()) {
     ret = OB_NOT_INIT;
   } else {
@@ -700,7 +924,9 @@ int ObAIFuncClient::start_async(bool wait_for_slot)
 void ObAIFuncClient::cancel_async()
 {
   admission_pending_ = false;
-  if (async_mode_) {
+  if (transport_) {
+    transport_->detach(*this);
+  } else if (async_mode_) {
     cancel_ret_.store(OB_CANCELED);
     AIFuncScheduler::instance().wait_for(*this, -1);
     async_mode_ = false;

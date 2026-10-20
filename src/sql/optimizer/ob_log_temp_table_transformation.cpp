@@ -33,6 +33,22 @@ ObLogTempTableTransformation::~ObLogTempTableTransformation()
 {
 }
 
+int ObLogTempTableTransformation::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item)
+{
+  int ret = ObLogicalOperator::get_plan_item_info(plan_text, plan_item);
+  bool enabled = false;
+  if (OB_SUCC(ret) && OB_FAIL(get_plan()->get_optimizer_context().get_global_hint().opt_params_
+      .get_bool_opt_param(ObOptParamHint::ENABLE_SEMANTIC_BRANCH_ASYNC, enabled))) {
+  } else if (OB_SUCC(ret) && enabled) {
+    BEGIN_BUF_PRINT;
+    if (OB_FAIL(BUF_PRINTF("branch_async=dependency_ready, producers=%ld",
+                           get_num_of_child() - 1))) {
+    }
+    END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
+  }
+  return ret;
+}
+
 int ObLogTempTableTransformation::compute_op_ordering()
 {
   int ret = OB_SUCCESS;

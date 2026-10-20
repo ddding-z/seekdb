@@ -37,16 +37,23 @@ public:
   OB_UNIS_VERSION_V(1);
 public:
   ObTempTableTransformationOpSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
-    : ObOpSpec(alloc, type) {}
+    : ObOpSpec(alloc, type), branch_async_(false), semantic_producers_(0),
+      branch_dependencies_(alloc) {}
   virtual ~ObTempTableTransformationOpSpec() {}
   DECLARE_VIRTUAL_TO_STRING;
+  bool branch_async_;
+  uint64_t semantic_producers_;
+  common::ObFixedArray<uint64_t, common::ObIAllocator> branch_dependencies_;
 };
+
+int configure_semantic_branch_plan(ObOpSpec &root, bool enabled);
 
 class ObTempTableTransformationOp : public ObOperator
 {
 public:
   ObTempTableTransformationOp(ObExecContext &exec_ctx, const ObOpSpec &spec, ObOpInput *input)
-    : ObOperator(exec_ctx, spec, input), init_temp_table_(true) {}
+    : ObOperator(exec_ctx, spec, input), init_temp_table_(true),
+      completed_branches_(0), next_branch_(0) {}
   ~ObTempTableTransformationOp() {}
   virtual int inner_open() override;
   virtual int inner_rescan() override;
@@ -58,6 +65,10 @@ public:
   int destory_local_interm_results(ObIArray<uint64_t> &result_ids);
 
   bool init_temp_table_;
+private:
+  int materialize_semantic_branches(int64_t max_row_cnt);
+  uint64_t completed_branches_;
+  int64_t next_branch_;
 };
 
 } // end namespace sql

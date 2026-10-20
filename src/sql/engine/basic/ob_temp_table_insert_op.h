@@ -84,7 +84,8 @@ public:
       all_datum_store_(),
       interm_result_ids_(),
       task_(NULL),
-      init_temp_table_(true) {}
+      init_temp_table_(true),
+      branch_store_(nullptr) {}
   ~ObTempTableInsertOp() {}
 
   virtual int inner_open() override;
@@ -94,6 +95,7 @@ public:
   virtual int inner_close() override;
   virtual void destroy() override;
   int do_get_next_batch(const int64_t max_row_cnt);
+  int advance_semantic_branch(int64_t max_row_cnt, bool &done, bool &progress);
   int add_row_to_temp_table(dtl::ObDTLIntermResultInfo *&chunk_row_store);
   int add_rows_to_temp_table(dtl::ObDTLIntermResultInfo *&chunk_row_store,
                              const ObBatchRows *brs);
@@ -124,6 +126,7 @@ private:
   common::ObSEArray<uint64_t, 8> interm_result_ids_;
   ObPxTask *task_;
   bool init_temp_table_;
+  dtl::ObDTLIntermResultInfo *branch_store_;
 };
 
 } // end namespace sql

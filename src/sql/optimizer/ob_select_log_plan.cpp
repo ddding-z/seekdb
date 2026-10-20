@@ -5401,7 +5401,17 @@ int check_semantic_output_plan(const ObLogicalOperator &node, bool automatic)
     }
   } else if (type == LOG_GROUP_BY) {
     const auto &group = static_cast<const ObLogGroupBy &>(node);
-    if (group.get_algo() != HASH_AGGREGATE || group.has_rollup() ||
+    int64_t dispatch_rows = 0;
+    int64_t request_limit = 0;
+    if (OB_FAIL(node.get_plan()->get_optimizer_context().get_global_hint()
+        .opt_params_.get_semantic_dispatch_options(dispatch_rows, request_limit))) {
+      return ret;
+    }
+    const bool scalar_count = dispatch_rows > 0 && group.get_algo() == SCALAR_AGGREGATE &&
+        group.get_aggr_funcs().count() == 1 &&
+        nullptr != group.get_aggr_funcs().at(0) &&
+        group.get_aggr_funcs().at(0)->get_expr_type() == T_FUN_COUNT;
+    if ((group.get_algo() != HASH_AGGREGATE && !scalar_count) || group.has_rollup() ||
         group.is_adaptive_aggregate() || group.is_three_stage_aggr() || group.is_push_down()) {
       ret = OB_NOT_SUPPORTED;
     }
@@ -5412,7 +5422,7 @@ int check_semantic_output_plan(const ObLogicalOperator &node, bool automatic)
       }
     }
     if (ret == OB_NOT_SUPPORTED) {
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "automatic semantic output requires ordinary non-adaptive hash aggregation without rollup, DISTINCT or aggregate ordering");
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "automatic semantic output requires ordinary hash aggregation or opt-in scalar COUNT, without rollup, DISTINCT or aggregate ordering");
       LOG_WARN("unsupported automatic semantic aggregation boundary", K(ret));
     }
   } else if (type == LOG_DISTINCT) {
@@ -5577,8 +5587,15 @@ int check_semantic_row_async_plan(ObLogicalOperator &root, const ObSelectStmt &s
 {
   int ret = OB_SUCCESS;
   bool serial = true;
+  int64_t dispatch_rows = 0;
+  int64_t request_limit = 0;
   local_px = false;
-  if (OB_FAIL(check_solo_plan(&root, serial))) {
+  if (OB_FAIL(root.get_plan()->get_optimizer_context().get_global_hint()
+      .opt_params_.get_semantic_dispatch_options(dispatch_rows, request_limit))) {
+  } else if (OB_FAIL(check_solo_plan(&root, serial))) {
+  } else if (dispatch_rows > 0 && !serial) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "shared semantic dispatch currently requires serial execution");
   } else if (serial) {
     if (policy != ObOptParamHint::SemanticOutputPolicy::ORDERED &&
         OB_FAIL(check_semantic_output_plan(root, policy == ObOptParamHint::SemanticOutputPolicy::AUTO))) {
@@ -5615,7 +5632,8 @@ int assign_semantic_auto_output(ObLogicalOperator &node, bool ordered, const cha
     reason = "SORT_RESTORES_ORDER";
   } else if (node.get_type() == LOG_GROUP_BY) {
     ordered = false;
-    reason = "HASH_AGGREGATE_INPUT";
+    reason = static_cast<ObLogGroupBy &>(node).get_algo() == SCALAR_AGGREGATE
+        ? "SCALAR_COUNT_INPUT" : "HASH_AGGREGATE_INPUT";
   } else if (node.get_type() == LOG_DISTINCT) {
     ordered = false;
     reason = "HASH_DISTINCT_INPUT";
@@ -5820,6 +5838,8 @@ public:
     bool cache_enabled = false;
     bool proxy_enabled = false;
     bool row_async_enabled = false;
+    int64_t dispatch_rows = 0;
+    int64_t request_limit = 0;
     ObOptParamHint::SemanticOutputPolicy policy = ObOptParamHint::SemanticOutputPolicy::ORDERED;
     const ObOptParamHint &options = plan_.get_optimizer_context().get_global_hint().opt_params_;
     if (OB_FAIL(options.get_bool_opt_param(
@@ -5833,6 +5853,8 @@ public:
       LOG_WARN("failed to read row asynchronous execution option", K(ret));
     } else if (OB_FAIL(options.get_semantic_output_policy(policy))) {
       LOG_WARN("failed to read semantic output order", K(ret));
+    } else if (OB_FAIL(options.get_semantic_dispatch_options(dispatch_rows, request_limit))) {
+      LOG_WARN("failed to read shared semantic dispatch options", K(ret));
     }
     ObSEArray<ObRawExpr *, 16> calls;
     bool local_px = false;
@@ -5870,6 +5892,9 @@ public:
           ret = OB_NOT_SUPPORTED;
           LOG_USER_ERROR(OB_NOT_SUPPORTED,
                          "row asynchronous execution supports static text or FILE MAP/FILTER/RANK calls only");
+        } else if (dispatch_rows > 0 && !SemanticExprUtils::supports_function_cache(call)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "shared semantic dispatch currently supports static TEXT calls only");
         }
       }
     }

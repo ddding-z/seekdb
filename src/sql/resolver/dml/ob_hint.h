@@ -159,6 +159,9 @@ struct ObOptParamHint
     DEF(SEMANTIC_PROXY_THRESHOLD,)                  \
     DEF(ENABLE_SEMANTIC_ROW_ASYNC,)                 \
     DEF(SEMANTIC_OUTPUT_ORDER,)                    \
+    DEF(ENABLE_SEMANTIC_BRANCH_ASYNC,)              \
+    DEF(SEMANTIC_DISPATCH_ROWS,)                    \
+    DEF(SEMANTIC_REQUEST_LIMIT,)                    \
 
 
   DECLARE_ENUM(OptParamType, opt_param, OPT_PARAM_TYPE_DEF, static);
@@ -180,6 +183,7 @@ struct ObOptParamHint
   int get_integer_opt_param(const OptParamType param_type, int64_t &val) const;
   int get_semantic_proxy_threshold(double &val) const;
   int get_semantic_output_policy(SemanticOutputPolicy &policy) const;
+  int get_semantic_dispatch_options(int64_t &rows, int64_t &limit) const;
   int get_opt_param_runtime_filter_type(int64_t &rf_type) const;
   int get_hash_rollup_param(ObObj &val, bool &has_opt_param) const;
   int get_enum_opt_param(const OptParamType param_type, int64_t &val) const;

@@ -18,6 +18,9 @@
 #define OB_AI_FUNC_CLIENT_H_
 
 #include <atomic>
+#include <memory>
+#include <mutex>
+#include <vector>
 #include <curl/curl.h>
 #include "ob_ai_func.h"
 
@@ -27,6 +30,38 @@ namespace sql { class ObSQLSessionInfo; }
 namespace common 
 {
 class AIFuncScheduler;
+class ObAIFuncClient;
+class AIRequestTransport
+{
+public:
+  AIRequestTransport(uint64_t execution_id, int64_t request_limit);
+  ~AIRequestTransport();
+  int init();
+  int attach(ObAIFuncClient &client);
+  void detach(ObAIFuncClient &client);
+  int64_t request_limit() const { return request_limit_; }
+private:
+  friend class AIFuncScheduler;
+  bool drive(bool cancel);
+  bool pending() const { return pending_.load(std::memory_order_acquire) > 0; }
+  void finish(ObAIFuncClient &client, int ret);
+  uint64_t execution_id_;
+  int64_t request_limit_;
+  CURLM *curlm_;
+  std::mutex mutex_;
+  std::vector<ObAIFuncClient *> clients_;
+  std::atomic<int64_t> pending_;
+  int64_t active_;
+  int64_t next_;
+  int64_t groups_;
+  int64_t requests_;
+  int64_t max_group_rows_;
+  int64_t peak_active_;
+  int failure_;
+  bool registered_;
+  DISALLOW_COPY_AND_ASSIGN(AIRequestTransport);
+};
+
 class ObAIFuncClient: public ObAIFuncHandle
 {
 public:
@@ -80,6 +115,7 @@ private:
   friend class AIFuncScheduler;
   friend class AIFuncBatch;
   friend class ObAIFuncModel;
+  friend class AIRequestTransport;
   struct Request;
   void set_incremental_results(bool enabled) { incremental_results_ = enabled; }
   bool is_incremental_ready() const;
@@ -132,6 +168,7 @@ private:
   int (*status_checker_)(void *);
   void *status_context_;
   ObAIFuncBase *response_validator_;
+  std::shared_ptr<AIRequestTransport> transport_;
   int64_t batch_start_ts_;
   int64_t attempts_;
   int64_t retries_;
@@ -161,6 +198,7 @@ public:
   void set_nonblocking_admission() { nonblocking_admission_ = true; }
   // Configure before starting a completion batch; retained across cancel().
   void set_incremental_results() { incremental_results_ = true; }
+  void set_transport(const std::shared_ptr<AIRequestTransport> &transport) { transport_ = transport; }
   bool incremental_results() const { return incremental_results_; }
   // Strings belong to result_allocator; finished covers the entire request group.
   int get_ready_results(ObIAllocator &result_allocator, ObArray<int64_t> &positions,
@@ -194,6 +232,7 @@ private:
   bool complete_text_output_;
   ObArray<int64_t> input_counts_;
   ObAIFuncClient client_;
+  std::shared_ptr<AIRequestTransport> transport_;
   DISALLOW_COPY_AND_ASSIGN(AIFuncBatch);
 };
 

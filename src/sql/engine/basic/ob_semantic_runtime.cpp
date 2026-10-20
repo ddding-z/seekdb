@@ -11,6 +11,8 @@
 #include <map>
 #include <new>
 
+#include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
+
 namespace oceanbase
 {
 namespace sql
@@ -31,6 +33,34 @@ SemanticRuntimeRegistry &runtime_registry()
   static SemanticRuntimeRegistry registry;
   return registry;
 }
+}
+
+int SemanticExecutionState::request_transport(
+    int64_t request_limit, std::shared_ptr<common::AIRequestTransport> &transport)
+{
+  int ret = OB_SUCCESS;
+  if (transport_ && transport_->request_limit() != request_limit) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("semantic stages disagree on HTTP request limit", K(ret), K(request_limit));
+  } else if (!transport_) {
+    try {
+      transport_ = std::make_shared<common::AIRequestTransport>(
+          budget_->execution_id(), request_limit);
+    } catch (const std::bad_alloc &) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate shared semantic transport", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(transport_->init())) {
+        LOG_WARN("failed to initialize shared semantic transport", K(ret));
+        transport_.reset();
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    transport = transport_;
+  }
+  return ret;
 }
 
 SemanticQueryBudget::SemanticQueryBudget(uint64_t execution_id, int64_t memory_limit,
@@ -431,6 +461,17 @@ bool SemanticExecutionState::can_resume(const void *data)
 }
 
 thread_local int64_t SemanticSuspendScope::blocked_depth_ = 0;
+thread_local int64_t SemanticBranchScope::depth_ = 0;
+
+SemanticBranchScope::SemanticBranchScope()
+{
+  ++depth_;
+}
+
+SemanticBranchScope::~SemanticBranchScope()
+{
+  --depth_;
+}
 
 SemanticSuspendScope::SemanticSuspendScope(ObPhyOperatorType type, bool opening, bool resumable)
     : blocked_(opening || (!resumable && type != PHY_SEMANTIC_MAP && type != PHY_SEMANTIC_FILTER &&

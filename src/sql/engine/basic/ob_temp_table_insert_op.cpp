@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "ob_temp_table_insert_op.h"
+#include "sql/engine/basic/ob_semantic_runtime.h"
 #include "share/rc/ob_server_runtime.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
 namespace oceanbase
@@ -178,9 +179,46 @@ int ObTempTableInsertOp::do_get_next_batch(const int64_t max_row_cnt)
     } else if (OB_FAIL(add_rows_to_temp_table(chunk_row_store, child_brs))) {
     } else if (OB_FAIL(THIS_WORKER.check_status())) {
     }
-    if (child_brs->end_) {
+    if (OB_SUCC(ret) && child_brs->end_) {
       (void) brs_.copy(child_brs);
       break;
+    }
+  }
+  return ret;
+}
+
+int ObTempTableInsertOp::advance_semantic_branch(int64_t max_row_cnt, bool &done, bool &progress)
+{
+  int ret = OB_SUCCESS;
+  const ObBatchRows *rows = nullptr;
+  done = !init_temp_table_;
+  if (done) {
+  } else if (OB_FAIL(ctx_.check_status())) {
+  } else if (MY_SPEC.is_distributed_ || nullptr == child_ || !is_vectorized()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "semantic branch scheduling requires local vectorized CTE producers");
+  } else {
+    clear_evaluated_flag();
+    clear_datum_eval_flag();
+    SemanticBranchScope branch_scope;
+    ret = child_->get_next_batch(max_row_cnt, rows);
+    if (ret == OB_EAGAIN) {
+      ret = OB_SUCCESS;
+    } else if (OB_FAIL(ret)) {
+      LOG_WARN("failed to advance semantic CTE producer", K(ret), K(MY_SPEC.temp_table_id_));
+    } else if (OB_ISNULL(rows)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("semantic CTE producer returned no batch", K(ret));
+    } else if (rows->size_ > 0 && OB_FAIL(add_rows_to_temp_table(branch_store_, rows))) {
+    } else {
+      progress = true;
+      if (rows->end_) {
+        if (OB_FAIL(insert_chunk_row_store())) {
+        } else {
+          init_temp_table_ = false;
+          done = true;
+        }
+      }
     }
   }
   return ret;

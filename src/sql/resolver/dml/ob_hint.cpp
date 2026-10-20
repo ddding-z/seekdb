@@ -673,6 +673,38 @@ int ObOptParamHint::get_semantic_output_policy(SemanticOutputPolicy &policy) con
         0 == value.get_varchar().case_compare("auto") ? SemanticOutputPolicy::AUTO :
         SemanticOutputPolicy::ORDERED;
   }
+  int64_t rows = 0;
+  int64_t limit = 0;
+  bool row_async = false;
+  bool cache = false;
+  bool proxy = false;
+  if (OB_SUCC(ret) && OB_FAIL(get_semantic_dispatch_options(rows, limit))) {
+  } else if (OB_SUCC(ret) && rows > 0) {
+    if (OB_FAIL(get_bool_opt_param(ENABLE_SEMANTIC_ROW_ASYNC, row_async))) {
+    } else if (OB_FAIL(get_bool_opt_param(ENABLE_SEMANTIC_CACHE, cache))) {
+    } else if (OB_FAIL(get_bool_opt_param(ENABLE_SEMANTIC_PROXY, proxy))) {
+    } else if (!row_async || cache || proxy || policy == SemanticOutputPolicy::ORDERED) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED,
+          "shared semantic dispatch requires row async, unordered/auto output and disabled cache/proxy");
+    }
+  }
+  return ret;
+}
+
+int ObOptParamHint::get_semantic_dispatch_options(int64_t &rows, int64_t &limit) const
+{
+  int ret = OB_SUCCESS;
+  bool has_rows = false;
+  bool has_limit = false;
+  rows = limit = 0;
+  if (OB_FAIL(get_integer_opt_param(SEMANTIC_DISPATCH_ROWS, rows, has_rows))) {
+  } else if (OB_FAIL(get_integer_opt_param(SEMANTIC_REQUEST_LIMIT, limit, has_limit))) {
+  } else if (has_rows != has_limit) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+        "semantic_dispatch_rows and semantic_request_limit must be specified together");
+  }
   return ret;
 }
 
@@ -684,12 +716,17 @@ int ObOptParamHint::add_opt_param_hint(const OptParamType param_type, const ObOb
     if (param_type == ENABLE_SEMANTIC_LIFT || param_type == ENABLE_SEMANTIC_CACHE ||
         param_type == ENABLE_SEMANTIC_PROXY || param_type == SEMANTIC_PROXY_MODEL ||
         param_type == SEMANTIC_PROXY_QUERY || param_type == SEMANTIC_PROXY_THRESHOLD ||
-        param_type == ENABLE_SEMANTIC_ROW_ASYNC || param_type == SEMANTIC_OUTPUT_ORDER) {
+        param_type == ENABLE_SEMANTIC_ROW_ASYNC || param_type == SEMANTIC_OUTPUT_ORDER ||
+        param_type == ENABLE_SEMANTIC_BRANCH_ASYNC ||
+        param_type == SEMANTIC_DISPATCH_ROWS || param_type == SEMANTIC_REQUEST_LIMIT) {
       ret = OB_INVALID_ARGUMENT;
       LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+          param_type == SEMANTIC_DISPATCH_ROWS ? "semantic_dispatch_rows requires an integer in [1,256]" :
+          param_type == SEMANTIC_REQUEST_LIMIT ? "semantic_request_limit requires an integer in [1,256]" :
           param_type == ENABLE_SEMANTIC_LIFT ? "enable_semantic_lift requires 'true' or 'false'" :
           param_type == ENABLE_SEMANTIC_CACHE ? "enable_semantic_cache requires 'true' or 'false'" :
           param_type == ENABLE_SEMANTIC_ROW_ASYNC ? "enable_semantic_row_async requires 'true' or 'false'" :
+          param_type == ENABLE_SEMANTIC_BRANCH_ASYNC ? "enable_semantic_branch_async requires 'true' or 'false'" :
           param_type == SEMANTIC_OUTPUT_ORDER ? "semantic_output_order requires 'ordered', 'unordered' or 'auto'" :
           param_type == ENABLE_SEMANTIC_PROXY ? "enable_semantic_proxy requires 'true' or 'false'" :
           param_type == SEMANTIC_PROXY_MODEL ? "semantic_proxy_model requires a nonempty model name" :
@@ -734,6 +771,7 @@ bool ObOptParamHint::is_param_val_valid(const OptParamType param_type, const ObO
     case ENABLE_SEMANTIC_CACHE:
     case ENABLE_SEMANTIC_PROXY:
     case ENABLE_SEMANTIC_ROW_ASYNC:
+    case ENABLE_SEMANTIC_BRANCH_ASYNC:
     case PRESERVE_ORDER_FOR_GROUPBY: {
       is_valid = val.is_varchar() && (0 == val.get_varchar().case_compare("true")
                                       || 0 == val.get_varchar().case_compare("false"));
@@ -753,6 +791,11 @@ bool ObOptParamHint::is_param_val_valid(const OptParamType param_type, const ObO
     case SEMANTIC_PROXY_THRESHOLD: {
       double threshold = 0;
       is_valid = parse_semantic_proxy_threshold(val, threshold);
+      break;
+    }
+    case SEMANTIC_DISPATCH_ROWS:
+    case SEMANTIC_REQUEST_LIMIT: {
+      is_valid = val.is_int() && val.get_int() >= 1 && val.get_int() <= 256;
       break;
     }
     case ROWSETS_MAX_ROWS: {

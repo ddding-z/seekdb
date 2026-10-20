@@ -21,6 +21,7 @@
 #include "sql/engine/basic/ob_ai_func_op.h"
 #include "sql/optimizer/ob_log_semantic.h"
 #include "sql/engine/basic/ob_semantic_op.h"
+#include "sql/engine/basic/ob_temp_table_transformation_op.h"
 #include "sql/engine/px/ob_px_task_process.h"
 #include "sql/optimizer/ob_log_group_by.h"
 #include "sql/optimizer/ob_log_sort.h"
@@ -202,6 +203,23 @@ int ObStaticEngineCG::generate(const ObLogPlan &log_plan, ObPhysicalPlan &phy_pl
     phy_plan.set_is_use_auto_dop(opt_ctx_->is_use_auto_dop());
     if (OB_FAIL(set_properties_post(log_plan, phy_plan))) {
     } else if (OB_FAIL(validate_semantic_px_row_plan(*root_spec, phy_plan))) {
+    }
+    bool branch_option = false;
+    bool branch_enabled = false;
+    if (OB_SUCC(ret) && OB_FAIL(opt_ctx_->get_global_hint().opt_params_.has_opt_param(
+        ObOptParamHint::ENABLE_SEMANTIC_BRANCH_ASYNC, branch_option))) {
+    } else if (OB_SUCC(ret) && branch_option && !log_plan.get_stmt()->is_explain_stmt()) {
+      if (OB_FAIL(opt_ctx_->get_global_hint().opt_params_.get_bool_opt_param(
+          ObOptParamHint::ENABLE_SEMANTIC_BRANCH_ASYNC, branch_enabled))) {
+      } else if (branch_enabled &&
+          (!log_plan.get_stmt()->is_select_stmt() ||
+           log_plan.get_plan_root()->get_parallel() != 1 || opt_ctx_->has_var_assign())) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+            "semantic branch scheduling requires serial SELECT without variable assignments");
+      } else if (OB_FAIL(configure_semantic_branch_plan(*root_spec, branch_enabled))) {
+        LOG_WARN("failed to configure semantic branch materialization", K(ret), K(branch_enabled));
+      }
     }
   }
   return ret;
@@ -1145,6 +1163,28 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
   spec.row_async_enabled_ = op.row_async_enabled();
   spec.output_order_ = op.output_order();
   spec.execution_scope_ = op.execution_scope();
+  if (OB_SUCC(ret) && OB_FAIL(opt_ctx_->get_global_hint().opt_params_
+      .get_semantic_dispatch_options(spec.dispatch_rows_, spec.request_limit_))) {
+    LOG_WARN("failed to read semantic dispatch options", K(ret));
+  } else if (OB_SUCC(ret) && spec.dispatch_rows_ > 0) {
+    if (!spec.row_async_enabled_ || op.get_parallel() != 1 ||
+        op.execution_scope() != SemanticExecutionScope::SERIAL ||
+        op.function_cache_enabled() || op.has_embedding_proxy() ||
+        (op.get_type() != log_op_def::LOG_SEMANTIC_MAP &&
+         op.get_type() != log_op_def::LOG_SEMANTIC_FILTER &&
+         op.get_type() != log_op_def::LOG_SEMANTIC_RANK)) {
+      ret = OB_NOT_SUPPORTED;
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && index < op.semantic_exprs().count(); ++index) {
+      if (!SemanticExprUtils::supports_function_cache(*op.semantic_exprs().at(index))) {
+        ret = OB_NOT_SUPPORTED;
+      }
+    }
+    if (OB_FAIL(ret)) {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED,
+          "shared semantic dispatch requires serial TEXT MAP/FILTER/RANK with row async and without cache or proxy");
+    }
+  }
   spec.filter_expr_count_ = (op.get_type() == log_op_def::LOG_SEMANTIC_FILTER ||
                             op.get_type() == log_op_def::LOG_SEMANTIC_JOIN)
       ? op.expressions().count() : 0;
