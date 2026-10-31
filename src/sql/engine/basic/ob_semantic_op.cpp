@@ -1026,11 +1026,14 @@ int SemanticOp::prepare(Slot &slot, bool &progress)
 {
   int ret = OB_SUCCESS;
   const bool first_prepare = !first_prepare_logged_;
+  const bool trace_prepare = first_prepare && nullptr != ctx_.get_my_session() &&
+                             ctx_.get_my_session()->is_use_trace_log();
   if (first_prepare) {
     first_prepare_logged_ = true;
     LOG_INFO("semantic first prepare begin", "execution_id", execution_->budget().execution_id(),
              "operator_id", spec_.get_id(), "px_task_id", ctx_.get_px_task_id(),
-             "thread_id", GETTID(), "rows", slot.size_);
+             "thread_id", GETTID(), "rows", slot.size_,
+             "monotonic_us", trace_prepare ? ObTimeUtility::current_monotonic_time() : 0);
   }
   const auto &expressions = semantic_spec().expressions_;
   ObEvalCtx::BatchInfoScopeGuard batch_guard(eval_ctx_);
@@ -1118,7 +1121,8 @@ int SemanticOp::prepare(Slot &slot, bool &progress)
   if (first_prepare) {
     LOG_INFO("semantic first prepare end", K(ret), "execution_id", execution_->budget().execution_id(),
              "operator_id", spec_.get_id(), "px_task_id", ctx_.get_px_task_id(),
-             "thread_id", GETTID(), "rows", slot.size_);
+             "thread_id", GETTID(), "rows", slot.size_,
+             "monotonic_us", trace_prepare ? ObTimeUtility::current_monotonic_time() : 0);
   }
   return ret;
 }

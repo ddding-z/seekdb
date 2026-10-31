@@ -22,12 +22,46 @@
 #include "sql/engine/expr/ob_array_expr_utils.h"
 #include "sql/engine/basic/ob_semantic_runtime.h"
 #include "sql/engine/basic/ob_semantic_op.h"
+#include "sql/session/ob_sql_session_info.h"
 
 namespace oceanbase
 {
 using namespace common;
 namespace sql
 {
+
+namespace
+{
+class RelationalTimingScope
+{
+public:
+  RelationalTimingScope(const ObOpSpec &spec, ObExecContext &ctx,
+                        const char *phase, const int &result)
+      : spec_(spec), phase_(phase), result_(result),
+        enabled_(nullptr != ctx.get_my_session() &&
+                 ctx.get_my_session()->is_use_trace_log() &&
+                 !spec.has_semantic_operator()),
+        begin_us_(enabled_ ? ObTimeUtility::current_monotonic_time() : 0)
+  {}
+
+  ~RelationalTimingScope()
+  {
+    if (enabled_) {
+      const int64_t end_us = ObTimeUtility::current_monotonic_time();
+      LOG_INFO("relational operator interval", "operator_id", spec_.id_,
+               "operator_name", get_phy_op_name(spec_.type_), "phase", phase_,
+               "begin_us", begin_us_, "end_us", end_us, "result", result_);
+    }
+  }
+
+private:
+  const ObOpSpec &spec_;
+  const char *phase_;
+  const int &result_;
+  bool enabled_;
+  int64_t begin_us_;
+};
+}
 
 OB_SERIALIZE_MEMBER(ObDynamicParamSetter, param_idx_, src_, dst_);
 OB_SERIALIZE_MEMBER(ObOpSchemaObj, obj_type_, is_not_null_, order_type_);
@@ -646,6 +680,7 @@ int ObOperator::open()
 {
   SemanticSuspendScope semantic_scope(spec_.type_, true);
   int ret = OB_SUCCESS;
+  RelationalTimingScope timing_scope(spec_, ctx_, "open", ret);
   if (OB_FAIL(check_stack_overflow())) {
   } else {
     OperatorOpenOrder open_order = get_operator_open_order();
@@ -869,6 +904,7 @@ int check_child_closed_helper(ObOperator *child, bool &closed)
 int ObOperator::close()
 {
   int ret = OB_SUCCESS;
+  RelationalTimingScope timing_scope(spec_, ctx_, "close", ret);
   OperatorOpenOrder open_order = get_operator_open_order();
   if (OPEN_SELF_ONLY != open_order) {
     //first call close of children
@@ -955,6 +991,7 @@ int ObOperator::get_next_row()
   SemanticSuspendScope semantic_scope(spec_.type_, false,
                                        spec_.is_vectorized() && supports_semantic_suspend());
   int ret = OB_SUCCESS;
+  RelationalTimingScope timing_scope(spec_, ctx_, "row", ret);
   begin_cpu_time_counting();
   if (OB_FAIL(check_stack_once())) {
   }
@@ -1095,6 +1132,7 @@ int ObOperator::get_next_batch(const int64_t max_row_cnt, const ObBatchRows *&ba
 {
   SemanticSuspendScope semantic_scope(spec_.type_, false, supports_semantic_suspend());
   int ret = OB_SUCCESS;
+  RelationalTimingScope timing_scope(spec_, ctx_, "batch", ret);
   begin_cpu_time_counting();
 
   if (OB_FAIL(check_stack_once())) {

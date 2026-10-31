@@ -132,6 +132,8 @@ private:
   int send_post_batch(ObArray<ObJsonObject *> &data_array, ObArray<ObJsonObject *> &responses);
   int start_request(Request &request);
   int advance_batch();
+  int64_t startup_time() const;
+  void log_startup_phase(const char *phase, int64_t begin_us, int64_t rows, int result) const;
   int check_status();
   int reserve_buffer(int64_t bytes);
   void release_buffer(int64_t bytes);
@@ -158,6 +160,9 @@ private:
   std::atomic<int> incremental_ret_;
   std::atomic<int64_t> ready_count_;
   sql::ObSQLSessionInfo *request_session_;
+  bool startup_timing_;
+  bool initial_handles_done_;
+  bool first_network_drive_;
   int64_t max_retry_times_;
   int64_t abs_timeout_ts_;
   int64_t timeout_sec_;

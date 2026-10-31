@@ -279,6 +279,7 @@ struct ObAIFuncClient::Request
       handle_(nullptr), result_(nullptr), attempts_(0), retry_at_(0),
       retry_after_us_(0), callback_ret_(OB_SUCCESS), active_(false), done_(false),
       queued_at_(ObTimeUtility::current_time()), started_at_(0),
+      serialized_us_(0), handle_ready_us_(0), first_progress_us_(0),
       result_state_(ResultState::PENDING) {}
   TO_STRING_KV(K_(index), K_(attempts), K_(active), K_(done));
   ObAIFuncClient &owner_;
@@ -296,6 +297,9 @@ struct ObAIFuncClient::Request
   bool done_;
   int64_t queued_at_;
   int64_t started_at_;
+  int64_t serialized_us_;
+  int64_t handle_ready_us_;
+  int64_t first_progress_us_;
   std::atomic<ResultState> result_state_;
 };
 
@@ -476,7 +480,8 @@ ObAIFuncClient::ObAIFuncClient()
     admission_pending_(false),
     next_admission_check_(0), async_done_(true),
     cancel_ret_(OB_SUCCESS), incremental_ret_(OB_SUCCESS), ready_count_(0),
-    request_session_(nullptr), max_retry_times_(3), abs_timeout_ts_(0),
+    request_session_(nullptr), startup_timing_(false), initial_handles_done_(false),
+    first_network_drive_(false), max_retry_times_(3), abs_timeout_ts_(0),
     timeout_sec_(60), max_parallel_(0), active_count_(0), completed_count_(0),
     batch_ret_(OB_SUCCESS), status_checker_(nullptr), status_context_(nullptr),
     response_validator_(nullptr),
@@ -484,6 +489,21 @@ ObAIFuncClient::ObAIFuncClient()
     buffered_bytes_(0), shared_buffered_bytes_(nullptr), shared_buffer_limit_(MAX_BATCH_BYTES),
     received_bytes_(0), submitted_bytes_(0)
 {}
+
+int64_t ObAIFuncClient::startup_time() const
+{
+  return startup_timing_ ? ObTimeUtility::current_monotonic_time() : 0;
+}
+
+void ObAIFuncClient::log_startup_phase(const char *phase, int64_t begin_us,
+                                      int64_t rows, int result) const
+{
+  if (begin_us > 0) {
+    const int64_t end_us = ObTimeUtility::current_monotonic_time();
+    LOG_INFO("AI startup phase", "client_id", this, K(phase), K(begin_us), K(end_us),
+             K(rows), K(result));
+  }
+}
 
 ObAIFuncClient::~ObAIFuncClient()
 {
@@ -509,6 +529,8 @@ void ObAIFuncClient::clean_up()
   requests_.reset();
   active_count_ = 0;
   completed_count_ = 0;
+  initial_handles_done_ = false;
+  first_network_drive_ = false;
   release_buffer(buffered_bytes_);
   is_finished_.store(false);
   cancel_ret_.store(OB_SUCCESS);
@@ -553,6 +575,7 @@ void ObAIFuncClient::reset()
   url_ = nullptr;
   allocator_ = nullptr;
   request_session_ = nullptr;
+  startup_timing_ = false;
   batch_ret_ = OB_SUCCESS;
   incremental_results_ = false;
   transport_.reset();
@@ -578,6 +601,7 @@ int ObAIFuncClient::init(ObIAllocator &allocator, const ObString &url, ObArray<O
   } else {
     allocator_ = &allocator;
     request_session_ = THIS_WORKER.get_session();
+    startup_timing_ = nullptr != request_session_ && request_session_->is_use_trace_log();
     const int64_t configured_us = std::min(timeout_sec_, CURL_MAX_TIMEOUT_SEC) * 1000000;
     const int64_t remaining_us = THIS_WORKER.is_timeout_ts_valid()
         ? THIS_WORKER.get_timeout_remain() : configured_us;
@@ -694,6 +718,7 @@ int ObAIFuncClient::send_post_batch_no_wait(ObArray<ObJsonObject *> &data_array)
   batch_ret_ = OB_SUCCESS;
   attempts_ = retries_ = peak_active_ = received_bytes_ = submitted_bytes_ = 0;
   batch_start_ts_ = ObTimeUtility::current_time();
+  const int64_t serialization_begin = startup_time();
   if (data_array.empty() || nullptr == allocator_ || nullptr == url_ || nullptr == header_list_) {
     ret = OB_INVALID_ARGUMENT;
   } else if (data_array.count() > MAX_BATCH_BYTES / static_cast<int64_t>(sizeof(Request))) {
@@ -717,7 +742,11 @@ int ObAIFuncClient::send_post_batch_no_wait(ObArray<ObJsonObject *> &data_array)
       ret = OB_SIZE_OVERFLOW;
     } else if (OB_FAIL(reserve_buffer(request->body_.length()))) {
     }
+    if (OB_SUCC(ret)) {
+      request->serialized_us_ = startup_time();
+    }
   }
+  log_startup_phase("serialize", serialization_begin, data_array.count(), ret);
   if (OB_SUCC(ret) && !transport_) {
     ret = advance_batch();
   }
@@ -766,6 +795,8 @@ int ObAIFuncClient::start_request(Request &request)
     } else {
       request.active_ = true;
       request.started_at_ = ObTimeUtility::current_time();
+      request.handle_ready_us_ = startup_time();
+      request.first_progress_us_ = 0;
       ++request.attempts_;
       ++attempts_;
       ++active_count_;
@@ -850,6 +881,21 @@ int ObAIFuncClient::finish_request(Request &request, CURLcode result)
     }
   }
   const int64_t parse_us = ObTimeUtility::current_time() - parse_start;
+  if (startup_timing_ && request.done_ && !incremental_results_) {
+    ObString request_id;
+    ObIJsonBase *id = request.result_->get_value("id");
+    if (nullptr != id && id->json_type() == ObJsonNodeType::J_STRING) {
+      request_id = ObString(id->get_data_length(), id->get_data());
+    } else {
+      LOG_WARN("AI startup response is missing a correlation ID", K(request.index_));
+    }
+    const int64_t finished_us = startup_time();
+    LOG_INFO("AI startup request", "client_id", this, "request_index", request.index_,
+             K(request_id), "attempts", request.attempts_,
+             "serialized_us", request.serialized_us_, "handle_ready_us", request.handle_ready_us_,
+             "first_progress_us", request.first_progress_us_, K(finished_us),
+             "body_bytes", request.body_.length(), K(connect_us), K(first_byte_us), K(transfer_us));
+  }
   LOG_TRACE("AI HTTP request attempt", K(ret), K(request.index_), K(request.attempts_),
             K(result), K(http_code), K(queue_us), K(connect_us), K(first_byte_us),
             K(transfer_us), K(parse_us), K(total_tokens));
@@ -869,11 +915,15 @@ int ObAIFuncClient::advance_batch()
 {
   int ret = check_status();
   int running = 0;
+  const bool first_drive = startup_timing_ && active_count_ > 0 && !first_network_drive_;
+  const int64_t drive_begin = first_drive ? startup_time() : 0;
+  first_network_drive_ = first_network_drive_ || first_drive;
   if (nullptr == curlm_) {
     ret = OB_NOT_INIT;
   } else if (OB_SUCC(ret) && CURLM_OK != curl_multi_perform(curlm_, &running)) {
     ret = OB_CURL_ERROR;
   }
+  log_startup_phase("first_network_drive", drive_begin, requests_.count(), ret);
   CURLMsg *message = nullptr;
   int messages_left = 0;
   while (OB_SUCC(ret) && nullptr != (message = curl_multi_info_read(curlm_, &messages_left))) {
@@ -887,11 +937,17 @@ int ObAIFuncClient::advance_batch()
     }
   }
   const int64_t max_parallel = max_parallel_ == 0 ? requests_.count() : max_parallel_;
+  const bool first_handles = startup_timing_ && !initial_handles_done_;
+  const int64_t handles_begin = first_handles ? startup_time() : 0;
   for (int64_t index = 0; OB_SUCC(ret) && active_count_ < max_parallel && index < requests_.count(); ++index) {
     Request &request = *requests_.at(index);
     if (!request.active_ && !request.done_ && request.retry_at_ <= ObTimeUtility::current_time()) {
       ret = start_request(request);
     }
+  }
+  if (first_handles) {
+    initial_handles_done_ = true;
+    log_startup_phase("initial_handles", handles_begin, requests_.count(), ret);
   }
   return ret;
 }
@@ -904,6 +960,7 @@ void ObAIFuncClient::stop_async_scheduler()
 int ObAIFuncClient::start_async(bool wait_for_slot)
 {
   int ret = OB_SUCCESS;
+  const int64_t submit_begin = startup_time();
   if (async_mode_ || admission_pending_) {
     ret = OB_INIT_TWICE;
   } else if (transport_) {
@@ -918,6 +975,7 @@ int ObAIFuncClient::start_async(bool wait_for_slot)
       ret = OB_SUCCESS;
     }
   }
+  log_startup_phase("async_submit", submit_begin, requests_.count(), ret);
   return ret;
 }
 
@@ -1161,6 +1219,9 @@ size_t ObAIFuncClient::header_callback(char *contents, size_t size, size_t nmemb
 int ObAIFuncClient::progress_callback(void *userp, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
 {
   Request &request = *static_cast<Request *>(userp);
+  if (request.owner_.startup_timing_ && request.first_progress_us_ == 0) {
+    request.first_progress_us_ = request.owner_.startup_time();
+  }
   const int ret = request.owner_.check_status();
   if (OB_SUCCESS != ret) {
     request.callback_ret_ = ret;

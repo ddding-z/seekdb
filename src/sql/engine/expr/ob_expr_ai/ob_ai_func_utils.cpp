@@ -20,6 +20,7 @@
 #include "ob_ai_func_client.h"
 #include "common/json_type/ob_json_schema.h"
 #include "query/engine/expr/ob_ai_model_resolver.h"
+#include "sql/session/ob_sql_session_info.h"
 #include <cmath>
 
 namespace oceanbase 
@@ -1742,6 +1743,9 @@ int ObAIFuncModel::start_completion_batch(ObArray<ObString> &prompts, ObJsonObje
                                          const ObString *system_prompt)
 {
   int ret = OB_SUCCESS;
+  const sql::ObSQLSessionInfo *session = THIS_WORKER.get_session();
+  const bool startup_timing = nullptr != session && session->is_use_trace_log();
+  const int64_t prepare_begin = startup_timing ? ObTimeUtility::current_monotonic_time() : 0;
   batch.cancel();
   ObArray<ObString> headers;
   ObJsonObject *body = nullptr;
@@ -1766,6 +1770,7 @@ int ObAIFuncModel::start_completion_batch(ObArray<ObString> &prompts, ObJsonObje
   } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
   } else {
     batch.provider_ = complete_provider;
+    const int64_t body_begin = startup_timing ? ObTimeUtility::current_monotonic_time() : 0;
     for (int64_t row = 0; OB_SUCC(ret) && row < prompts.count(); ++row) {
       ObString prompt = prompts.at(row);
       ObJsonArray *parts = nullptr == media_parts ? nullptr : media_parts->at(row);
@@ -1781,11 +1786,15 @@ int ObAIFuncModel::start_completion_batch(ObArray<ObString> &prompts, ObJsonObje
       } else if (OB_FAIL(batch.input_counts_.push_back(1))) {
       }
     }
+    client.log_startup_phase("json_build", body_begin, prompts.count(), ret);
   }
+  client.log_startup_phase("completion_prepare", prepare_begin, prompts.count(), ret);
   if (OB_SUCC(ret)) {
     client.set_response_validator(complete_provider);
-    if (OB_FAIL(client.init(*allocator_, endpoint_info_.get_url(), headers))) {
-    } else {
+    const int64_t init_begin = startup_timing ? ObTimeUtility::current_monotonic_time() : 0;
+    ret = client.init(*allocator_, endpoint_info_.get_url(), headers);
+    client.log_startup_phase("client_init", init_begin, prompts.count(), ret);
+    if (OB_SUCC(ret)) {
       client.transport_ = batch.transport_;
       client.set_incremental_results(batch.incremental_results_);
       if (OB_FAIL(client.send_post_batch_no_wait(body_array))) {
