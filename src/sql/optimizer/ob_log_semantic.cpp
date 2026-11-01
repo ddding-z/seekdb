@@ -186,13 +186,14 @@ int LogSemantic::compute_op_ordering()
 int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item)
 {
   int ret = OB_SUCCESS;
+  const bool lifted = lifted_join_count_ > 0 || lifted_topn_sort_;
   if (OB_FAIL(ObLogicalOperator::get_plan_item_info(plan_text, plan_item))) {
-  } else if (lifted_join_count_ > 0 || nullptr != lift_stop_reason_ ||
+  } else if (lifted || nullptr != lift_stop_reason_ ||
              function_cache_enabled_ || has_embedding_proxy() || row_async_enabled_) {
     BEGIN_BUF_PRINT;
-    const bool placement = lifted_join_count_ > 0 || nullptr != lift_stop_reason_;
+    const bool placement = lifted || nullptr != lift_stop_reason_;
     if (placement && OB_FAIL(BUF_PRINTF("semantic_placement=%s, crossed_inner_joins=%ld",
-                          lifted_join_count_ > 0 ? "LIFTED" : "KEPT", lifted_join_count_))) {
+                          lifted ? "LIFTED" : "KEPT", lifted_join_count_))) {
     } else if (nullptr != lift_stop_reason_) {
       ret = BUF_PRINTF(", lift_stop_reason=%s", lift_stop_reason_);
     }

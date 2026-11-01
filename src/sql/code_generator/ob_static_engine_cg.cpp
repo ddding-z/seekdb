@@ -1163,6 +1163,7 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
   spec.row_async_enabled_ = op.row_async_enabled();
   spec.output_order_ = op.output_order();
   spec.execution_scope_ = op.execution_scope();
+  spec.topn_lifted_ = op.lifted_topn_sort();
   if (OB_SUCC(ret) && OB_FAIL(opt_ctx_->get_global_hint().opt_params_
       .get_semantic_dispatch_options(spec.dispatch_rows_, spec.request_limit_))) {
     LOG_WARN("failed to read semantic dispatch options", K(ret));

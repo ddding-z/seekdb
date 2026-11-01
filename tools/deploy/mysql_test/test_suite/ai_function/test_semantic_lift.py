@@ -978,10 +978,27 @@ class SemanticLiftContracts(unittest.TestCase):
             self.seed(prompt, "mapped:" + prompt, second=True, boolean=False)
         accepted = [index for index in reversed(range(0, 100, 10)) if index % 30 != 0]
         expected_filter = tuple((index, f"category-{index}") for index in accepted[1:4])
+        expected_topn = tuple((index, f"category-{index}") for index in accepted[:3])
+        demanded_topn = [prompts[index] for index in (90, 80, 70, 60, 50)]
         retained_map = list(reversed(range(0, 100, 10)))[2:5]
         expected_map = tuple((index, f"category-{index}", "mapped:" + prompts[index])
                              for index in retained_map)
         for enabled in (None, "true"):
+            with self.subTest(enabled=enabled, demand="TOP-N SORT splits and lifts SEMANTIC FILTER"):
+                statement = self.filter_query(
+                    enabled=enabled, suffix="ORDER BY a.id DESC LIMIT 3")
+                plan = self.explain(statement)
+                if enabled is None:
+                    stage = assert_below_join(self, plan)
+                    self.assertTrue(plan.is_above(plan.one("TOP-N SORT"), stage), plan.text)
+                else:
+                    stage = assert_lifted(self, plan)
+                    self.assertEqual(len(plan.find("TOP-N SORT")), 0, plan.text)
+                    self.assertTrue(plan.is_above(plan.one("LIMIT"), stage), plan.text)
+                    self.assertTrue(plan.is_above(stage, plan.one("SORT")), plan.text)
+                    self.assertTrue(plan.is_above(plan.one("SORT"), plan.one("HASH JOIN")), plan.text)
+                self.check_query(statement, expected_topn,
+                                 first=prompts if enabled is None else demanded_topn)
             with self.subTest(enabled=enabled, demand="WHERE filter before LIMIT"):
                 statement = self.filter_query(
                     enabled=enabled, suffix="ORDER BY a.id DESC LIMIT 3 OFFSET 1")

@@ -14,9 +14,9 @@ class LogSemantic : public ObLogicalOperator
 public:
   explicit LogSemantic(ObLogPlan &plan)
       : ObLogicalOperator(plan), query_task_count_(1), lifted_join_count_(0),
-        lift_stop_reason_(nullptr), function_cache_enabled_(false), row_async_enabled_(false),
-        output_order_(SemanticOutputOrder::INPUT_ORDER), auto_order_reason_(nullptr),
-        execution_scope_(SemanticExecutionScope::SERIAL) {}
+        lifted_topn_sort_(false), lift_stop_reason_(nullptr), function_cache_enabled_(false),
+        row_async_enabled_(false), output_order_(SemanticOutputOrder::INPUT_ORDER),
+        auto_order_reason_(nullptr), execution_scope_(SemanticExecutionScope::SERIAL) {}
   int add_expression(ObRawExpr *expr);
   int add_shared_expression(ObRawExpr *expr);
   int add_carried_expression(ObRawExpr *expr);
@@ -42,6 +42,8 @@ public:
   int64_t proxy_count() const;
   bool has_embedding_proxy() const { return proxy_count() > 0; }
   void record_lifted_join() { ++lifted_join_count_; lift_stop_reason_ = nullptr; }
+  void record_lifted_topn_sort() { lifted_topn_sort_ = true; lift_stop_reason_ = nullptr; }
+  bool lifted_topn_sort() const { return lifted_topn_sort_; }
   void set_lift_stop_reason(const char *reason) { lift_stop_reason_ = reason; }
   int get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item) override;
   int get_op_exprs(common::ObIArray<ObRawExpr *> &exprs) override;
@@ -62,6 +64,7 @@ private:
   common::ObSEArray<ObRawExpr *, 16> local_exprs_;
   int64_t query_task_count_;
   int64_t lifted_join_count_;
+  bool lifted_topn_sort_;
   const char *lift_stop_reason_;
   bool function_cache_enabled_;
   bool row_async_enabled_;

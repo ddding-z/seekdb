@@ -5810,6 +5810,12 @@ public:
         } else {
           changed |= lifted;
         }
+      } else if (OB_SUCC(ret) && node->get_type() == LOG_SORT) {
+        bool lifted = false;
+        if (OB_FAIL(lift_child_stage_over_topn_sort(node, candidate_boundary, lifted))) {
+        } else {
+          changed |= lifted;
+        }
       }
     }
     return ret;
@@ -6077,6 +6083,136 @@ private:
               OPT_TRACE("semantic_lift applied", "input_side", side,
                         "estimated_input_rows", join.get_card());
             }
+          }
+        }
+      }
+    }
+    return ret;
+  }
+
+  int semantic_lift_topn_sort_candidate(ObLogSort &sort, LogSemantic &stage,
+                                        const char *&reason)
+  {
+    int ret = OB_SUCCESS;
+    reason = nullptr;
+    ObLogicalOperator *source = stage.get_child(ObLogicalOperator::first_child);
+    const ObSelectStmt *stmt = plan_.get_stmt();
+    bool safe = false;
+    if (!plan_.is_final_root_plan() ||
+        stage.get_type() != LOG_SEMANTIC_FILTER ||
+        !stage.shared_exprs().empty() || !stage.carried_exprs().empty()) {
+      reason = "non_filter_or_shared_stage";
+    } else if (OB_ISNULL(source) || stage.get_num_of_child() != 1 ||
+               sort.get_num_of_child() != 1) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing semantic stage or sort child while checking Top-N sort lift", K(ret));
+    } else if (nullptr == sort.get_topn_expr() || nullptr == stmt ||
+               sort.get_topn_expr() != stmt->get_limit_expr() ||
+               nullptr != stmt->get_offset_expr() ||
+               nullptr != stmt->get_limit_percent_expr() ||
+               stmt->is_calc_found_rows() || stmt->is_fetch_with_ties() ||
+               nullptr != sort.get_topk_limit_expr() ||
+               nullptr != sort.get_topk_offset_expr() ||
+               sort.is_fetch_with_ties() || sort.is_prefix_sort() ||
+               sort.is_local_merge_sort() || sort.is_part_sort() ||
+               sort.enable_pd_topn_filter() ||
+               nullptr != sort.get_hash_sortkey().expr_ ||
+               !sort.get_filter_exprs().empty() ||
+               !sort.get_pushdown_filter_exprs().empty() ||
+               !sort.get_startup_exprs().empty()) {
+      reason = "unsupported_sort_mode";
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && nullptr == reason &&
+         index < stage.expressions().count(); ++index) {
+      ObRawExpr *expr = stage.expressions().at(index);
+      if (OB_ISNULL(expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("missing semantic filter expression while checking Top-N sort lift", K(ret));
+      } else if (OB_FAIL(semantic_lift_expression_safe(
+          expr, true, false, safe, stage.function_cache_enabled()))) {
+      } else if (!safe) {
+        reason = "unsafe_stage_expression";
+      } else if (!expr->get_relation_ids().is_subset(source->get_table_set())) {
+        reason = "stage_depends_outside_source";
+      }
+    }
+    if (OB_SUCC(ret) && nullptr == reason) {
+      if (OB_FAIL(semantic_lift_relational_safe(*source, safe))) {
+      } else if (!safe) {
+        reason = "unsafe_source_subtree";
+      }
+    }
+    for (int64_t index = 0; OB_SUCC(ret) && nullptr == reason &&
+         index < sort.get_sort_keys().count(); ++index) {
+      ObRawExpr *key = sort.get_sort_keys().at(index).expr_;
+      bool contains_sem = false;
+      if (OB_ISNULL(key)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("missing sort key expression while checking Top-N sort lift", K(ret));
+      } else if (ObOptimizerUtil::find_item(stage.owned_exprs(), key)) {
+        reason = "sort_depends_on_stage";
+      } else if (OB_FAIL(SemanticExprUtils::contains_semantic(key, contains_sem))) {
+      } else if (contains_sem) {
+        reason = "semantic_sort_key";
+      } else if (OB_FAIL(semantic_lift_expression_safe(key, false, false, safe))) {
+      } else if (!safe) {
+        reason = "unsafe_sort_key";
+      } else if (!key->get_relation_ids().is_subset(source->get_table_set())) {
+        reason = "sort_key_outside_source";
+      }
+    }
+    return ret;
+  }
+
+  int lift_child_stage_over_topn_sort(ObLogicalOperator *&node, bool candidate_boundary,
+                                      bool &lifted)
+  {
+    int ret = OB_SUCCESS;
+    auto &sort = *static_cast<ObLogSort *>(node);
+    lifted = false;
+    ObLogicalOperator *child = sort.get_child(ObLogicalOperator::first_child);
+    if (OB_ISNULL(child)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing sort child while lifting semantic stage", K(ret));
+    } else if (!candidate_boundary && child->get_type() == LOG_SEMANTIC_FILTER) {
+      auto &stage = *static_cast<LogSemantic *>(child);
+      const char *reason = nullptr;
+      if (OB_FAIL(semantic_lift_topn_sort_candidate(sort, stage, reason))) {
+        LOG_WARN("failed to check Top-N sort semantic placement", K(ret));
+      } else if (nullptr != reason) {
+        OPT_TRACE("semantic_lift kept before topn sort", "reason", reason);
+      } else {
+        const bool root = sort.is_plan_root();
+        ObRawExpr *topn_expr = sort.get_topn_expr();
+        ObLogicalOperator *source = stage.get_child(ObLogicalOperator::first_child);
+        sort.set_child(ObLogicalOperator::first_child, source);
+        sort.set_topn_expr(nullptr);
+        sort.set_is_plan_root(false);
+        sort.get_output_const_exprs().reuse();
+        stage.set_child(ObLogicalOperator::first_child, &sort);
+        stage.set_is_plan_root(false);
+        stage.get_output_const_exprs().reuse();
+        if (OB_FAIL(sort.compute_property())) {
+        } else if (OB_FAIL(sort.est_cost())) {
+        } else if (OB_FAIL(stage.compute_property())) {
+        } else {
+          ObLogicalOperator *new_top = &stage;
+          if (OB_FAIL(plan_.allocate_limit_as_top(
+              new_top, topn_expr, nullptr, nullptr, false, root, false, nullptr))) {
+            LOG_WARN("failed to allocate limit operator above lifted semantic filter", K(ret));
+          } else if (OB_ISNULL(new_top)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("allocated null limit operator", K(ret));
+          } else {
+            new_top->set_is_plan_root(root);
+            if (root) {
+              new_top->set_parent(nullptr);
+            }
+            stage.record_lifted_topn_sort();
+            node = new_top;
+            lifted = true;
+            OPT_TRACE("semantic_lift applied over topn sort",
+                      "estimated_input_rows", sort.get_card());
           }
         }
       }

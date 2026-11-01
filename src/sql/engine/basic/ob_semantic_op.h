@@ -20,7 +20,8 @@ public:
       : ObOpSpec(allocator, type), expressions_(allocator), semantic_exprs_(allocator),
         owned_exprs_(allocator), local_exprs_(allocator),
         shared_exprs_(allocator), carried_exprs_(allocator),
-        query_task_count_(1), filter_expr_count_(0), row_async_enabled_(false), memoized_exprs_(allocator),
+        query_task_count_(1), filter_expr_count_(0), row_async_enabled_(false),
+        topn_lifted_(false), memoized_exprs_(allocator),
         proxy_configs_(allocator), output_order_(SemanticOutputOrder::INPUT_ORDER),
         execution_scope_(SemanticExecutionScope::SERIAL), dispatch_rows_(0), request_limit_(0) {}
   common::ObFixedArray<ObExpr *, common::ObIAllocator> expressions_;
@@ -34,6 +35,7 @@ public:
   int64_t query_task_count_;
   int64_t filter_expr_count_;
   bool row_async_enabled_;
+  bool topn_lifted_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> memoized_exprs_;
   common::ObFixedArray<SemanticProxyConfig, common::ObIAllocator> proxy_configs_;
   SemanticOutputOrder output_order_;
@@ -115,11 +117,16 @@ private:
   int reserve(Slot &slot, int64_t bytes);
   int64_t slot_metadata_bytes(int64_t size) const;
   int allocate_slot(Slot &slot, int64_t size);
-  int capture(Slot &slot);
+  int capture(Slot &slot, int64_t max_row_cnt);
   int capture_join_candidates(Slot &slot);
   int prepare(Slot &slot, bool &progress);
   void mark_row_ready(Slot &slot, int64_t row);
   bool slot_drained(const Slot &slot) const;
+  bool quota_cutoff_enabled(const Slot &slot) const;
+  bool quota_cruise_brake_enabled() const;
+  int64_t slot_cutoff_row(const Slot &slot) const;
+  bool row_started(const Slot &slot, int64_t row) const;
+  int64_t quota_new_row_allowance(const Slot &slot) const;
   void enqueue_ready_slot(Slot &slot);
   void reclaim_unordered_slots(bool &progress);
   int output_ready_slot(int64_t max_row_cnt);
@@ -166,6 +173,11 @@ private:
   int64_t max_output_rows_;
   int64_t peak_pending_rows_;
   int64_t peak_frames_;
+  int64_t demand_evaluated_;
+  int64_t demand_matched_;
+  int64_t active_pull_rows_;
+  int64_t async_evaluated_rows_;
+  int64_t async_matched_rows_;
   DISALLOW_COPY_AND_ASSIGN(SemanticOp);
 };
 

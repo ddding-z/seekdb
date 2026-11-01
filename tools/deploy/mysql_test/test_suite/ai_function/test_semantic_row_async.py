@@ -118,6 +118,57 @@ class SemanticRowAsyncContracts(cache.SemanticCacheContracts):
                 self.assert_no_model_sockets()
                 tail.set()
 
+    def test_lifted_topn_straggler_replenishes_and_brakes_without_overshoot(self):
+        prompts = [f"topn-{index:02d}" for index in range(BATCH_ROWS)]
+        self.load_inputs(prompts)
+        for caching in ("false", "true"):
+            statement = cache.sql_statement(
+                "a.id, a.prompt",
+                cache=caching,
+                enabled_lift="true",
+                where=self.call("filter"),
+                suffix="ORDER BY a.prompt LIMIT 2",
+                hints="PARALLEL(1) " + ROW_HINT,
+            )
+            plan = self.explain(statement)
+            stage = plan.one("SEMANTIC FILTER")
+            self.assertTrue(plan.is_above(plan.one("LIMIT"), stage), plan.text)
+            self.assertTrue(plan.is_above(stage, plan.one("SORT")), plan.text)
+            self.assertIn("SEMANTIC_PLACEMENT=LIFTED", stage.annotation.upper())
+            self.assertIn("ROW_ASYNC=ORDERED_PREFIX", stage.annotation.upper())
+            for head_matches, expected in (
+                (True, ((0, "topn-00"), (2, "topn-02"))),
+                (False, ((2, "topn-02"), (3, "topn-03"))),
+            ):
+                with self.subTest(caching=caching, head_matches=head_matches):
+                    head_gate = self.fixtures.gate()
+                    offset = len(self.first.requests)
+                    self.fixtures.reply(0, prompts[0], head_matches, kind="filter", gate=head_gate)
+                    self.fixtures.reply(0, prompts[1], False, kind="filter")
+                    for prompt in prompts[2:]:
+                        self.fixtures.reply(0, prompt, True, kind="filter")
+                    pending = self.fixtures.start(lambda: self.execute(statement))
+                    self.wait_requests(
+                        self.first,
+                        lambda: len([record for record in semantic.audit(self.first)[offset:]
+                                     if record["response"] is not None]) >= 3,
+                        pending,
+                        "straggler shadow replenishment did not complete 2 out-of-order matches behind row 0",
+                    )
+                    self.assertFalse(head_gate.is_set())
+                    self.assertFalse(pending.done.is_set(), repr(pending.error))
+                    self.assertEqual(
+                        [body["messages"][0]["content"] for body in self.first.requests[offset:]],
+                        prompts[:4],
+                    )
+                    head_gate.set()
+                    self.assertEqual(pending.result(timeout=3), expected)
+                    self.assertEqual(
+                        [body["messages"][0]["content"] for body in self.first.requests[offset:]],
+                        prompts[:4],
+                    )
+                    self.assert_no_model_sockets()
+
     def test_nested_rows_advance_while_a_sibling_inner_request_is_held(self):
         prompts = [f"nested-{index}" for index in range(BATCH_ROWS)]
         self.load_inputs(prompts)
