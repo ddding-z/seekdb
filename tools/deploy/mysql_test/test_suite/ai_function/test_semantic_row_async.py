@@ -169,6 +169,68 @@ class SemanticRowAsyncContracts(cache.SemanticCacheContracts):
                     )
                     self.assert_no_model_sockets()
 
+    def test_lifted_topn_cross_batch_sliding_window_pulls_next_batch_for_single_row(self):
+        prompts = [f"slide-{index:02d}" for index in range(2 * BATCH_ROWS)]
+        self.load_inputs(prompts)
+        statement = cache.sql_statement(
+            "a.id, a.prompt",
+            cache="false",
+            enabled_lift="true",
+            where=self.call("filter"),
+            suffix=f"ORDER BY a.prompt LIMIT {BATCH_ROWS}",
+            hints="PARALLEL(1) " + ROW_HINT,
+        )
+        plan = self.explain(statement)
+        stage = plan.one("SEMANTIC FILTER")
+        self.assertIn("SEMANTIC_PLACEMENT=LIFTED", stage.annotation.upper())
+        self.assertIn("ROW_ASYNC=ORDERED_PREFIX", stage.annotation.upper())
+        fast_gate, batch0_gate, batch1_row0_gate = (
+            self.fixtures.gate() for _ in range(3)
+        )
+        offset = len(self.first.requests)
+        # In Batch 0 (rows 0..15): row 0 is fast and returns False (rejected),
+        # while rows 1..15 are still in-flight behind batch0_gate.
+        self.fixtures.reply(0, prompts[0], False, kind="filter", gate=fast_gate)
+        for prompt in prompts[1:BATCH_ROWS]:
+            self.fixtures.reply(0, prompt, True, kind="filter", gate=batch0_gate)
+        # In Batch 1 (rows 16..31): row 16 is gated by batch1_row0_gate and returns True.
+        self.fixtures.reply(0, prompts[BATCH_ROWS], True, kind="filter", gate=batch1_row0_gate)
+        for prompt in prompts[BATCH_ROWS + 1:]:
+            self.fixtures.reply(0, prompt, True, kind="filter")
+        pending = self.fixtures.start(lambda: self.execute(statement))
+        self.wait_batch(pending, offset)
+        self.assertEqual(
+            Counter(body["messages"][0]["content"] for body in self.first.requests[offset:]),
+            Counter(prompts[:BATCH_ROWS]),
+        )
+        # Release 1 row from Batch 0 (rejected). While rows 1..15 of Batch 0 are STILL in-flight,
+        # the sliding window must immediately pull Batch 1 and dispatch exactly 1 row (prompts[16])
+        # to refill the window back to BATCH_ROWS (15 in Batch 0 + 1 in Batch 1 = 16).
+        fast_gate.set()
+        self.wait_requests(
+            self.first,
+            lambda: len(self.first.requests) >= offset + BATCH_ROWS + 1,
+            pending,
+            "cross-batch sliding window did not pull next batch and refill 1 row while batch 0 was in-flight",
+        )
+        self.assertFalse(batch0_gate.is_set())
+        self.assertFalse(batch1_row0_gate.is_set())
+        self.assertEqual(
+            Counter(body["messages"][0]["content"] for body in self.first.requests[offset:]),
+            Counter(prompts[:BATCH_ROWS + 1]),
+        )
+        batch0_gate.set()
+        batch1_row0_gate.set()
+        self.assertEqual(
+            pending.result(timeout=3),
+            tuple((index, prompts[index]) for index in range(1, BATCH_ROWS + 1)),
+        )
+        self.assertEqual(
+            Counter(body["messages"][0]["content"] for body in self.first.requests[offset:]),
+            Counter(prompts[:BATCH_ROWS + 1]),
+        )
+        self.assert_no_model_sockets()
+
     def test_nested_rows_advance_while_a_sibling_inner_request_is_held(self):
         prompts = [f"nested-{index}" for index in range(BATCH_ROWS)]
         self.load_inputs(prompts)

@@ -440,8 +440,9 @@ bool AIRequestTransport::drive(bool cancel)
   while (OB_SUCC(ret) && active_ < request_limit_ && started && !clients_.empty()) {
     started = false;
     const int64_t count = clients_.size();
+    const bool head_priority = !clients_[0]->incremental_results_;
     for (int64_t i = 0; OB_SUCC(ret) && i < count && active_ < request_limit_; ++i) {
-      ObAIFuncClient &client = *clients_[(next_ + i) % count];
+      ObAIFuncClient &client = *clients_[head_priority ? i : ((next_ + i) % count)];
       if (client.async_done_.load(std::memory_order_acquire) ||
           client.active_count_ >= (client.max_parallel_ == 0
               ? client.requests_.count() : client.max_parallel_)) {
@@ -458,6 +459,9 @@ bool AIRequestTransport::drive(bool cancel)
           }
           break;
         }
+      }
+      if (head_priority && started) {
+        break;
       }
     }
     next_ = (next_ + 1) % count;

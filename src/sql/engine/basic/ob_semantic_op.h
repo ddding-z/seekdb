@@ -124,13 +124,19 @@ private:
   bool slot_drained(const Slot &slot) const;
   bool quota_cutoff_enabled(const Slot &slot) const;
   bool quota_cruise_brake_enabled() const;
+  int64_t accepted_before_slot(const Slot &slot) const;
+  int64_t pipeline_in_flight_rows(int64_t task_index) const;
+  bool active_slots_have_queued_rows() const;
   int64_t slot_cutoff_row(const Slot &slot) const;
   bool row_started(const Slot &slot, int64_t row) const;
+  int64_t max_started_row(const Slot &slot) const;
+  bool row_needs_prefix_completion(
+      const Slot &slot, int64_t row, int64_t cutoff_row, int64_t max_started) const;
   int64_t quota_new_row_allowance(const Slot &slot) const;
   void enqueue_ready_slot(Slot &slot);
   void reclaim_unordered_slots(bool &progress);
   int output_ready_slot(int64_t max_row_cnt);
-  int advance_media(Task &task, bool &progress);
+  int advance_media(Slot &slot, Task &task, bool &progress);
   bool input_ready(const Task &task, int64_t position) const;
   bool has_pending_requests() const;
   int build_request_parts(Task &task, Dispatch &dispatch, int64_t position);
