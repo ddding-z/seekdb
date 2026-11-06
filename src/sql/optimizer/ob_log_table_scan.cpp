@@ -1064,11 +1064,11 @@ int ObLogTableScan::generate_necessary_rowkey_and_partkey_exprs()
   } else if (OB_FAIL(schema_guard->get_table_schema(ref_table_id_, table_schema))) {
   } else if (table_schema != NULL && FALSE_IT(is_table_without_pk = table_schema->is_table_without_pk())) {
   } else if (OB_FAIL(get_stmt()->has_lob_column(table_id_, has_lob_column))) {
-  } else if (OB_FAIL(get_mbr_column_exprs(table_id_, spatial_exprs_))) {
-  } else if (is_table_without_pk && is_index_global_ && index_back_ &&
+  } else if (spatial_exprs_.empty() && OB_FAIL(get_mbr_column_exprs(table_id_, spatial_exprs_))) {
+  } else if (part_exprs_.empty() && is_table_without_pk && is_index_global_ && index_back_ &&
              OB_FAIL(get_part_column_exprs(table_id_, ref_table_id_, part_exprs_))) {
     LOG_WARN("failed to get part column exprs", K(ret));
-  } else if ((has_lob_column || need_get_rowkey_exprs())
+  } else if (rowkey_exprs_.empty() && (has_lob_column || need_get_rowkey_exprs())
       && OB_FAIL(get_plan()->get_rowkey_exprs(table_id_, ref_table_id_, rowkey_exprs_))) {
     LOG_WARN("failed to generate rowkey exprs", K(ret));
   } else { /*do nothing*/ }
@@ -3772,7 +3772,10 @@ int ObLogTableScan::prepare_hnsw_vector_access_exprs()
   ObColumnRefRawExpr *embedded_vector_column = nullptr;
   ObSEArray<uint64_t , 1> col_ids;
   ObVectorAuxTableIdx hybrid_embedded_tbl_idx = need_skip_rowkey_vid() ? VEC_FOURTH_AUX_TBL_IDX : VEC_SIXTH_AUX_TBL_IDX;
-  if (OB_ISNULL(get_stmt()) || OB_ISNULL(get_plan()) ||
+  if (OB_NOT_NULL(vc_info.target_vec_column_) && OB_NOT_NULL(vc_info.vec_id_column_) &&
+      !vc_info.aux_table_column_.empty()) {
+    // already prepared
+  } else if (OB_ISNULL(get_stmt()) || OB_ISNULL(get_plan()) ||
       OB_ISNULL(expr_factory = &get_plan()->get_optimizer_context().get_expr_factory()) ||
       OB_ISNULL(session_info = get_plan()->get_optimizer_context().get_session_info()) ||
       OB_ISNULL(schema_guard = get_plan()->get_optimizer_context().get_sql_schema_guard())) {

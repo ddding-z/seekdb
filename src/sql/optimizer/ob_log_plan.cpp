@@ -12881,6 +12881,9 @@ int ObLogPlan::prepare_vector_index_info(AccessPath *ap,
       ObVecIndexInfo &vc_info = table_scan->get_vector_index_info();
       vc_info.main_table_tid_ = table_scan->get_real_ref_table_id();
       vc_info.sort_key_.expr_ = vector_expr;
+      if (stmt->get_order_item_size() > 0) {
+        vc_info.sort_key_.order_type_ = stmt->get_order_item(0).order_type_;
+      }
       vc_info.topk_limit_expr_ = stmt->get_limit_expr();
       vc_info.topk_offset_expr_ = stmt->get_offset_expr();
       vc_info.vec_type_ = ap->vec_idx_info_.vec_extra_info_.get_vec_idx_type();

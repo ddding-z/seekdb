@@ -255,7 +255,8 @@ struct ObVecIndexInfo
     is_spatial_index_(false),
     can_extract_range_(false),
     vec_index_name_(),
-    is_hybrid_index(false)
+    is_hybrid_index(false),
+    semantic_prefetch_factor_(0)
   { }
   ~ObVecIndexInfo() {}
 
@@ -338,6 +339,7 @@ struct ObVecIndexInfo
   bool can_extract_range_;
   ObString vec_index_name_;
   bool is_hybrid_index;
+  int64_t semantic_prefetch_factor_;
 };
 
 class ObLogTableScan : public ObLogicalOperator

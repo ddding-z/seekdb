@@ -85,7 +85,8 @@ public:
       relevance_col_cnt_(0),
       is_hybrid_(false),
       use_rowkey_vid_tbl_(false),
-      skip_delta_buffer_(false) {}
+      skip_delta_buffer_(false),
+      semantic_prefetch_factor_(0) {}
 
   inline bool is_pre_filter() const { return ObVecIndexType::VEC_INDEX_PRE == vec_type_;  }
   inline bool is_vec_adaptive_scan() const { return ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN == vec_type_ && ObVecIdxAdaTryPath::VEC_PATH_UNCHOSEN != adaptive_try_path_; }
@@ -192,6 +193,7 @@ public:
   bool is_hybrid_;
   bool use_rowkey_vid_tbl_;
   bool skip_delta_buffer_;  // true: HNSW + heap table + sync_mode=async, skip delta_buffer in scan
+  int64_t semantic_prefetch_factor_;
 };
 
 struct ObDASVecAuxScanRtDef : ObDASAttachRtDef

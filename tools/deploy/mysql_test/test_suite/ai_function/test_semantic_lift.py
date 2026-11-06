@@ -94,6 +94,10 @@ TABLES = {
     ),
     "lift_guards": "id INT PRIMARY KEY, prompt LONGTEXT, guard_flag INT NULL",
     "lift_files": "id INT PRIMARY KEY, prompt LONGTEXT, asset FILE",
+    "lift_vec": (
+        "id INT PRIMARY KEY, category INT, prompt LONGTEXT, emb VECTOR(4), "
+        "KEY idx_cat(category), VECTOR INDEX idx_emb(emb) WITH (distance=L2, type=hnsw, ef_search=10)"
+    ),
 }
 SESSION_SETTINGS = (
     "ob_query_timeout", "ai_pipeline_slots", "ai_pipeline_memory_limit",
@@ -1017,6 +1021,65 @@ class SemanticLiftContracts(unittest.TestCase):
                 self.assertTrue(plan.is_above(plan.one("SEMANTIC MAP"), plan.one("LIMIT")), plan.text)
                 self.check_query(statement, expected_map,
                                  second=[prompts[index] for index in retained_map])
+
+    def test_vector_ann_topk_semantic_filter_lift_and_prefetch(self):
+        self.cursor.execute("SET SESSION ai_pipeline_slots=1")
+        prompts = [f"vec-item-{index}" for index in range(1, 81)]
+        self.cursor.executemany(
+            "INSERT INTO lift_vec VALUES (%s,%s,%s,%s)",
+            [
+                (index, 1 if index % 2 == 1 else 2, prompts[index - 1], f"[0, 0, 0, {index}]")
+                for index in range(1, 81)
+            ],
+        )
+        for index, prompt in enumerate(prompts, start=1):
+            self.seed(prompt, index % 6 == 0 or index in (3, 9, 15, 21, 27))
+        pure_expected = ((3,), (6,), (9,), (12,), (15,))
+        hybrid_expected = ((3,), (9,), (15,), (21,), (27,))
+        for mode, where_sql, scan_label, expected, lifted_demanded in (
+            (
+                "pure_ai_filter",
+                f"AI_FILTER('{MODEL_A}',prompt)",
+                "VECTOR INDEX SCAN",
+                pure_expected,
+                prompts[:16],
+            ),
+            (
+                "hybrid_scalar_and_ai_filter",
+                f"category=1 AND AI_FILTER('{MODEL_A}',prompt)",
+                "VECTOR INDEX ADAPTIVE SCAN (PRE-FILTER)",
+                hybrid_expected,
+                [prompts[index - 1] for index in range(1, 28, 2)],
+            ),
+        ):
+            for enabled in ("false", "true"):
+                with self.subTest(mode=mode, enabled=enabled):
+                    statement = (
+                        f"SELECT /*+ OPT_PARAM('rowsets_max_rows', {BATCH_ROWS}) "
+                        f"OPT_PARAM('enable_semantic_lift', '{enabled}') */ id "
+                        f"FROM lift_vec WHERE {where_sql} "
+                        "ORDER BY l2_distance(emb, '[0, 0, 0, 0]') APPROXIMATE LIMIT 5"
+                    )
+                    plan = self.explain(statement)
+                    stage = plan.one("SEMANTIC FILTER")
+                    scan = plan.one(scan_label)
+                    self.assertTrue(plan.is_above(stage, scan), plan.text)
+                    if enabled == "false":
+                        topn = plan.one("TOP-N SORT")
+                        self.assertTrue(plan.is_above(topn, stage), plan.text)
+                        before = self.snapshots()
+                        rows = self.execute(statement)
+                        after = self.snapshots()
+                        self.assertEqual(rows, expected)
+                        delta = counter_delta(before[self.first].counts, after[self.first].counts)
+                        self.assertGreater(sum(delta.values()), len(lifted_demanded))
+                    else:
+                        self.assertEqual(len(plan.find("TOP-N SORT")), 0, plan.text)
+                        limit_node = plan.one("LIMIT")
+                        self.assertTrue(plan.is_above(limit_node, stage), plan.text)
+                        self.assertRegex(stage.annotation, r"(?i)\bsemantic_placement\s*=\s*LIFTED\b",
+                                         plan.text)
+                        self.check_query(statement, expected, first=lifted_demanded)
 
     def test_aggregate_boundary_retains_group_level_demand(self):
         self.load_basic(12, stride=2)

@@ -1383,6 +1383,26 @@ int ObJoinOrder::check_use_das_by_false_startup_filter(const IndexInfoEntry &ind
   return ret;
 }
 
+static int collect_non_semantic_exprs(const ObIArray<ObRawExpr *> &exprs,
+                                      ObIArray<ObRawExpr *> &scalar_exprs)
+{
+  int ret = OB_SUCCESS;
+  scalar_exprs.reuse();
+  for (int64_t i = 0; OB_SUCC(ret) && i < exprs.count(); ++i) {
+    ObRawExpr *expr = exprs.at(i);
+    bool contains_semantic = false;
+    if (OB_ISNULL(expr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null filter expr", K(ret));
+    } else if (OB_FAIL(SemanticExprUtils::contains_semantic(expr, contains_semantic))) {
+      LOG_WARN("failed to check semantic expr", K(ret));
+    } else if (!contains_semantic && OB_FAIL(scalar_exprs.push_back(expr))) {
+      LOG_WARN("failed to push back scalar filter expr", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObJoinOrder::check_can_use_vec_primary_opt(const uint64_t ref_table_id,
                                               PathHelper &helper,
                                               const QueryRangeInfo &range_info,
@@ -1391,7 +1411,14 @@ int ObJoinOrder::check_can_use_vec_primary_opt(const uint64_t ref_table_id,
   int ret = OB_SUCCESS;
   is_filter_all_rowkey_col = false;
   if (OB_NOT_NULL(range_info.get_query_range_provider())) {
-    is_filter_all_rowkey_col = (range_info.get_query_range_provider()->get_range_exprs().count() == helper.filters_.count() && helper.filters_.count() > 0);
+    ObSEArray<ObRawExpr *, 4> scalar_filters;
+    if (OB_FAIL(collect_non_semantic_exprs(helper.filters_, scalar_filters))) {
+      LOG_WARN("failed to collect scalar filters for vec primary opt", K(ret));
+    } else {
+      is_filter_all_rowkey_col =
+          (range_info.get_query_range_provider()->get_range_exprs().count() == scalar_filters.count() &&
+           scalar_filters.count() > 0);
+    }
   }
   return ret;
 }
@@ -1524,12 +1551,17 @@ int ObJoinOrder::process_vec_index_info(const ObDMLStmt *stmt,
     }
   } else {
     // if adaptive filter, should not come in
-    ObVecIndexType post_vec_type = ((helper.filters_.count() > 0 || !stmt->get_subquery_exprs().empty()
-    || helper.match_expr_infos_.count() > 0 || helper.is_index_merge_) && index_schema->is_vec_hnsw_index()) ?
-    ObVecIndexType::VEC_INDEX_POST_ITERATIVE_FILTER : ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER;
-    vec_index_schema = index_schema;
-    access_path.vec_idx_info_.vec_extra_info_.set_vec_idx_type(post_vec_type);
-    vector_index_match = true;
+    ObSEArray<ObRawExpr *, 4> scalar_filters;
+    if (OB_FAIL(collect_non_semantic_exprs(helper.filters_, scalar_filters))) {
+      LOG_WARN("failed to collect scalar filters for vec index", K(ret));
+    } else {
+      ObVecIndexType post_vec_type = ((scalar_filters.count() > 0 || !stmt->get_subquery_exprs().empty()
+      || helper.match_expr_infos_.count() > 0 || helper.is_index_merge_) && index_schema->is_vec_hnsw_index()) ?
+      ObVecIndexType::VEC_INDEX_POST_ITERATIVE_FILTER : ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER;
+      vec_index_schema = index_schema;
+      access_path.vec_idx_info_.vec_extra_info_.set_vec_idx_type(post_vec_type);
+      vector_index_match = true;
+    }
   }
 
   if (OB_FAIL(ret) || !vector_index_match) {
@@ -1538,9 +1570,12 @@ int ObJoinOrder::process_vec_index_info(const ObDMLStmt *stmt,
     LOG_WARN("vec_table_schema unexpected null", K(ret));
   } else {
     double selectivity = 0.0;
-    if (OB_FAIL(ObOptSelectivity::calculate_selectivity(get_plan()->get_basic_table_metas(),
+    ObSEArray<ObRawExpr *, 8> scalar_restrict_infos;
+    if (OB_FAIL(collect_non_semantic_exprs(get_restrict_infos(), scalar_restrict_infos))) {
+      LOG_WARN("failed to collect scalar restrict infos for vec index", K(ret));
+    } else if (OB_FAIL(ObOptSelectivity::calculate_selectivity(get_plan()->get_basic_table_metas(),
                                                         get_plan()->get_selectivity_ctx(),
-                                                        get_restrict_infos(),
+                                                        scalar_restrict_infos,
                                                         selectivity,
                                                         get_plan()->get_predicate_selectivities()))) {
     } else if (OB_FAIL(ObVectorIndexUtil::set_vector_index_param(vec_index_schema,
@@ -1561,7 +1596,7 @@ int ObJoinOrder::process_vec_index_info(const ObDMLStmt *stmt,
       double selectivity = 0.0;
       if (OB_FAIL(ObOptSelectivity::calculate_selectivity(get_plan()->get_basic_table_metas(),
                                                           get_plan()->get_selectivity_ctx(),
-                                                          get_restrict_infos(),
+                                                          scalar_restrict_infos,
                                                           selectivity,
                                                           get_plan()->get_predicate_selectivities()))) {
       } else if (OB_FAIL(ObVectorIndexUtil::set_vector_index_param(vec_index_schema,
@@ -3740,6 +3775,7 @@ int ObJoinOrder::get_valid_index_ids(const uint64_t table_id,
   bool add_only_vec_index_id = false;
   bool add_only_fts_index_id = false;
   bool add_only_match_index_id = false;
+  ObSEArray<ObRawExpr *, 4> scalar_filters;
   if (OB_ISNULL(get_plan()) ||
       OB_ISNULL(stmt = get_plan()->get_stmt()) ||
       OB_ISNULL(schema_guard = OPT_CTX.get_sql_schema_guard()) ||
@@ -3755,8 +3791,11 @@ int ObJoinOrder::get_valid_index_ids(const uint64_t table_id,
   } else if (stmt->is_select_stmt() && FALSE_IT(select_stmt = static_cast<const ObSelectStmt*>(stmt))) {
   } else if (FALSE_IT(can_use_global_index = (table_item->access_all_part() && !has_match_expr_on_table && !stmt->has_vec_approx()))) {
   } else if (nullptr != select_stmt && FALSE_IT(has_aggr = select_stmt->get_aggr_item_size() > 0)) {
+  } else if (stmt->has_vec_approx() &&
+             OB_FAIL(collect_non_semantic_exprs(helper.filters_, scalar_filters))) {
+    LOG_WARN("failed to collect scalar filters for valid index ids", K(ret));
   } else if (stmt->has_vec_approx()
-            && ((helper.filters_.count() == 0 && stmt->get_subquery_exprs().empty() && !has_match_expr_on_table && !helper.is_index_merge_))
+            && ((scalar_filters.count() == 0 && stmt->get_subquery_exprs().empty() && !has_match_expr_on_table && !helper.is_index_merge_))
             && OB_FALSE_IT(add_only_vec_index_id = true)) {
   } else if (add_only_vec_index_id) {
     if (OB_FAIL(add_valid_vec_index_ids(*stmt, schema_guard, table_id, ref_table_id, has_aggr, valid_index_ids))) {
@@ -5766,13 +5805,16 @@ int ObJoinOrder::compute_vec_idx_path_relationship(const AccessPath &first_path,
   AccessPath *pre_path = first_path.vec_idx_info_.is_post_filter() ?
                           const_cast<AccessPath*>(&second_path) : const_cast<AccessPath*>(&first_path);
   double selectivity = 0.0;
+  ObSEArray<ObRawExpr *, 4> scalar_restrict_infos;
   if (first_path.vec_idx_info_.vec_extra_info_.is_spatial_index_) {
     relation = first_path.vec_idx_info_.vec_extra_info_.is_pre_filter() ? DominateRelation::OBJ_LEFT_DOMINATE : DominateRelation::OBJ_RIGHT_DOMINATE;
   } else if (first_path.vec_idx_info_.vec_extra_info_.is_multi_value_index_) {
     relation = first_path.vec_idx_info_.vec_extra_info_.is_post_filter() ? DominateRelation::OBJ_LEFT_DOMINATE : DominateRelation::OBJ_RIGHT_DOMINATE;
+  } else if (OB_FAIL(collect_non_semantic_exprs(get_restrict_infos(), scalar_restrict_infos))) {
+    LOG_WARN("failed to collect non-semantic restrict infos", K(ret));
   } else if (OB_FAIL(ObOptSelectivity::calculate_selectivity(get_plan()->get_basic_table_metas(),
                                                       get_plan()->get_selectivity_ctx(),
-                                                      get_restrict_infos(),
+                                                      scalar_restrict_infos,
                                                       selectivity,
                                                       get_plan()->get_predicate_selectivities()))) {
   } else if (selectivity >= first_path.vec_idx_info_.vec_extra_info_.get_default_selectivity_rate()) {
@@ -17864,24 +17906,29 @@ int ObJoinOrder::get_valid_hint_index_list(const ObDMLStmt &stmt,
                                           has_aggr, is_valid))) {
       } else if (!is_valid || helper.is_index_merge_ || !helper.match_expr_infos_.empty()) {
       } else {
-        ObVecIndexType vec_with_filter_index_type = ObVecIndexType::VEC_INDEX_INVALID;
-        if (index_hint_table_schema->is_vec_hnsw_index()) {
-          // hint choose vec index post-with-filter
-          vec_with_filter_index_type = ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN;
+        ObSEArray<ObRawExpr *, 4> scalar_filters;
+        if (OB_FAIL(collect_non_semantic_exprs(helper.filters_, scalar_filters))) {
+          LOG_WARN("failed to collect scalar filters for hint index list", K(ret));
         } else {
-          vec_with_filter_index_type = ObVecIndexType::VEC_INDEX_POST_ITERATIVE_FILTER;
-        }
-        helper.vec_index_type_ = (helper.filters_.count() > 0 && stmt.get_subquery_exprs().empty() && !has_match_expr_on_table && !helper.is_index_merge_)
-        ? vec_with_filter_index_type : ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER;
-        // filter choose VEC_INDEX_ADAPTIVE_SCAN, can not add vec index into index ids, choose a normal index anyways
-        if (helper.vec_index_type_ != ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN) {
-          if (OB_FAIL(valid_hint_index_ids.push_back(tid))) {
-          }
-        } else {
-          if (ObVectorIndexUtil::is_sindi_index(index_hint_table_schema)) {
-            helper.vec_idx_try_path_ = ObVecIdxAdaTryPath::VEC_INDEX_POST_FILTER;
+          ObVecIndexType vec_with_filter_index_type = ObVecIndexType::VEC_INDEX_INVALID;
+          if (index_hint_table_schema->is_vec_hnsw_index()) {
+            // hint choose vec index post-with-filter
+            vec_with_filter_index_type = ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN;
           } else {
-            helper.vec_idx_try_path_ = ObVecIdxAdaTryPath::VEC_INDEX_ITERATIVE_FILTER;
+            vec_with_filter_index_type = ObVecIndexType::VEC_INDEX_POST_ITERATIVE_FILTER;
+          }
+          helper.vec_index_type_ = (scalar_filters.count() > 0 && stmt.get_subquery_exprs().empty() && !has_match_expr_on_table && !helper.is_index_merge_)
+          ? vec_with_filter_index_type : ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER;
+          // filter choose VEC_INDEX_ADAPTIVE_SCAN, can not add vec index into index ids, choose a normal index anyways
+          if (helper.vec_index_type_ != ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN) {
+            if (OB_FAIL(valid_hint_index_ids.push_back(tid))) {
+            }
+          } else {
+            if (ObVectorIndexUtil::is_sindi_index(index_hint_table_schema)) {
+              helper.vec_idx_try_path_ = ObVecIdxAdaTryPath::VEC_INDEX_POST_FILTER;
+            } else {
+              helper.vec_idx_try_path_ = ObVecIdxAdaTryPath::VEC_INDEX_ITERATIVE_FILTER;
+            }
           }
         }
       }

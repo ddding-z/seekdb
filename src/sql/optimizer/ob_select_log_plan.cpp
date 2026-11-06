@@ -5199,6 +5199,19 @@ int semantic_lift_expression_safe(ObRawExpr *expr, bool semantic_recipe,
             expr->get_param_expr(index)->is_static_scalar_const_expr();
       }
     }
+  } else if (!semantic_recipe && expr->is_vector_sort_expr()) {
+    safe = expr->get_param_count() == 2;
+    for (int64_t index = 0; OB_SUCC(ret) && safe && index < expr->get_param_count(); ++index) {
+      ObRawExpr *param = expr->get_param_expr(index);
+      if (OB_ISNULL(param)) {
+        safe = false;
+      } else if (param->is_static_scalar_const_expr()) {
+        safe = true;
+      } else {
+        ret = SMART_CALL(semantic_lift_expression_safe(
+            param, false, false, safe, cached_recipe));
+      }
+    }
   } else {
     const ObItemType type = expr->get_expr_type();
     bool contains_semantic = false;
@@ -5257,10 +5270,36 @@ int semantic_lift_relational_safe(ObLogicalOperator &node, bool &safe)
        semantic_lift_join_supported(static_cast<ObLogJoin &>(node))) ||
       (node.get_type() == LOG_SORT &&
        nullptr == static_cast<ObLogSort &>(node).get_topn_expr());
-  if (safe && OB_FAIL(node.get_op_exprs(expressions))) {
-    LOG_WARN("failed to inspect relational expressions for semantic placement", K(ret));
-  } else if (safe && OB_FAIL(append_array_no_dup(expressions, node.get_pushdown_filter_exprs()))) {
-    LOG_WARN("failed to inspect pushdown expressions for semantic placement", K(ret));
+  if (safe) {
+    if (node.get_type() == LOG_TABLE_SCAN) {
+      ObLogTableScan &scan = static_cast<ObLogTableScan &>(node);
+      const ObVecIndexInfo &vc_info = scan.get_vector_index_info();
+      if (OB_FAIL(node.ObLogicalOperator::get_op_exprs(expressions))) {
+        LOG_WARN("failed to inspect base table scan expressions for semantic placement", K(ret));
+      } else if (OB_FAIL(append_array_no_dup(expressions, scan.get_range_conditions()))) {
+        LOG_WARN("failed to inspect range expressions for semantic placement", K(ret));
+      } else if (OB_NOT_NULL(scan.get_limit_expr()) &&
+                 OB_FAIL(add_var_to_array_no_dup(expressions, scan.get_limit_expr()))) {
+        LOG_WARN("failed to inspect scan limit expression for semantic placement", K(ret));
+      } else if (OB_NOT_NULL(scan.get_offset_expr()) &&
+                 OB_FAIL(add_var_to_array_no_dup(expressions, scan.get_offset_expr()))) {
+        LOG_WARN("failed to inspect scan offset expression for semantic placement", K(ret));
+      } else if (OB_NOT_NULL(vc_info.sort_key_.expr_) &&
+                 OB_FAIL(add_var_to_array_no_dup(expressions, vc_info.sort_key_.expr_))) {
+        LOG_WARN("failed to inspect vector sort expression for semantic placement", K(ret));
+      } else if (OB_NOT_NULL(vc_info.topk_limit_expr_) &&
+                 OB_FAIL(add_var_to_array_no_dup(expressions, vc_info.topk_limit_expr_))) {
+        LOG_WARN("failed to inspect vector topk limit expression for semantic placement", K(ret));
+      } else if (OB_NOT_NULL(vc_info.topk_offset_expr_) &&
+                 OB_FAIL(add_var_to_array_no_dup(expressions, vc_info.topk_offset_expr_))) {
+        LOG_WARN("failed to inspect vector topk offset expression for semantic placement", K(ret));
+      }
+    } else if (OB_FAIL(node.get_op_exprs(expressions))) {
+      LOG_WARN("failed to inspect relational expressions for semantic placement", K(ret));
+    }
+    if (OB_SUCC(ret) && OB_FAIL(append_array_no_dup(expressions, node.get_pushdown_filter_exprs()))) {
+      LOG_WARN("failed to inspect pushdown expressions for semantic placement", K(ret));
+    }
   }
   for (int64_t index = 0; OB_SUCC(ret) && safe &&
        index < expressions.count(); ++index) {
@@ -6185,17 +6224,63 @@ private:
         const bool root = sort.is_plan_root();
         ObRawExpr *topn_expr = sort.get_topn_expr();
         ObLogicalOperator *source = stage.get_child(ObLogicalOperator::first_child);
-        sort.set_child(ObLogicalOperator::first_child, source);
-        sort.set_topn_expr(nullptr);
-        sort.set_is_plan_root(false);
-        sort.get_output_const_exprs().reuse();
-        stage.set_child(ObLogicalOperator::first_child, &sort);
-        stage.set_is_plan_root(false);
-        stage.get_output_const_exprs().reuse();
-        if (OB_FAIL(sort.compute_property())) {
-        } else if (OB_FAIL(sort.est_cost())) {
-        } else if (OB_FAIL(stage.compute_property())) {
+        bool can_elide_vec_sort = false;
+        if (OB_NOT_NULL(source) && source->get_type() == LOG_TABLE_SCAN) {
+          auto &table_scan = *static_cast<ObLogTableScan *>(source);
+          ObVecIndexInfo &vc_info = table_scan.get_vector_index_info();
+          if (table_scan.is_vec_idx_scan()) {
+            vc_info.semantic_prefetch_factor_ =
+                std::max<int64_t>(vc_info.semantic_prefetch_factor_, 10);
+          }
+          if ((table_scan.is_vec_idx_scan_post_filter() || table_scan.is_hnsw_vec_scan()) &&
+              !table_scan.is_ivf_pq_scan() &&
+              !vc_info.is_hnsw_bq_scan() &&
+              !table_scan.use_das() &&
+              !table_scan.is_distributed() &&
+              (nullptr == table_scan.get_table_partition_info() ||
+               !table_scan.get_table_partition_info()->get_table_location().is_partitioned()) &&
+              !(vc_info.vec_type_ == ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER &&
+                (table_scan.get_filter_exprs().count() != 0 ||
+                 table_scan.get_pushdown_filter_exprs().count() != 0)) &&
+              sort.get_sort_keys().count() == 1 &&
+              sort.get_sort_keys().at(0).expr_ == vc_info.sort_key_.expr_ &&
+              is_ascending_direction(sort.get_sort_keys().at(0).order_type_)) {
+            can_elide_vec_sort = true;
+          }
+        }
+        if (can_elide_vec_sort) {
+          auto &table_scan = *static_cast<ObLogTableScan *>(source);
+          ObVecIndexInfo &vc_info = table_scan.get_vector_index_info();
+          vc_info.sort_key_.order_type_ = sort.get_sort_keys().at(0).order_type_;
+          if (vc_info.vec_type_ == ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER &&
+              table_scan.get_filter_exprs().count() == 0 &&
+              table_scan.get_pushdown_filter_exprs().count() == 0) {
+            vc_info.selectivity_ = 1;
+          }
+          if (OB_FAIL(table_scan.set_op_ordering(sort.get_sort_keys()))) {
+            LOG_WARN("failed to set op ordering on vector index table scan", K(ret));
+          } else {
+            stage.set_child(ObLogicalOperator::first_child, source);
+            stage.set_is_plan_root(false);
+            stage.get_output_const_exprs().reuse();
+            if (OB_FAIL(stage.compute_property())) {
+              LOG_WARN("failed to compute property on lifted semantic filter over vector scan", K(ret));
+            }
+          }
         } else {
+          sort.set_child(ObLogicalOperator::first_child, source);
+          sort.set_topn_expr(nullptr);
+          sort.set_is_plan_root(false);
+          sort.get_output_const_exprs().reuse();
+          stage.set_child(ObLogicalOperator::first_child, &sort);
+          stage.set_is_plan_root(false);
+          stage.get_output_const_exprs().reuse();
+          if (OB_FAIL(sort.compute_property())) {
+          } else if (OB_FAIL(sort.est_cost())) {
+          } else if (OB_FAIL(stage.compute_property())) {
+          }
+        }
+        if (OB_SUCC(ret)) {
           ObLogicalOperator *new_top = &stage;
           if (OB_FAIL(plan_.allocate_limit_as_top(
               new_top, topn_expr, nullptr, nullptr, false, root, false, nullptr))) {
@@ -6336,6 +6421,13 @@ private:
         ret = stage->add_expression(expressions.at(index));
       }
       if (OB_SUCC(ret)) {
+        if (stage->get_type() == LOG_SEMANTIC_FILTER && child->get_type() == LOG_TABLE_SCAN) {
+          auto &table_scan = *static_cast<ObLogTableScan *>(child);
+          if (table_scan.is_vec_idx_scan()) {
+            table_scan.get_vector_index_info().semantic_prefetch_factor_ =
+                std::max<int64_t>(table_scan.get_vector_index_info().semantic_prefetch_factor_, 10);
+          }
+        }
         stage->set_output_order(policy == ObOptParamHint::SemanticOutputPolicy::ORDERED
             ? SemanticOutputOrder::INPUT_ORDER : SemanticOutputOrder::READY_ORDER);
         stage->set_child(ObLogicalOperator::first_child, child);

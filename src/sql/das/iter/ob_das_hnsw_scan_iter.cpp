@@ -3154,6 +3154,11 @@ int ObDASHNSWScanIter::set_vector_query_condition(ObVectorQueryConditions &query
     } else if (OB_FALSE_IT(query_cond.ef_search_ = ob_hnsw_ef_search)) {
     } else {
       uint64_t real_limit = limit_param_.limit_ + limit_param_.offset_;
+      if (OB_NOT_NULL(vec_aux_ctdef_) && vec_aux_ctdef_->semantic_prefetch_factor_ > 0 &&
+          query_cond.ef_search_ < real_limit) {
+        query_cond.ef_search_ = OB_MIN(real_limit, VSAG_MAX_EF_SEARCH);
+        ob_hnsw_ef_search = query_cond.ef_search_;
+      }
       uint64_t n_candidate = real_limit;
       // if selectivity_ == 1 means there is no filter
       if (is_hnsw_bq()) {
