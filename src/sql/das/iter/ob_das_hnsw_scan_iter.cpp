@@ -487,6 +487,8 @@ uint64_t ObDASHNSWScanIter::adjust_batch_count(bool is_vectored, uint64_t batch_
   if (need_save_distance_result()) {
     if (!is_vectored) {
       ret_count = 1;
+    } else if (OB_NOT_NULL(vec_aux_ctdef_) && vec_aux_ctdef_->semantic_prefetch_factor_ > 0) {
+      ret_count = batch_count;
     } else if (batch_count > MAX_OPTIMIZE_BATCH_COUNT) {
       ret_count = MAX_OPTIMIZE_BATCH_COUNT;
     }

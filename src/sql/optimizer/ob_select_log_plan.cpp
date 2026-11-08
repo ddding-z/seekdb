@@ -6230,7 +6230,7 @@ private:
           ObVecIndexInfo &vc_info = table_scan.get_vector_index_info();
           if (table_scan.is_vec_idx_scan()) {
             vc_info.semantic_prefetch_factor_ =
-                std::max<int64_t>(vc_info.semantic_prefetch_factor_, 10);
+                std::max<int64_t>(vc_info.semantic_prefetch_factor_, 16);
           }
           if ((table_scan.is_vec_idx_scan_post_filter() || table_scan.is_hnsw_vec_scan()) &&
               !table_scan.is_ivf_pq_scan() &&
@@ -6425,7 +6425,7 @@ private:
           auto &table_scan = *static_cast<ObLogTableScan *>(child);
           if (table_scan.is_vec_idx_scan()) {
             table_scan.get_vector_index_info().semantic_prefetch_factor_ =
-                std::max<int64_t>(table_scan.get_vector_index_info().semantic_prefetch_factor_, 10);
+                std::max<int64_t>(table_scan.get_vector_index_info().semantic_prefetch_factor_, 16);
           }
         }
         stage->set_output_order(policy == ObOptParamHint::SemanticOutputPolicy::ORDERED
