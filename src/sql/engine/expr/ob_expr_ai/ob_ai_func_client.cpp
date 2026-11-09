@@ -312,7 +312,7 @@ AIRequestTransport::AIRequestTransport(uint64_t execution_id, int64_t request_li
 int AIRequestTransport::init()
 {
   int ret = OB_SUCCESS;
-  if (request_limit_ < 1 || request_limit_ > 256 || nullptr != curlm_) {
+  if (request_limit_ < 1 || request_limit_ > 4096 || nullptr != curlm_) {
     ret = OB_INVALID_ARGUMENT;
   } else if (nullptr == (curlm_ = curl_multi_init())) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
