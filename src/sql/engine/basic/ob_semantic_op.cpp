@@ -11,6 +11,7 @@
 #include "sql/engine/px/ob_px_sqc_handler.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <thread>
 
 namespace oceanbase
@@ -306,7 +307,8 @@ SemanticOp::SemanticOp(ObExecContext &ctx, const ObOpSpec &spec, ObOpInput *inpu
       captured_batches_(0), max_captured_rows_(0), output_batches_(0), output_rows_(0),
       max_output_rows_(0), peak_pending_rows_(0), peak_frames_(0),
       demand_evaluated_(0), demand_matched_(0),
-      active_pull_rows_(0), async_evaluated_rows_(0), async_matched_rows_(0)
+      active_pull_rows_(0), async_evaluated_rows_(0), async_matched_rows_(0),
+      async_ewma_pass_rate_(0.80), async_wave_draining_(false)
 {
 }
 
@@ -589,6 +591,8 @@ void SemanticOp::reset_pipeline()
   active_pull_rows_ = 0;
   async_evaluated_rows_ = 0;
   async_matched_rows_ = 0;
+  async_ewma_pass_rate_ = 0.80;
+  async_wave_draining_ = false;
 }
 
 int SemanticOp::inner_close()
@@ -1214,6 +1218,8 @@ int SemanticOp::prepare(Slot &slot, bool &progress)
             ++slot.unordered_accepted_;
             ++async_matched_rows_;
           }
+          const double obs = accepted ? 1.0 : 0.0;
+          async_ewma_pass_rate_ = 0.92 * async_ewma_pass_rate_ + 0.08 * obs;
           if (semantic_spec().dispatch_rows_ > 0) {
             OB_ASSERT(pending_rows_ > 0);
             --pending_rows_;
@@ -1449,18 +1455,61 @@ int64_t SemanticOp::quota_new_row_allowance(const Slot &slot) const
           ? 1
           : 0;
   const int64_t active_other_in_flight = std::max<int64_t>(0, total_active_in_flight - hol_straggler);
-  int64_t target_in_flight = rem_needed;
   const bool dynamic_ablation = ablation_enables_dynamic_window(ctx_);
-  if (hol_straggler == 0 || dynamic_ablation) {
-    const int64_t eval = async_evaluated_rows_;
-    const int64_t match = async_matched_rows_;
-    target_in_flight = eval > 0
-        ? (rem_needed * (eval + 4) + match + 3) / (match + 4)
-        : rem_needed;
-    target_in_flight = std::max(target_in_flight, static_cast<int64_t>(1));
+  if (!dynamic_ablation) {
+    int64_t target_in_flight = rem_needed;
+    if (hol_straggler == 0) {
+      const int64_t eval = async_evaluated_rows_;
+      const int64_t match = async_matched_rows_;
+      target_in_flight = eval > 0
+          ? (rem_needed * (eval + 4) + match + 3) / (match + 4)
+          : rem_needed;
+      target_in_flight = std::max(target_in_flight, static_cast<int64_t>(1));
+    }
+    return std::max<int64_t>(0, target_in_flight - active_other_in_flight);
   }
-  const int64_t active_counted = dynamic_ablation ? total_active_in_flight : active_other_in_flight;
-  return std::max<int64_t>(0, target_in_flight - active_counted);
+  const int64_t w_max = (slot.task_count_ > 0 && nullptr != slot.tasks_[0])
+      ? effective_max_parallel(*slot.tasks_[0])
+      : 64;
+  const int64_t w_init = std::min<int64_t>(
+      w_max,
+      std::max<int64_t>(active_pull_rows_ + 2, (active_pull_rows_ * 5 + 3) / 4));
+  const int64_t eval = async_evaluated_rows_;
+  const int64_t match = async_matched_rows_;
+  const int64_t low_water = std::max<int64_t>(0, std::min<int64_t>(rem_needed - 1, 2));
+  if (total_active_in_flight <= low_water) {
+    async_wave_draining_ = false;
+  }
+  if (eval > 0 && async_wave_draining_) {
+    return 0;
+  }
+  int64_t target_in_flight = w_init;
+  if (eval == 0) {
+    target_in_flight = w_init;
+  } else {
+    const double prior_num = (match == 0) ? 0.75 : 1.0;
+    const double prior_den = (match == 0) ? 1.0 : 1.5;
+    const double p_global =
+        (static_cast<double>(match) + prior_num) / (static_cast<double>(eval) + prior_den);
+    const double p_eff = std::max(
+        0.02,
+        eval >= 32
+            ? 0.7 * p_global + 0.3 * std::min(p_global, async_ewma_pass_rate_)
+            : p_global);
+    target_in_flight = static_cast<int64_t>(
+        std::ceil(static_cast<double>(rem_needed) / p_eff));
+    if (eval >= 4 && p_eff < 0.85) {
+      target_in_flight += (p_eff < 0.35 ? 2 : 1);
+    }
+  }
+  if (eval < 32) {
+    const int64_t w_slew = (match == 0)
+        ? (w_init + 5 * eval)
+        : std::min<int64_t>(w_init + 2 * eval + 2, 2 * w_init + 11);
+    target_in_flight = std::min(target_in_flight, w_slew);
+  }
+  target_in_flight = std::clamp<int64_t>(target_in_flight, 1, w_max);
+  return std::max<int64_t>(0, target_in_flight - total_active_in_flight);
 }
 
 void SemanticOp::enqueue_ready_slot(Slot &slot)
@@ -1743,6 +1792,11 @@ int SemanticOp::submit_cached_tasks(Slot &slot, Task &task, bool &progress)
         progress = true;
       }
     }
+    if (semantic_spec().row_async_enabled_ &&
+        (remaining_new_rows <= 0 ||
+         pipeline_in_flight_rows(0) >= effective_max_parallel(task))) {
+      async_wave_draining_ = true;
+    }
   }
   return ret;
 }
@@ -1881,6 +1935,11 @@ int SemanticOp::submit_tasks(Slot &slot, bool &progress)
             task.in_flight_rows_ += dispatch->positions_.count();
             for (int64_t position : dispatch->positions_) {
               task.states_[task.rows_.at(position)] = Task::IN_FLIGHT;
+            }
+            if (semantic_spec().row_async_enabled_ &&
+                (remaining_new_rows <= 0 ||
+                 pipeline_in_flight_rows(index) >= max_parallel)) {
+              async_wave_draining_ = true;
             }
             progress = true;
           } else if (nullptr != dispatch) {
