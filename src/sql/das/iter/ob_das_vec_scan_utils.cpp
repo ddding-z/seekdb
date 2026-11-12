@@ -250,12 +250,21 @@ int ObDasVecScanUtils::init_limit(const ObDASVecAuxScanCtDef *ir_ctdef,
     static const int64_t MAX_SEMANTIC_VEC_RES_SIZE = 16384;
     static const int64_t MIN_SEMANTIC_VEC_PREFETCH = 160;
     const int64_t safe_offset = std::max<int64_t>(0, limit_param.offset_);
-    const int64_t base_total = limit_param.limit_ + safe_offset;
-    const int64_t amplified_total = std::max<int64_t>(
-        base_total * ir_ctdef->semantic_prefetch_factor_, MIN_SEMANTIC_VEC_PREFETCH);
-    limit_param.offset_ = 0;
-    limit_param.limit_ = std::min<int64_t>(
-        MAX_SEMANTIC_VEC_RES_SIZE, std::max<int64_t>(base_total, amplified_total));
+    if (limit_param.limit_ > MAX_SEMANTIC_VEC_RES_SIZE ||
+        safe_offset > MAX_SEMANTIC_VEC_RES_SIZE - limit_param.limit_) {
+      limit_param.offset_ = 0;
+      limit_param.limit_ = MAX_SEMANTIC_VEC_RES_SIZE + 1;
+    } else {
+      const int64_t base_total = limit_param.limit_ + safe_offset;
+      const int64_t factor = ir_ctdef->semantic_prefetch_factor_;
+      const int64_t scaled = (base_total > MAX_SEMANTIC_VEC_RES_SIZE / factor)
+          ? MAX_SEMANTIC_VEC_RES_SIZE
+          : (base_total * factor);
+      const int64_t amplified_total = std::max<int64_t>(scaled, MIN_SEMANTIC_VEC_PREFETCH);
+      limit_param.offset_ = 0;
+      limit_param.limit_ = std::min<int64_t>(
+          MAX_SEMANTIC_VEC_RES_SIZE, std::max<int64_t>(base_total, amplified_total));
+    }
   }
 
   return ret;

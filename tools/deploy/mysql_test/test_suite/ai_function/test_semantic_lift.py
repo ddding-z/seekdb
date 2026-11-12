@@ -1080,6 +1080,24 @@ class SemanticLiftContracts(unittest.TestCase):
                         self.assertRegex(stage.annotation, r"(?i)\bsemantic_placement\s*=\s*LIFTED\b",
                                          plan.text)
                         self.check_query(statement, expected, first=lifted_demanded)
+        for enabled in ("false", "true"):
+            with self.subTest(mode="offset_post_filter", enabled=enabled):
+                offset_stmt = (
+                    f"SELECT /*+ OPT_PARAM('rowsets_max_rows', {BATCH_ROWS}) "
+                    f"OPT_PARAM('enable_semantic_lift', '{enabled}') */ id "
+                    f"FROM lift_vec WHERE AI_FILTER('{MODEL_A}',prompt) "
+                    "ORDER BY l2_distance(emb, '[0, 0, 0, 0]') APPROXIMATE LIMIT 3 OFFSET 2"
+                )
+                self.assertEqual(self.execute(offset_stmt), ((9,), (12,), (15,)))
+            for over_clause in ("LIMIT 20000", "LIMIT 1000000000000000000"):
+                with self.subTest(mode=over_clause, enabled=enabled):
+                    over_stmt = (
+                        f"SELECT /*+ OPT_PARAM('rowsets_max_rows', {BATCH_ROWS}) "
+                        f"OPT_PARAM('enable_semantic_lift', '{enabled}') */ id "
+                        f"FROM lift_vec WHERE AI_FILTER('{MODEL_A}',prompt) "
+                        f"ORDER BY l2_distance(emb, '[0, 0, 0, 0]') APPROXIMATE {over_clause}"
+                    )
+                    sql_error(self, 1235, lambda s=over_stmt: self.execute(s))
 
     def test_aggregate_boundary_retains_group_level_demand(self):
         self.load_basic(12, stride=2)

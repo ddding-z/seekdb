@@ -6228,10 +6228,6 @@ private:
         if (OB_NOT_NULL(source) && source->get_type() == LOG_TABLE_SCAN) {
           auto &table_scan = *static_cast<ObLogTableScan *>(source);
           ObVecIndexInfo &vc_info = table_scan.get_vector_index_info();
-          if (table_scan.is_vec_idx_scan()) {
-            vc_info.semantic_prefetch_factor_ =
-                std::max<int64_t>(vc_info.semantic_prefetch_factor_, 16);
-          }
           if ((table_scan.is_vec_idx_scan_post_filter() || table_scan.is_hnsw_vec_scan()) &&
               !table_scan.is_ivf_pq_scan() &&
               !vc_info.is_hnsw_bq_scan() &&
@@ -6251,6 +6247,8 @@ private:
         if (can_elide_vec_sort) {
           auto &table_scan = *static_cast<ObLogTableScan *>(source);
           ObVecIndexInfo &vc_info = table_scan.get_vector_index_info();
+          vc_info.semantic_prefetch_factor_ =
+              std::max<int64_t>(vc_info.semantic_prefetch_factor_, 16);
           vc_info.sort_key_.order_type_ = sort.get_sort_keys().at(0).order_type_;
           if (vc_info.vec_type_ == ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER &&
               table_scan.get_filter_exprs().count() == 0 &&
@@ -6423,9 +6421,21 @@ private:
       if (OB_SUCC(ret)) {
         if (stage->get_type() == LOG_SEMANTIC_FILTER && child->get_type() == LOG_TABLE_SCAN) {
           auto &table_scan = *static_cast<ObLogTableScan *>(child);
-          if (table_scan.is_vec_idx_scan()) {
-            table_scan.get_vector_index_info().semantic_prefetch_factor_ =
-                std::max<int64_t>(table_scan.get_vector_index_info().semantic_prefetch_factor_, 16);
+          const ObSelectStmt *stmt = plan_.get_stmt();
+          ObVecIndexInfo &vc_info = table_scan.get_vector_index_info();
+          if (table_scan.is_vec_idx_scan() &&
+              nullptr != stmt &&
+              stmt->has_order_by() &&
+              stmt->has_limit() &&
+              !stmt->is_calc_found_rows() &&
+              !stmt->is_fetch_with_ties() &&
+              nullptr == stmt->get_limit_percent_expr() &&
+              nullptr != vc_info.topk_limit_expr_ &&
+              stmt->get_order_item_size() == 1 &&
+              stmt->get_order_item(0).expr_ == vc_info.sort_key_.expr_ &&
+              is_ascending_direction(stmt->get_order_item(0).order_type_)) {
+            vc_info.semantic_prefetch_factor_ =
+                std::max<int64_t>(vc_info.semantic_prefetch_factor_, 16);
           }
         }
         stage->set_output_order(policy == ObOptParamHint::SemanticOutputPolicy::ORDERED
