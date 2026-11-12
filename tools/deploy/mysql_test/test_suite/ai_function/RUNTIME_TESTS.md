@@ -4,6 +4,22 @@ Legacy baseline validation (2026-09-29): the Debug build, all **105 SQL contract
 
 For the current architecture, code map, maintenance invariants and handoff checklist, see the [Chinese maintenance handoff](../../../../../docs/developer-guide/zh/ai-function-runtime-handoff.md).
 
+## Quota-Aware Top-N Window & Policy Hints
+
+Lifted `SEMANTIC FILTER` stages below `LIMIT` / `ORDER BY ... LIMIT k` default
+to `semantic_quota_policy='dynamic'` and `enable_semantic_cross_batch_slide='true'`,
+using out-of-order prefix quota cutoff and continuous Cruise-then-Brake concurrency
+control. Three optional `OPT_PARAM` hints configure explicit caps and ablation
+baselines without session user variables:
+
+- `OPT_PARAM('semantic_quota_policy', 'dynamic' | 'static' | 'disabled')`
+- `OPT_PARAM('semantic_topn_window_max', <int 1..4096>)`
+- `OPT_PARAM('enable_semantic_cross_batch_slide', 'true' | 'false')`
+
+Invalid values or conflicting `semantic_topn_window_max` and `semantic_request_limit`
+settings fail in both `EXPLAIN` and `SELECT` with MySQL `1210` (`OB_INVALID_ARGUMENT`)
+before model work.
+
 ## Shared-Transport Dispatch Comparison
 
 This opt-in path separates **B**, the ordinary SQL batch size, **G**, the

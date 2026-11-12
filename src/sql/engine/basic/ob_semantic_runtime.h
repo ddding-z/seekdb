@@ -30,6 +30,13 @@ enum class SemanticExecutionScope : int64_t
   LOCAL_PX_WORKER = 1
 };
 
+enum class SemanticQuotaPolicy : int64_t
+{
+  DYNAMIC = 0,
+  STATIC = 1,
+  DISABLED = 2
+};
+
 // Physical operator ID and expression index are stable across serialized PX tasks.
 using SemanticTaskGroup = std::pair<int64_t, int64_t>;
 

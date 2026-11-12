@@ -675,10 +675,15 @@ int ObOptParamHint::get_semantic_output_policy(SemanticOutputPolicy &policy) con
   }
   int64_t rows = 0;
   int64_t limit = 0;
+  SemanticQuotaOption quota_policy = SemanticQuotaOption::DYNAMIC;
+  int64_t topn_window_max = 0;
+  bool cross_batch_slide = true;
   bool row_async = false;
   bool cache = false;
   bool proxy = false;
   if (OB_SUCC(ret) && OB_FAIL(get_semantic_dispatch_options(rows, limit))) {
+  } else if (OB_SUCC(ret) &&
+             OB_FAIL(get_semantic_quota_options(quota_policy, topn_window_max, cross_batch_slide))) {
   } else if (OB_SUCC(ret) && rows > 0) {
     if (OB_FAIL(get_bool_opt_param(ENABLE_SEMANTIC_ROW_ASYNC, row_async))) {
     } else if (OB_FAIL(get_bool_opt_param(ENABLE_SEMANTIC_CACHE, cache))) {
@@ -708,6 +713,50 @@ int ObOptParamHint::get_semantic_dispatch_options(int64_t &rows, int64_t &limit)
   return ret;
 }
 
+int ObOptParamHint::get_semantic_quota_options(SemanticQuotaOption &policy,
+                                               int64_t &window_max,
+                                               bool &cross_batch_slide) const
+{
+  int ret = OB_SUCCESS;
+  ObObj value;
+  bool has_window = false;
+  policy = SemanticQuotaOption::DYNAMIC;
+  window_max = 0;
+  cross_batch_slide = true;
+  if (OB_FAIL(get_opt_param(SEMANTIC_QUOTA_POLICY, value))) {
+  } else if (!value.is_nop_value()) {
+    if (!is_param_val_valid(SEMANTIC_QUOTA_POLICY, value)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+          "semantic_quota_policy requires 'dynamic', 'static' or 'disabled'");
+      LOG_WARN("invalid semantic quota policy", K(ret), "value_type", value.get_type());
+    } else {
+      policy = 0 == value.get_varchar().case_compare("static") ? SemanticQuotaOption::STATIC :
+          0 == value.get_varchar().case_compare("disabled") ? SemanticQuotaOption::DISABLED :
+          SemanticQuotaOption::DYNAMIC;
+    }
+  }
+  if (OB_SUCC(ret) &&
+      OB_FAIL(get_integer_opt_param(SEMANTIC_TOPN_WINDOW_MAX, window_max, has_window))) {
+  } else if (OB_SUCC(ret) && !has_window) {
+    window_max = 0;
+  }
+  if (OB_SUCC(ret) &&
+      OB_FAIL(get_bool_opt_param(ENABLE_SEMANTIC_CROSS_BATCH_SLIDE, cross_batch_slide))) {
+  }
+  if (OB_SUCC(ret) && window_max > 0) {
+    int64_t dispatch_rows = 0;
+    int64_t request_limit = 0;
+    if (OB_FAIL(get_semantic_dispatch_options(dispatch_rows, request_limit))) {
+    } else if (request_limit > 0 && request_limit != window_max) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+          "semantic_topn_window_max conflicts with semantic_request_limit");
+    }
+  }
+  return ret;
+}
+
 int ObOptParamHint::add_opt_param_hint(const OptParamType param_type, const ObObj &val)
 {
   int ret = OB_SUCCESS;
@@ -718,11 +767,16 @@ int ObOptParamHint::add_opt_param_hint(const OptParamType param_type, const ObOb
         param_type == SEMANTIC_PROXY_QUERY || param_type == SEMANTIC_PROXY_THRESHOLD ||
         param_type == ENABLE_SEMANTIC_ROW_ASYNC || param_type == SEMANTIC_OUTPUT_ORDER ||
         param_type == ENABLE_SEMANTIC_BRANCH_ASYNC ||
-        param_type == SEMANTIC_DISPATCH_ROWS || param_type == SEMANTIC_REQUEST_LIMIT) {
+        param_type == SEMANTIC_DISPATCH_ROWS || param_type == SEMANTIC_REQUEST_LIMIT ||
+        param_type == SEMANTIC_QUOTA_POLICY || param_type == SEMANTIC_TOPN_WINDOW_MAX ||
+        param_type == ENABLE_SEMANTIC_CROSS_BATCH_SLIDE) {
       ret = OB_INVALID_ARGUMENT;
       LOG_USER_ERROR(OB_INVALID_ARGUMENT,
           param_type == SEMANTIC_DISPATCH_ROWS ? "semantic_dispatch_rows requires an integer in [1,256]" :
           param_type == SEMANTIC_REQUEST_LIMIT ? "semantic_request_limit requires an integer in [1,256]" :
+          param_type == SEMANTIC_TOPN_WINDOW_MAX ? "semantic_topn_window_max requires an integer in [1,4096]" :
+          param_type == SEMANTIC_QUOTA_POLICY ? "semantic_quota_policy requires 'dynamic', 'static' or 'disabled'" :
+          param_type == ENABLE_SEMANTIC_CROSS_BATCH_SLIDE ? "enable_semantic_cross_batch_slide requires 'true' or 'false'" :
           param_type == ENABLE_SEMANTIC_LIFT ? "enable_semantic_lift requires 'true' or 'false'" :
           param_type == ENABLE_SEMANTIC_CACHE ? "enable_semantic_cache requires 'true' or 'false'" :
           param_type == ENABLE_SEMANTIC_ROW_ASYNC ? "enable_semantic_row_async requires 'true' or 'false'" :
@@ -772,9 +826,16 @@ bool ObOptParamHint::is_param_val_valid(const OptParamType param_type, const ObO
     case ENABLE_SEMANTIC_PROXY:
     case ENABLE_SEMANTIC_ROW_ASYNC:
     case ENABLE_SEMANTIC_BRANCH_ASYNC:
+    case ENABLE_SEMANTIC_CROSS_BATCH_SLIDE:
     case PRESERVE_ORDER_FOR_GROUPBY: {
       is_valid = val.is_varchar() && (0 == val.get_varchar().case_compare("true")
                                       || 0 == val.get_varchar().case_compare("false"));
+      break;
+    }
+    case SEMANTIC_QUOTA_POLICY: {
+      is_valid = val.is_varchar() && (0 == val.get_varchar().case_compare("dynamic")
+                                      || 0 == val.get_varchar().case_compare("static")
+                                      || 0 == val.get_varchar().case_compare("disabled"));
       break;
     }
     case SEMANTIC_OUTPUT_ORDER: {
@@ -796,6 +857,10 @@ bool ObOptParamHint::is_param_val_valid(const OptParamType param_type, const ObO
     case SEMANTIC_DISPATCH_ROWS:
     case SEMANTIC_REQUEST_LIMIT: {
       is_valid = val.is_int() && val.get_int() >= 1 && val.get_int() <= 256;
+      break;
+    }
+    case SEMANTIC_TOPN_WINDOW_MAX: {
+      is_valid = val.is_int() && val.get_int() >= 1 && val.get_int() <= 4096;
       break;
     }
     case ROWSETS_MAX_ROWS: {

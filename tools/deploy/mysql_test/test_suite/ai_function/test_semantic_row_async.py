@@ -245,7 +245,7 @@ class SemanticRowAsyncContracts(cache.SemanticCacheContracts):
         head_gate, wave3_gate = self.fixtures.gate(), self.fixtures.gate()
         offset = len(self.first.requests)
         # Row 0 is a slow head-of-line straggler; rows 1..5 all reject (eval=5, match=0).
-        # Without setting @semantic_ablation_mode, the default dynamic window must NOT collapse
+        # With the default dynamic quota policy, the window must NOT collapse
         # to rem_needed=2 behind the straggler: once rows 1..3 finish False, it must expand
         # concurrency to >= 3 simultaneous non-head requests in wave 3 (rows 4..6).
         self.fixtures.reply(0, prompts[0], False, kind="filter", gate=head_gate)
@@ -280,53 +280,146 @@ class SemanticRowAsyncContracts(cache.SemanticCacheContracts):
     def test_sliding_window_replenishes_continuously_without_wave_draining_barrier(self):
         prompts = [f"cont-slide-{index:02d}" for index in range(3 * BATCH_ROWS)]
         self.load_inputs(prompts)
-        statement = cache.sql_statement(
+        for window_hint in ("", " OPT_PARAM('semantic_topn_window_max', 64)"):
+            with self.subTest(window_hint=window_hint or "default"):
+                statement = cache.sql_statement(
+                    "a.id, a.prompt",
+                    cache="false",
+                    enabled_lift="true",
+                    where=self.call("filter"),
+                    suffix="ORDER BY a.prompt LIMIT 8",
+                    hints="PARALLEL(1) " + ROW_HINT + window_hint,
+                )
+                slow_gate = self.fixtures.gate()
+                offset = len(self.first.requests)
+                # Hold 4 slow requests (rows 1..4 > old low_water=2) in flight while rows 0 and 5..7
+                # return False quickly. A continuous sliding window must replenish rows 8..15 immediately
+                # without waiting for the 4 in-flight stragglers to drain down to <= 2.
+                self.fixtures.reply(0, prompts[0], False, kind="filter")
+                for prompt in prompts[1:5]:
+                    self.fixtures.reply(0, prompt, False, kind="filter", gate=slow_gate)
+                for prompt in prompts[5:8]:
+                    self.fixtures.reply(0, prompt, False, kind="filter")
+                for prompt in prompts[8:]:
+                    self.fixtures.reply(0, prompt, True, kind="filter")
+                pending = self.fixtures.start(lambda: self.execute(statement))
+                self.wait_requests(
+                    self.first,
+                    lambda: len([record for record in semantic.audit(self.first)[offset:]
+                                 if record["response"] is not None]) >= 12,
+                    pending,
+                    "sliding window stalled on wave-draining barrier with 4 slow requests in flight",
+                )
+                self.assertFalse(slow_gate.is_set())
+                slow_gate.set()
+                self.assertEqual(
+                    pending.result(timeout=3),
+                    tuple((index, prompts[index]) for index in range(8, 16)),
+                )
+                dispatched = len(self.first.requests) - offset
+                self.assertGreaterEqual(dispatched, 16)
+                self.assertLessEqual(dispatched, 28)
+                self.assert_no_model_sockets()
+
+    def test_formal_quota_opt_param_hints_and_explain_contracts(self):
+        prompts = [f"opt-quota-{index:02d}" for index in range(2 * BATCH_ROWS)]
+        self.load_inputs(prompts)
+        before = self.snapshots()
+        for bad_hint in (
+            "OPT_PARAM('semantic_quota_policy', '')",
+            "OPT_PARAM('semantic_quota_policy', 'bogus')",
+            "OPT_PARAM('semantic_quota_policy', 1)",
+            "OPT_PARAM('semantic_topn_window_max', 0)",
+            "OPT_PARAM('semantic_topn_window_max', -4)",
+            "OPT_PARAM('semantic_topn_window_max', 4097)",
+            "OPT_PARAM('semantic_topn_window_max', '64')",
+            "OPT_PARAM('enable_semantic_cross_batch_slide', '')",
+            "OPT_PARAM('enable_semantic_cross_batch_slide', 'yes')",
+            "OPT_PARAM('enable_semantic_cross_batch_slide', 1)",
+            ("OPT_PARAM('semantic_output_order', 'unordered') "
+             "OPT_PARAM('semantic_dispatch_rows', 1) "
+             "OPT_PARAM('semantic_request_limit', 8) "
+             "OPT_PARAM('semantic_topn_window_max', 64)"),
+        ):
+            with self.subTest(bad_hint=bad_hint):
+                stmt = cache.sql_statement(
+                    "a.id",
+                    cache="false",
+                    where=self.call("filter"),
+                    suffix="LIMIT 2",
+                    hints=f"PARALLEL(1) {ROW_HINT} {bad_hint}",
+                )
+                for prefix in ("EXPLAIN ", ""):
+                    sql_error(self, 1210, lambda s=prefix + stmt: self.execute(s))
+        self.assert_windows(before)
+
+        # 1) EXPLAIN annotations + large window cap (512) works with default ai_pipeline_slots=2
+        large_win_stmt = cache.sql_statement(
             "a.id, a.prompt",
             cache="false",
             enabled_lift="true",
             where=self.call("filter"),
-            suffix="ORDER BY a.prompt LIMIT 8",
-            hints="PARALLEL(1) " + ROW_HINT,
+            suffix="ORDER BY a.prompt LIMIT 2",
+            hints=f"PARALLEL(1) {ROW_HINT} OPT_PARAM('semantic_topn_window_max', 512)",
         )
-        for ablation_mode in (None, "ours_dynamic"):
-            with self.subTest(ablation_mode=ablation_mode):
-                if ablation_mode is None:
-                    self.execute("SET @semantic_ablation_mode = NULL")
-                else:
-                    self.execute(f"SET @semantic_ablation_mode = '{ablation_mode}'")
-                try:
-                    slow_gate = self.fixtures.gate()
-                    offset = len(self.first.requests)
-                    # Hold 4 slow requests (rows 1..4 > old low_water=2) in flight while rows 0 and 5..7
-                    # return False quickly. A continuous sliding window must replenish rows 8..15 immediately
-                    # without waiting for the 4 in-flight stragglers to drain down to <= 2.
-                    self.fixtures.reply(0, prompts[0], False, kind="filter")
-                    for prompt in prompts[1:5]:
-                        self.fixtures.reply(0, prompt, False, kind="filter", gate=slow_gate)
-                    for prompt in prompts[5:8]:
-                        self.fixtures.reply(0, prompt, False, kind="filter")
-                    for prompt in prompts[8:]:
-                        self.fixtures.reply(0, prompt, True, kind="filter")
-                    pending = self.fixtures.start(lambda: self.execute(statement))
-                    self.wait_requests(
-                        self.first,
-                        lambda: len([record for record in semantic.audit(self.first)[offset:]
-                                     if record["response"] is not None]) >= 12,
-                        pending,
-                        "sliding window stalled on wave-draining barrier with 4 slow requests in flight",
-                    )
-                    self.assertFalse(slow_gate.is_set())
-                    slow_gate.set()
-                    self.assertEqual(
-                        pending.result(timeout=3),
-                        tuple((index, prompts[index]) for index in range(8, 16)),
-                    )
-                    dispatched = len(self.first.requests) - offset
-                    self.assertGreaterEqual(dispatched, 16)
-                    self.assertLessEqual(dispatched, 28)
-                    self.assert_no_model_sockets()
-                finally:
-                    self.execute("SET @semantic_ablation_mode = NULL")
+        large_plan = self.explain(large_win_stmt)
+        self.assertIn("TOPN_WINDOW_MAX=512", large_plan.one("SEMANTIC FILTER").annotation.upper())
+        for prompt in prompts[:2]:
+            self.fixtures.reply(0, prompt, True, kind="filter")
+        self.assertEqual(self.execute(large_win_stmt), ((0, prompts[0]), (1, prompts[1])))
+
+        # 2) semantic_quota_policy='static' + enable_semantic_cross_batch_slide='false'
+        static_ns_stmt = cache.sql_statement(
+            "a.id, a.prompt",
+            cache="false",
+            enabled_lift="true",
+            where=self.call("filter"),
+            suffix="ORDER BY a.prompt LIMIT 2",
+            hints=(f"PARALLEL(1) {ROW_HINT} "
+                   "OPT_PARAM('semantic_quota_policy', 'static') "
+                   "OPT_PARAM('semantic_topn_window_max', 4) "
+                   "OPT_PARAM('enable_semantic_cross_batch_slide', 'false')"),
+        )
+        static_plan = self.explain(static_ns_stmt)
+        annot = static_plan.one("SEMANTIC FILTER").annotation.upper()
+        self.assertIn("QUOTA_POLICY=STATIC", annot)
+        self.assertIn("TOPN_WINDOW_MAX=4", annot)
+        self.assertIn("CROSS_BATCH_SLIDE=FALSE", annot)
+        offset = len(self.first.requests)
+        for prompt in prompts[:4]:
+            self.fixtures.reply(0, prompt, True, kind="filter")
+        self.assertEqual(self.execute(static_ns_stmt), ((0, prompts[0]), (1, prompts[1])))
+        self.assertLessEqual(len(self.first.requests) - offset, 4)
+
+        # 3) semantic_quota_policy='disabled' behaves like Flink blind static window (no out-of-order cutoff)
+        blind_stmt = cache.sql_statement(
+            "a.id, a.prompt",
+            cache="false",
+            enabled_lift="true",
+            where=self.call("filter"),
+            suffix="ORDER BY a.prompt LIMIT 2",
+            hints=(f"PARALLEL(1) {ROW_HINT} "
+                   "OPT_PARAM('semantic_quota_policy', 'disabled') "
+                   "OPT_PARAM('semantic_topn_window_max', 4)"),
+        )
+        blind_plan = self.explain(blind_stmt)
+        self.assertIn("QUOTA_POLICY=DISABLED", blind_plan.one("SEMANTIC FILTER").annotation.upper())
+        head_gate = self.fixtures.gate()
+        offset = len(self.first.requests)
+        self.fixtures.reply(0, prompts[0], True, kind="filter", gate=head_gate)
+        for prompt in prompts[1:8]:
+            self.fixtures.reply(0, prompt, True, kind="filter")
+        pending = self.fixtures.start(lambda: self.execute(blind_stmt))
+        # With quota cutoff disabled and row 0 held, completing matches 1..3 keeps refilling past index 3!
+        self.wait_requests(
+            self.first,
+            lambda: len(self.first.requests) - offset >= 6,
+            pending,
+            "disabled quota policy unexpectedly applied out-of-order prefix cutoff",
+        )
+        head_gate.set()
+        self.assertEqual(pending.result(timeout=3), ((0, prompts[0]), (1, prompts[1])))
+        self.assert_no_model_sockets()
 
     def test_quota_cutoff_releases_task_credit_for_downstream_stage_under_single_slot(self):
         prompts = [f"credit-cutoff-{index:02d}" for index in range(BATCH_ROWS)]

@@ -162,11 +162,15 @@ struct ObOptParamHint
     DEF(ENABLE_SEMANTIC_BRANCH_ASYNC,)              \
     DEF(SEMANTIC_DISPATCH_ROWS,)                    \
     DEF(SEMANTIC_REQUEST_LIMIT,)                    \
+    DEF(SEMANTIC_QUOTA_POLICY,)                     \
+    DEF(SEMANTIC_TOPN_WINDOW_MAX,)                  \
+    DEF(ENABLE_SEMANTIC_CROSS_BATCH_SLIDE,)         \
 
 
   DECLARE_ENUM(OptParamType, opt_param, OPT_PARAM_TYPE_DEF, static);
 
   enum class SemanticOutputPolicy { ORDERED, UNORDERED, AUTO };
+  enum class SemanticQuotaOption { DYNAMIC, STATIC, DISABLED };
 
   static bool is_param_val_valid(const OptParamType param_type, const ObObj &val);
   int merge_opt_param_hint(const ObOptParamHint &other);
@@ -184,6 +188,9 @@ struct ObOptParamHint
   int get_semantic_proxy_threshold(double &val) const;
   int get_semantic_output_policy(SemanticOutputPolicy &policy) const;
   int get_semantic_dispatch_options(int64_t &rows, int64_t &limit) const;
+  int get_semantic_quota_options(SemanticQuotaOption &policy,
+                                 int64_t &window_max,
+                                 bool &cross_batch_slide) const;
   int get_opt_param_runtime_filter_type(int64_t &rf_type) const;
   int get_hash_rollup_param(ObObj &val, bool &has_opt_param) const;
   int get_enum_opt_param(const OptParamType param_type, int64_t &val) const;

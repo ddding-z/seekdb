@@ -191,70 +191,109 @@ int LogSemantic::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_ite
 {
   int ret = OB_SUCCESS;
   const bool lifted = lifted_join_count_ > 0 || lifted_topn_sort_;
+  ObOptParamHint::SemanticQuotaOption quota_option = ObOptParamHint::SemanticQuotaOption::DYNAMIC;
+  int64_t topn_window_max = 0;
+  bool cross_batch_slide = true;
   if (OB_FAIL(ObLogicalOperator::get_plan_item_info(plan_text, plan_item))) {
-  } else if (lifted || nullptr != lift_stop_reason_ ||
-             function_cache_enabled_ || has_embedding_proxy() || row_async_enabled_) {
-    BEGIN_BUF_PRINT;
-    const bool placement = lifted || nullptr != lift_stop_reason_;
-    if (placement && OB_FAIL(BUF_PRINTF("semantic_placement=%s, crossed_inner_joins=%ld",
-                          lifted ? "LIFTED" : "KEPT", lifted_join_count_))) {
-    } else if (nullptr != lift_stop_reason_) {
-      ret = BUF_PRINTF(", lift_stop_reason=%s", lift_stop_reason_);
-    }
-    if (OB_SUCC(ret) && function_cache_enabled_) {
-      int64_t memoized = 0;
-      for (const ObRawExpr *expr : semantic_exprs_) {
-        memoized += nullptr != expr && SemanticExprUtils::supports_function_cache(*expr);
+  } else if (OB_FAIL(get_plan()->get_optimizer_context().get_global_hint()
+                 .opt_params_.get_semantic_quota_options(
+                     quota_option, topn_window_max, cross_batch_slide))) {
+  } else {
+    const bool has_quota_hint = get_type() == log_op_def::LOG_SEMANTIC_FILTER &&
+        (quota_option != ObOptParamHint::SemanticQuotaOption::DYNAMIC ||
+         topn_window_max > 0 || !cross_batch_slide);
+    if (lifted || nullptr != lift_stop_reason_ ||
+        function_cache_enabled_ || has_embedding_proxy() ||
+        row_async_enabled_ || has_quota_hint) {
+      BEGIN_BUF_PRINT;
+      const bool placement = lifted || nullptr != lift_stop_reason_;
+      bool has_prev = false;
+      if (placement) {
+        has_prev = true;
+        if (OB_FAIL(BUF_PRINTF("semantic_placement=%s, crossed_inner_joins=%ld",
+                               lifted ? "LIFTED" : "KEPT", lifted_join_count_))) {
+        } else if (nullptr != lift_stop_reason_) {
+          ret = BUF_PRINTF(", lift_stop_reason=%s", lift_stop_reason_);
+        }
       }
-      ret = BUF_PRINTF("%sfunction_cache=LOCAL_QUERY_TEXT, memoized_calls=%ld",
-                       placement ? ", " : "", memoized);
-    }
-    if (OB_SUCC(ret) && has_embedding_proxy()) {
-      const int64_t count = proxy_count();
-      if (OB_FAIL(BUF_PRINTF(", embedding_proxy=REJECT_ONLY, approximate=true, proxy_calls=%ld",
-                            count))) {
-      } else if (count == 1) {
-        for (const SemanticProxyConfig &config : proxy_configs_) {
-          if (OB_SUCC(ret) && config.enabled_) {
-            ret = BUF_PRINTF(", threshold=%.17g", config.threshold_);
+      if (OB_SUCC(ret) && function_cache_enabled_) {
+        int64_t memoized = 0;
+        for (const ObRawExpr *expr : semantic_exprs_) {
+          memoized += nullptr != expr && SemanticExprUtils::supports_function_cache(*expr);
+        }
+        ret = BUF_PRINTF("%sfunction_cache=LOCAL_QUERY_TEXT, memoized_calls=%ld",
+                         has_prev ? ", " : "", memoized);
+        has_prev = true;
+      }
+      if (OB_SUCC(ret) && has_embedding_proxy()) {
+        const int64_t count = proxy_count();
+        if (OB_FAIL(BUF_PRINTF("%sembedding_proxy=REJECT_ONLY, approximate=true, proxy_calls=%ld",
+                               has_prev ? ", " : "", count))) {
+        } else if (count == 1) {
+          for (const SemanticProxyConfig &config : proxy_configs_) {
+            if (OB_SUCC(ret) && config.enabled_) {
+              ret = BUF_PRINTF(", threshold=%.17g", config.threshold_);
+            }
+          }
+        } else if (OB_FAIL(BUF_PRINTF(", thresholds=["))) {
+        } else {
+          int64_t printed = 0;
+          for (const SemanticProxyConfig &config : proxy_configs_) {
+            if (OB_SUCC(ret) && config.enabled_) {
+              ret = BUF_PRINTF("%s%.17g", printed++ > 0 ? "," : "", config.threshold_);
+            }
+          }
+          if (OB_SUCC(ret)) {
+            ret = BUF_PRINTF("]");
           }
         }
-      } else if (OB_FAIL(BUF_PRINTF(", thresholds=["))) {
-      } else {
-        int64_t printed = 0;
-        for (const SemanticProxyConfig &config : proxy_configs_) {
-          if (OB_SUCC(ret) && config.enabled_) {
-            ret = BUF_PRINTF("%s%.17g", printed++ > 0 ? "," : "", config.threshold_);
-          }
-        }
+        has_prev = true;
+      }
+      if (OB_SUCC(ret) && row_async_enabled_) {
+        ret = BUF_PRINTF("%srow_async=%s",
+                         has_prev ? ", " : "",
+                         output_order_ == SemanticOutputOrder::READY_ORDER
+                             ? "UNORDERED_READY" : "ORDERED_PREFIX");
         if (OB_SUCC(ret)) {
-          ret = BUF_PRINTF("]");
+          ret = BUF_PRINTF(", execution_scope=%s",
+              execution_scope_ == SemanticExecutionScope::LOCAL_PX_WORKER
+                  ? "LOCAL_PX_WORKER" : "SERIAL");
+        }
+        has_prev = true;
+      }
+      if (OB_SUCC(ret) && nullptr != auto_order_reason_) {
+        ret = BUF_PRINTF("%soutput_policy=AUTO, order_reason=%s",
+                         has_prev ? ", " : "", auto_order_reason_);
+        has_prev = true;
+      }
+      int64_t dispatch_rows = 0;
+      int64_t request_limit = 0;
+      if (OB_SUCC(ret) && OB_FAIL(get_plan()->get_optimizer_context().get_global_hint()
+          .opt_params_.get_semantic_dispatch_options(dispatch_rows, request_limit))) {
+      } else if (OB_SUCC(ret) && dispatch_rows > 0) {
+        ret = BUF_PRINTF("%stransport=SHARED_QUERY, dispatch_rows=%ld, request_limit=%ld",
+                         has_prev ? ", " : "", dispatch_rows, request_limit);
+        has_prev = true;
+      }
+      if (OB_SUCC(ret) && has_quota_hint) {
+        if (quota_option != ObOptParamHint::SemanticQuotaOption::DYNAMIC) {
+          ret = BUF_PRINTF("%squota_policy=%s",
+                           has_prev ? ", " : "",
+                           quota_option == ObOptParamHint::SemanticQuotaOption::STATIC
+                               ? "STATIC" : "DISABLED");
+          has_prev = true;
+        }
+        if (OB_SUCC(ret) && topn_window_max > 0) {
+          ret = BUF_PRINTF("%stopn_window_max=%ld", has_prev ? ", " : "", topn_window_max);
+          has_prev = true;
+        }
+        if (OB_SUCC(ret) && !cross_batch_slide) {
+          ret = BUF_PRINTF("%scross_batch_slide=false", has_prev ? ", " : "");
+          has_prev = true;
         }
       }
+      END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
     }
-    if (OB_SUCC(ret) && row_async_enabled_) {
-      ret = BUF_PRINTF("%srow_async=%s",
-                       placement || function_cache_enabled_ || has_embedding_proxy() ? ", " : "",
-                       output_order_ == SemanticOutputOrder::READY_ORDER
-                           ? "UNORDERED_READY" : "ORDERED_PREFIX");
-      if (OB_SUCC(ret)) {
-        ret = BUF_PRINTF(", execution_scope=%s",
-            execution_scope_ == SemanticExecutionScope::LOCAL_PX_WORKER
-                ? "LOCAL_PX_WORKER" : "SERIAL");
-      }
-    }
-    if (OB_SUCC(ret) && nullptr != auto_order_reason_) {
-      ret = BUF_PRINTF(", output_policy=AUTO, order_reason=%s", auto_order_reason_);
-    }
-    int64_t dispatch_rows = 0;
-    int64_t request_limit = 0;
-    if (OB_SUCC(ret) && OB_FAIL(get_plan()->get_optimizer_context().get_global_hint()
-        .opt_params_.get_semantic_dispatch_options(dispatch_rows, request_limit))) {
-    } else if (OB_SUCC(ret) && dispatch_rows > 0) {
-      ret = BUF_PRINTF(", transport=SHARED_QUERY, dispatch_rows=%ld, request_limit=%ld",
-                       dispatch_rows, request_limit);
-    }
-    END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
   }
   return ret;
 }

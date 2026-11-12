@@ -24,6 +24,8 @@ public:
         topn_lifted_(false), memoized_exprs_(allocator),
         proxy_configs_(allocator), output_order_(SemanticOutputOrder::INPUT_ORDER),
         execution_scope_(SemanticExecutionScope::SERIAL), dispatch_rows_(0), request_limit_(0),
+        quota_policy_(SemanticQuotaPolicy::DYNAMIC), topn_window_max_(0),
+        cross_batch_slide_enabled_(true),
         quota_limit_expr_(nullptr), quota_offset_expr_(nullptr) {}
   common::ObFixedArray<ObExpr *, common::ObIAllocator> expressions_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> semantic_exprs_;
@@ -43,12 +45,24 @@ public:
   SemanticExecutionScope execution_scope_;
   int64_t dispatch_rows_;
   int64_t request_limit_;
+  SemanticQuotaPolicy quota_policy_;
+  int64_t topn_window_max_;
+  bool cross_batch_slide_enabled_;
   ObExpr *quota_limit_expr_;
   ObExpr *quota_offset_expr_;
   int64_t task_slots(int64_t session_slots) const
   {
     // Output frames pinned by a slow row do not need additional request credits.
-    return dispatch_rows_ > 0 ? std::max(session_slots, 2 * request_limit_ + 1) : session_slots;
+    int64_t required = session_slots;
+    if (dispatch_rows_ > 0) {
+      required = std::max(required, 2 * request_limit_ + 1);
+    }
+    if (topn_window_max_ > 0) {
+      const int64_t batch_rows = std::max<int64_t>(1, max_batch_size_);
+      const int64_t needed_batches = (topn_window_max_ + batch_rows - 1) / batch_rows + 2;
+      required = std::max(required, needed_batches);
+    }
+    return required;
   }
   bool unordered_output() const { return output_order_ == SemanticOutputOrder::READY_ORDER; }
   bool has_embedding_proxy() const

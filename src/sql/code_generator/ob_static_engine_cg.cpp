@@ -1180,10 +1180,22 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
       LOG_WARN("failed to generate semantic quota offset rt expr", K(ret));
     }
   }
+  ObOptParamHint::SemanticQuotaOption quota_option = ObOptParamHint::SemanticQuotaOption::DYNAMIC;
   if (OB_SUCC(ret) && OB_FAIL(opt_ctx_->get_global_hint().opt_params_
       .get_semantic_dispatch_options(spec.dispatch_rows_, spec.request_limit_))) {
     LOG_WARN("failed to read semantic dispatch options", K(ret));
-  } else if (OB_SUCC(ret) && spec.dispatch_rows_ > 0) {
+  } else if (OB_SUCC(ret) && OB_FAIL(opt_ctx_->get_global_hint().opt_params_
+      .get_semantic_quota_options(
+          quota_option, spec.topn_window_max_, spec.cross_batch_slide_enabled_))) {
+    LOG_WARN("failed to read semantic quota options", K(ret));
+  } else if (OB_SUCC(ret)) {
+    spec.quota_policy_ = quota_option == ObOptParamHint::SemanticQuotaOption::STATIC
+        ? SemanticQuotaPolicy::STATIC
+        : quota_option == ObOptParamHint::SemanticQuotaOption::DISABLED
+              ? SemanticQuotaPolicy::DISABLED
+              : SemanticQuotaPolicy::DYNAMIC;
+  }
+  if (OB_SUCC(ret) && spec.dispatch_rows_ > 0) {
     if (!spec.row_async_enabled_ || op.get_parallel() != 1 ||
         op.execution_scope() != SemanticExecutionScope::SERIAL ||
         op.function_cache_enabled() || op.has_embedding_proxy() ||

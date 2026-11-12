@@ -1945,3 +1945,32 @@ id 条件扩大样本。COUNT DISTINCT、带顺序的聚合、rollup 等不借�
 没有在本轮调用真实模型测性能，也没有证明多行组一定比单行组更快。
 真实实验还应记录完整 EOF、首行、CPU、请求并发、组/输出批分布和内存，
 区分组级封装成本与网络/推理时间，并对两边使用相同资源窗口。
+
+## 27. Top-N / LIMIT 配额窗口与正式 `OPT_PARAM` 契约
+
+在 `LIMIT k`、`ORDER BY ... LIMIT k`（上提拆分为 `LIMIT -> SEMANTIC FILTER -> SORT`）
+与 `APPROXIMATE` 向量 ANN Top-K 下，`SEMANTIC FILTER` 通过编译期注入的全局配额
+（`bind_semantic_limit_quotas` 优先绑定上层 `ObLogLimit` 真实静态 `k + offset`，
+其次回退本地 `batch_size`）驱动乱序前缀截断与动态窗口控制（Wilson-UCB + EWMA +
+Newsvendor 尾部校正）。
+
+默认策略为 `semantic_quota_policy='dynamic'` 且 `enable_semantic_cross_batch_slide='true'`。
+所有窗口上限与消融开关均通过正式 `OPT_PARAM` 暴露，移除会话用户变量
+`@semantic_ablation_mode`：
+
+- `OPT_PARAM('semantic_quota_policy', 'dynamic' | 'static' | 'disabled')`
+- `OPT_PARAM('semantic_topn_window_max', <1..4096>)`
+- `OPT_PARAM('enable_semantic_cross_batch_slide', 'true' | 'false')`
+
+维护不变量：
+1. **`SemanticSpec::task_slots` 一致性**：`ob_result_set.cpp` 的 `pin_semantic_query`
+   在 `SemanticOp::inner_open()` 之前根据 `SemanticSpec::task_slots(0)` 固定查询级
+   `task_limit`。任何因 `topn_window_max_` 抬升任务槽位的逻辑必须放在
+   `SemanticSpec::task_slots(...)` 内，禁止仅在 `inner_open()` 单侧放大。
+2. **共享传输层 `request_limit` 一致性**：同时指定 `semantic_request_limit` 与
+   `semantic_topn_window_max` 且数值不一致时，在 `ObOptParamHint` 解析阶段直接报
+   `OB_INVALID_ARGUMENT`（MySQL `1210`），避免运行期触发共享传输层限流不一致断言。
+3. **配额截断时的槽位归还**：当前缀满足配额而主动取消非队首在途请求时，必须同步释放
+   `task.credit_` 与共享传输句柄，保证单槽位（`ai_pipeline_slots=1`）下的下游阶段
+   （如 `LIMIT` 之上的 `SEMANTIC MAP`）不会因上游持锁饿死。
+
