@@ -1324,14 +1324,33 @@ int64_t SemanticOp::pipeline_in_flight_rows(int64_t task_index) const
   return total;
 }
 
+bool SemanticOp::pipeline_has_in_flight_capacity() const
+{
+  if (count_ <= 0) {
+    return true;
+  }
+  const Slot &head_slot = *slots_[head_];
+  for (int64_t t_idx = 0; t_idx < head_slot.task_count_; ++t_idx) {
+    if (nullptr != head_slot.tasks_[t_idx] &&
+        pipeline_in_flight_rows(t_idx) >= effective_max_parallel(*head_slot.tasks_[t_idx])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 int64_t SemanticOp::effective_max_parallel(const Task &task) const
 {
-  if (semantic_spec().row_async_enabled_ && has_semantic_ablation_mode(ctx_)) {
-    return ablation_window_cap(ctx_, task.max_parallel_);
-  }
-  return (semantic_spec().row_async_enabled_ && ablation_window_cap_64(ctx_))
-      ? std::min<int64_t>(task.max_parallel_, 64)
+  const int64_t base_cap = semantic_spec().topn_lifted_
+      ? std::max(task.max_parallel_, spec_.max_batch_size_)
       : task.max_parallel_;
+  const int64_t configured_cap = semantic_spec().request_limit_ > 0
+      ? semantic_spec().request_limit_
+      : base_cap;
+  if (semantic_spec().row_async_enabled_ && has_semantic_ablation_mode(ctx_)) {
+    return ablation_window_cap(ctx_, configured_cap);
+  }
+  return configured_cap;
 }
 
 bool SemanticOp::active_slots_have_queued_rows() const
@@ -1454,61 +1473,56 @@ int64_t SemanticOp::quota_new_row_allowance(const Slot &slot) const
        row_started(head_slot, head_slot.prefix_))
           ? 1
           : 0;
-  const int64_t active_other_in_flight = std::max<int64_t>(0, total_active_in_flight - hol_straggler);
-  const bool dynamic_ablation = ablation_enables_dynamic_window(ctx_);
-  if (!dynamic_ablation) {
-    int64_t target_in_flight = rem_needed;
-    if (hol_straggler == 0) {
-      const int64_t eval = async_evaluated_rows_;
-      const int64_t match = async_matched_rows_;
-      target_in_flight = eval > 0
-          ? (rem_needed * (eval + 4) + match + 3) / (match + 4)
-          : rem_needed;
-      target_in_flight = std::max(target_in_flight, static_cast<int64_t>(1));
+  int64_t w_max = spec_.max_batch_size_ > 0 ? spec_.max_batch_size_ : 64;
+  if (slot.task_count_ > 0 && nullptr != slot.tasks_[0]) {
+    w_max = effective_max_parallel(*slot.tasks_[0]);
+    for (int64_t t_idx = 1; t_idx < slot.task_count_; ++t_idx) {
+      if (nullptr != slot.tasks_[t_idx]) {
+        w_max = std::min(w_max, effective_max_parallel(*slot.tasks_[t_idx]));
+      }
     }
-    return std::max<int64_t>(0, target_in_flight - active_other_in_flight);
   }
-  const int64_t w_max = (slot.task_count_ > 0 && nullptr != slot.tasks_[0])
-      ? effective_max_parallel(*slot.tasks_[0])
-      : 64;
-  const int64_t w_init = std::min<int64_t>(
-      w_max,
-      std::max<int64_t>(active_pull_rows_ + 2, (active_pull_rows_ * 5 + 3) / 4));
   const int64_t eval = async_evaluated_rows_;
   const int64_t match = async_matched_rows_;
   const int64_t low_water = std::max<int64_t>(0, std::min<int64_t>(rem_needed - 1, 2));
   if (total_active_in_flight <= low_water) {
     async_wave_draining_ = false;
   }
-  if (eval > 0 && async_wave_draining_) {
+  if (has_semantic_ablation_mode(ctx_) && eval > 0 && async_wave_draining_) {
     return 0;
   }
-  int64_t target_in_flight = w_init;
-  if (eval == 0) {
-    target_in_flight = w_init;
-  } else {
-    const double prior_num = (match == 0) ? 0.75 : 1.0;
-    const double prior_den = (match == 0) ? 1.0 : 1.5;
-    const double p_global =
-        (static_cast<double>(match) + prior_num) / (static_cast<double>(eval) + prior_den);
-    const double p_eff = std::max(
-        0.02,
-        eval >= 32
-            ? 0.7 * p_global + 0.3 * std::min(p_global, async_ewma_pass_rate_)
-            : p_global);
-    target_in_flight = static_cast<int64_t>(
-        std::ceil(static_cast<double>(rem_needed) / p_eff));
-    if (eval >= 4 && p_eff < 0.85) {
-      target_in_flight += (p_eff < 0.35 ? 2 : 1);
+  int64_t w_demand = rem_needed;
+  if (eval > 0) {
+    const double n = static_cast<double>(eval);
+    const double p_emp = static_cast<double>(match) / n;
+    const double p_hat = (eval >= 16)
+        ? (0.6 * p_emp + 0.4 * async_ewma_pass_rate_)
+        : p_emp;
+    if (rem_needed <= 4 && eval >= 8 && match > 0) {
+      const double p_tail = std::clamp(p_hat, 0.02, 1.0);
+      const double mean_need = static_cast<double>(rem_needed) / p_tail;
+      const double std_margin = 0.5 * std::sqrt(
+          static_cast<double>(rem_needed) * (1.0 - p_tail)) / p_tail;
+      w_demand = static_cast<int64_t>(std::ceil(mean_need + std_margin));
+    } else {
+      const double z = (eval < 16) ? 1.87 : 1.28;
+      const double z2 = z * z;
+      const double p_ucb = std::clamp(
+          (p_hat + z2 / (2.0 * n) +
+           z * std::sqrt(p_hat * (1.0 - p_hat) / n + z2 / (4.0 * n * n))) /
+              (1.0 + z2 / n),
+          0.02,
+          1.0);
+      w_demand = static_cast<int64_t>(
+          std::ceil(static_cast<double>(rem_needed) / p_ucb));
+    }
+    if (match < 5 && eval < 32) {
+      const int64_t w_slew = rem_needed + 4 * eval + 4;
+      w_demand = std::min(w_demand, w_slew);
     }
   }
-  if (eval < 32) {
-    const int64_t w_slew = (match == 0)
-        ? (w_init + 5 * eval)
-        : std::min<int64_t>(w_init + 2 * eval + 2, 2 * w_init + 11);
-    target_in_flight = std::min(target_in_flight, w_slew);
-  }
-  target_in_flight = std::clamp<int64_t>(target_in_flight, 1, w_max);
+  const int64_t target_in_flight = std::clamp<int64_t>(
+      std::max(rem_needed + hol_straggler, w_demand), 1, w_max);
   return std::max<int64_t>(0, target_in_flight - total_active_in_flight);
 }
 
@@ -2362,7 +2376,7 @@ int SemanticOp::inner_get_next_batch(int64_t max_row_cnt)
           slots_[(head_ + count_ - 1) % slot_count_]->size_) &&
         !active_slots_have_queued_rows() &&
         quota_new_row_allowance(*slots_[head_]) > 0 &&
-        pipeline_in_flight_rows(0) < effective_max_parallel(*slots_[head_]->tasks_[0]) &&
+        pipeline_has_in_flight_capacity() &&
         waiting_memory_ == 0 &&
         (semantic_spec().dispatch_rows_ == 0 ||
          pending_rows_ < 2 * std::max(semantic_spec().request_limit_,

@@ -126,6 +126,7 @@ private:
   bool quota_cruise_brake_enabled() const;
   int64_t accepted_before_slot(const Slot &slot) const;
   int64_t pipeline_in_flight_rows(int64_t task_index) const;
+  bool pipeline_has_in_flight_capacity() const;
   int64_t effective_max_parallel(const Task &task) const;
   bool active_slots_have_queued_rows() const;
   int64_t slot_cutoff_row(const Slot &slot) const;

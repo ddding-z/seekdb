@@ -231,6 +231,52 @@ class SemanticRowAsyncContracts(cache.SemanticCacheContracts):
         )
         self.assert_no_model_sockets()
 
+    def test_default_dynamic_window_scales_under_low_selectivity_with_head_straggler(self):
+        prompts = [f"dyn-default-{index:02d}" for index in range(BATCH_ROWS)]
+        self.load_inputs(prompts)
+        statement = cache.sql_statement(
+            "a.id, a.prompt",
+            cache="false",
+            enabled_lift="true",
+            where=self.call("filter"),
+            suffix="ORDER BY a.prompt LIMIT 2",
+            hints="PARALLEL(1) " + ROW_HINT,
+        )
+        head_gate, wave3_gate = self.fixtures.gate(), self.fixtures.gate()
+        offset = len(self.first.requests)
+        # Row 0 is a slow head-of-line straggler; rows 1..5 all reject (eval=5, match=0).
+        # Without setting @semantic_ablation_mode, the default dynamic window must NOT collapse
+        # to rem_needed=2 behind the straggler: once rows 1..3 finish False, it must expand
+        # concurrency to >= 3 simultaneous non-head requests in wave 3 (rows 4..6).
+        self.fixtures.reply(0, prompts[0], False, kind="filter", gate=head_gate)
+        for prompt in prompts[1:4]:
+            self.fixtures.reply(0, prompt, False, kind="filter")
+        for prompt in prompts[4:7]:
+            self.fixtures.reply(0, prompt, False, kind="filter", gate=wave3_gate)
+        for prompt in prompts[7:]:
+            self.fixtures.reply(0, prompt, True, kind="filter")
+        pending = self.fixtures.start(lambda: self.execute(statement))
+        self.wait_requests(
+            self.first,
+            lambda: len(self.first.requests) - offset >= 7,
+            pending,
+            "default dynamic window collapsed to rem_needed=2 instead of expanding behind head straggler",
+        )
+        self.assertFalse(head_gate.is_set())
+        self.assertFalse(wave3_gate.is_set())
+        wave3_gate.set()
+        self.wait_requests(
+            self.first,
+            lambda: len([record for record in semantic.audit(self.first)[offset:]
+                         if record["response"] is not None]) >= 8,
+            pending,
+            "expanded wave did not reach matching rows and brake behind head straggler",
+        )
+        head_gate.set()
+        self.assertEqual(pending.result(timeout=3), ((7, prompts[7]), (8, prompts[8])))
+        self.assertLessEqual(len(self.first.requests) - offset, 12)
+        self.assert_no_model_sockets()
+
     def test_nested_rows_advance_while_a_sibling_inner_request_is_held(self):
         prompts = [f"nested-{index}" for index in range(BATCH_ROWS)]
         self.load_inputs(prompts)
