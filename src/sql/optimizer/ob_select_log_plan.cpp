@@ -26,6 +26,7 @@
 #include "sql/optimizer/ob_log_join.h"
 #include "sql/optimizer/ob_log_group_by.h"
 #include "sql/optimizer/ob_log_sort.h"
+#include "sql/optimizer/ob_log_limit.h"
 #include "sql/optimizer/ob_log_exchange.h"
 #include "sql/optimizer/ob_log_distinct.h"
 #include "sql/optimizer/ob_log_window_function.h"
@@ -6459,6 +6460,32 @@ private:
   ObSEArray<LogSemantic *, 8> stages_;
   ObSEArray<ObLogGroupBy *, 4> aggregate_stages_;
 };
+
+void bind_semantic_limit_quotas(ObLogicalOperator &node)
+{
+  if (node.get_type() == LOG_SEMANTIC_FILTER) {
+    static_cast<LogSemantic &>(node).set_quota_limit(nullptr, nullptr);
+  }
+  for (int64_t index = 0; index < node.get_num_of_child(); ++index) {
+    ObLogicalOperator *child = node.get_child(index);
+    if (nullptr != child) {
+      bind_semantic_limit_quotas(*child);
+    }
+  }
+  if (node.get_type() == LOG_LIMIT && node.get_num_of_child() == 1) {
+    auto &limit = static_cast<ObLogLimit &>(node);
+    ObLogicalOperator *child = limit.get_child(ObLogicalOperator::first_child);
+    if (nullptr != child &&
+        child->get_type() == LOG_SEMANTIC_FILTER &&
+        !limit.get_is_calc_found_rows() &&
+        !limit.is_fetch_with_ties() &&
+        nullptr == limit.get_percent_expr() &&
+        nullptr != limit.get_limit_expr()) {
+      static_cast<LogSemantic &>(*child).set_quota_limit(
+          limit.get_limit_expr(), limit.get_offset_expr());
+    }
+  }
+}
 }
 
 int ObSelectLogPlan::candi_allocate_semantic(bool projection, bool before_sort)
@@ -6524,6 +6551,8 @@ int ObSelectLogPlan::candi_allocate_semantic(bool projection, bool before_sort)
       if (OB_FAIL(lowering.lower(root))) {
       } else if (projection && OB_FAIL(lowering.add_projection(root, selects))) {
       } else if (OB_FAIL(lowering.assign_query_limits(*root, projection, before_sort))) {
+      } else if (nullptr != root) {
+        bind_semantic_limit_quotas(*root);
       }
     }
   }
@@ -6572,6 +6601,9 @@ int ObSelectLogPlan::place_semantic_stages()
       } while (OB_SUCC(ret) && changed);
     }
     if (OB_SUCC(ret)) {
+      if (nullptr != root) {
+        bind_semantic_limit_quotas(*root);
+      }
       candidates_.candidate_plans_.at(0).plan_tree_ = root;
       if (is_final_root_plan()) {
         set_plan_root(root);

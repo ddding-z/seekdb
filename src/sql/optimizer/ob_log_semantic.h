@@ -16,7 +16,8 @@ public:
       : ObLogicalOperator(plan), query_task_count_(1), lifted_join_count_(0),
         lifted_topn_sort_(false), lift_stop_reason_(nullptr), function_cache_enabled_(false),
         row_async_enabled_(false), output_order_(SemanticOutputOrder::INPUT_ORDER),
-        auto_order_reason_(nullptr), execution_scope_(SemanticExecutionScope::SERIAL) {}
+        auto_order_reason_(nullptr), execution_scope_(SemanticExecutionScope::SERIAL),
+        quota_limit_expr_(nullptr), quota_offset_expr_(nullptr) {}
   int add_expression(ObRawExpr *expr);
   int add_shared_expression(ObRawExpr *expr);
   int add_carried_expression(ObRawExpr *expr);
@@ -44,6 +45,13 @@ public:
   void record_lifted_join() { ++lifted_join_count_; lift_stop_reason_ = nullptr; }
   void record_lifted_topn_sort() { lifted_topn_sort_ = true; lift_stop_reason_ = nullptr; }
   bool lifted_topn_sort() const { return lifted_topn_sort_; }
+  void set_quota_limit(ObRawExpr *limit_expr, ObRawExpr *offset_expr)
+  {
+    quota_limit_expr_ = limit_expr;
+    quota_offset_expr_ = offset_expr;
+  }
+  ObRawExpr *quota_limit_expr() const { return quota_limit_expr_; }
+  ObRawExpr *quota_offset_expr() const { return quota_offset_expr_; }
   void set_lift_stop_reason(const char *reason) { lift_stop_reason_ = reason; }
   int get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item) override;
   int get_op_exprs(common::ObIArray<ObRawExpr *> &exprs) override;
@@ -71,6 +79,8 @@ private:
   SemanticOutputOrder output_order_;
   const char *auto_order_reason_;
   SemanticExecutionScope execution_scope_;
+  ObRawExpr *quota_limit_expr_;
+  ObRawExpr *quota_offset_expr_;
   common::ObSEArray<SemanticProxyConfig, 8> proxy_configs_;
 };
 

@@ -361,6 +361,59 @@ class SemanticRowAsyncContracts(cache.SemanticCacheContracts):
                     self.execute("SET SESSION ai_pipeline_slots = 2")
                     self.execute("SET SESSION ob_query_timeout = 10000000")
 
+    def test_global_limit_exceeding_batch_size_does_not_brake_at_single_batch_boundary(self):
+        prompts = [f"multi-batch-lim-{index:02d}" for index in range(3 * BATCH_ROWS)]
+        self.load_inputs(prompts)
+        target_k = BATCH_ROWS + 4  # 20 > BATCH_ROWS (16)
+        statement = cache.sql_statement(
+            "a.id, a.prompt",
+            cache="false",
+            enabled_lift="true",
+            where=self.call("filter"),
+            suffix=f"ORDER BY a.prompt LIMIT {target_k}",
+            hints="PARALLEL(1) " + ROW_HINT,
+        )
+        self.execute("SET SESSION ai_pipeline_slots = 3")
+        try:
+            for head_matches, expected_indices in (
+                (True, range(0, target_k)),
+                (False, range(1, target_k + 1)),
+            ):
+                with self.subTest(head_matches=head_matches):
+                    head_gate = self.fixtures.gate()
+                    offset = len(self.first.requests)
+                    # Hold row 0 behind head_gate so Slot 0 cannot emit its first batch to ObLimitOp.
+                    # Even though ObLimitOp's first pull passes max_row_cnt=16 (BATCH_ROWS), SemanticOp
+                    # must use the true global LIMIT 20 quota instead of braking prematurely at 16 matches.
+                    self.fixtures.reply(0, prompts[0], head_matches, kind="filter", gate=head_gate)
+                    for prompt in prompts[1:]:
+                        self.fixtures.reply(0, prompt, True, kind="filter")
+                    pending = self.fixtures.start(lambda: self.execute(statement))
+                    self.wait_requests(
+                        self.first,
+                        lambda: len([record for record in semantic.audit(self.first)[offset:]
+                                     if record["response"] is not None]) >= target_k,
+                        pending,
+                        "SemanticOp braked prematurely at single-batch max_row_cnt=16 instead of global LIMIT 20",
+                    )
+                    self.assertFalse(head_gate.is_set())
+                    self.assertEqual(
+                        Counter(body["messages"][0]["content"] for body in self.first.requests[offset:]),
+                        Counter(prompts[:target_k + 1]),
+                    )
+                    head_gate.set()
+                    self.assertEqual(
+                        pending.result(timeout=3),
+                        tuple((index, prompts[index]) for index in expected_indices),
+                    )
+                    self.assertEqual(
+                        Counter(body["messages"][0]["content"] for body in self.first.requests[offset:]),
+                        Counter(prompts[:target_k + 1]),
+                    )
+                    self.assert_no_model_sockets()
+        finally:
+            self.execute("SET SESSION ai_pipeline_slots = 2")
+
     def test_nested_rows_advance_while_a_sibling_inner_request_is_held(self):
         prompts = [f"nested-{index}" for index in range(BATCH_ROWS)]
         self.load_inputs(prompts)

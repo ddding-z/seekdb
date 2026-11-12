@@ -120,6 +120,10 @@ int LogSemantic::get_op_exprs(ObIArray<ObRawExpr *> &exprs)
   } else if (OB_FAIL(append_array_no_dup(exprs, shared_exprs_))) {
   } else if (OB_FAIL(append_array_no_dup(exprs, carried_exprs_))) {
   } else if (OB_FAIL(append_array_no_dup(exprs, owned_exprs_))) {
+  } else if (nullptr != quota_limit_expr_ &&
+             OB_FAIL(add_var_to_array_no_dup(exprs, quota_limit_expr_))) {
+  } else if (nullptr != quota_offset_expr_ &&
+             OB_FAIL(add_var_to_array_no_dup(exprs, quota_offset_expr_))) {
   }
   return ret;
 }

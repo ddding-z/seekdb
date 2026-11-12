@@ -23,7 +23,8 @@ public:
         query_task_count_(1), filter_expr_count_(0), row_async_enabled_(false),
         topn_lifted_(false), memoized_exprs_(allocator),
         proxy_configs_(allocator), output_order_(SemanticOutputOrder::INPUT_ORDER),
-        execution_scope_(SemanticExecutionScope::SERIAL), dispatch_rows_(0), request_limit_(0) {}
+        execution_scope_(SemanticExecutionScope::SERIAL), dispatch_rows_(0), request_limit_(0),
+        quota_limit_expr_(nullptr), quota_offset_expr_(nullptr) {}
   common::ObFixedArray<ObExpr *, common::ObIAllocator> expressions_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> semantic_exprs_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> owned_exprs_;
@@ -42,6 +43,8 @@ public:
   SemanticExecutionScope execution_scope_;
   int64_t dispatch_rows_;
   int64_t request_limit_;
+  ObExpr *quota_limit_expr_;
+  ObExpr *quota_offset_expr_;
   int64_t task_slots(int64_t session_slots) const
   {
     // Output frames pinned by a slow row do not need additional request credits.
@@ -122,6 +125,8 @@ private:
   int prepare(Slot &slot, bool &progress);
   void mark_row_ready(Slot &slot, int64_t row);
   bool slot_drained(const Slot &slot) const;
+  int resolve_quota_target();
+  int64_t effective_quota_rows() const;
   bool quota_cutoff_enabled(const Slot &slot) const;
   bool quota_cruise_brake_enabled() const;
   int64_t accepted_before_slot(const Slot &slot) const;
@@ -184,6 +189,9 @@ private:
   int64_t demand_evaluated_;
   int64_t demand_matched_;
   int64_t active_pull_rows_;
+  bool quota_bound_evaluated_;
+  int64_t quota_target_rows_;
+  int64_t emitted_quota_rows_;
   int64_t async_evaluated_rows_;
   int64_t async_matched_rows_;
   double async_ewma_pass_rate_;

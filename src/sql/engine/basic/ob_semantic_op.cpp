@@ -143,7 +143,7 @@ bool ablation_disables_cross_batch_slide(const ObExecContext &ctx)
 OB_SERIALIZE_MEMBER((SemanticSpec, ObOpSpec), expressions_, semantic_exprs_, owned_exprs_,
                     local_exprs_, shared_exprs_, carried_exprs_, query_task_count_, filter_expr_count_,
                     memoized_exprs_, proxy_configs_, row_async_enabled_, output_order_, execution_scope_,
-                    dispatch_rows_, request_limit_, topn_lifted_);
+                    dispatch_rows_, request_limit_, topn_lifted_, quota_limit_expr_, quota_offset_expr_);
 OB_SERIALIZE_MEMBER((SemanticMapSpec, SemanticSpec));
 OB_SERIALIZE_MEMBER((SemanticFilterSpec, SemanticSpec));
 OB_SERIALIZE_MEMBER((SemanticRankSpec, SemanticSpec));
@@ -307,7 +307,9 @@ SemanticOp::SemanticOp(ObExecContext &ctx, const ObOpSpec &spec, ObOpInput *inpu
       captured_batches_(0), max_captured_rows_(0), output_batches_(0), output_rows_(0),
       max_output_rows_(0), peak_pending_rows_(0), peak_frames_(0),
       demand_evaluated_(0), demand_matched_(0),
-      active_pull_rows_(0), async_evaluated_rows_(0), async_matched_rows_(0),
+      active_pull_rows_(0), quota_bound_evaluated_(false),
+      quota_target_rows_(-1), emitted_quota_rows_(0),
+      async_evaluated_rows_(0), async_matched_rows_(0),
       async_ewma_pass_rate_(0.80)
 {
 }
@@ -589,6 +591,9 @@ void SemanticOp::reset_pipeline()
   demand_evaluated_ = 0;
   demand_matched_ = 0;
   active_pull_rows_ = 0;
+  quota_bound_evaluated_ = false;
+  quota_target_rows_ = -1;
+  emitted_quota_rows_ = 0;
   async_evaluated_rows_ = 0;
   async_matched_rows_ = 0;
   async_ewma_pass_rate_ = 0.80;
@@ -803,9 +808,10 @@ int SemanticOp::capture(Slot &slot, int64_t max_row_cnt)
   int ret = OB_SUCCESS;
   const auto &columns = child_->get_spec().output_;
   int64_t batch_size = spec_.max_batch_size_;
-  if (semantic_spec().topn_lifted_ && !semantic_spec().row_async_enabled_ && max_row_cnt > 0 &&
+  const int64_t target_rows = effective_quota_rows();
+  if (semantic_spec().topn_lifted_ && !semantic_spec().row_async_enabled_ && target_rows > 0 &&
       !ablation_is_pure_sync_batch(ctx_)) {
-    const int64_t rem = std::max(max_row_cnt, static_cast<int64_t>(1));
+    const int64_t rem = std::max(target_rows, static_cast<int64_t>(1));
     int64_t demand_rows = demand_evaluated_ > 0
         ? (rem * (demand_evaluated_ + 1) + demand_matched_) / (demand_matched_ + 1)
         : rem;
@@ -1278,13 +1284,71 @@ bool SemanticOp::slot_drained(const Slot &slot) const
   return slot.ready_ && slot.offset_ == slot.kept_count_;
 }
 
+int SemanticOp::resolve_quota_target()
+{
+  int ret = OB_SUCCESS;
+  if (quota_bound_evaluated_) {
+    return OB_SUCCESS;
+  }
+  const SemanticSpec &spec = semantic_spec();
+  if (nullptr == spec.quota_limit_expr_) {
+    quota_target_rows_ = -1;
+    quota_bound_evaluated_ = true;
+    return OB_SUCCESS;
+  }
+  bool is_null = false;
+  int64_t limit_val = 0;
+  int64_t offset_val = 0;
+  ObDatum *datum = nullptr;
+  if (OB_FAIL(spec.quota_limit_expr_->eval(eval_ctx_, datum))) {
+    LOG_WARN("failed to evaluate semantic quota limit expr", K(ret));
+  } else if (datum->is_null()) {
+    is_null = true;
+  } else {
+    limit_val = datum->get_int();
+  }
+  if (OB_SUCC(ret) && !is_null && nullptr != spec.quota_offset_expr_) {
+    if (OB_FAIL(spec.quota_offset_expr_->eval(eval_ctx_, datum))) {
+      LOG_WARN("failed to evaluate semantic quota offset expr", K(ret));
+    } else if (datum->is_null()) {
+      is_null = true;
+    } else {
+      offset_val = datum->get_int();
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (is_null || limit_val <= 0) {
+      quota_target_rows_ = 0;
+    } else {
+      const int64_t safe_offset = std::max<int64_t>(0, offset_val);
+      quota_target_rows_ = (limit_val > INT64_MAX - safe_offset)
+          ? INT64_MAX
+          : (limit_val + safe_offset);
+    }
+    quota_bound_evaluated_ = true;
+  }
+  return ret;
+}
+
+int64_t SemanticOp::effective_quota_rows() const
+{
+  if (nullptr != semantic_spec().quota_limit_expr_ && quota_bound_evaluated_) {
+    return std::max<int64_t>(0, quota_target_rows_ - emitted_quota_rows_);
+  }
+  return active_pull_rows_;
+}
+
 bool SemanticOp::quota_cutoff_enabled(const Slot &slot) const
 {
+  const bool has_bound_limit =
+      nullptr != semantic_spec().quota_limit_expr_ && quota_bound_evaluated_;
   return spec_.type_ == PHY_SEMANTIC_FILTER &&
       semantic_spec().row_async_enabled_ &&
       !semantic_spec().unordered_output() &&
-      active_pull_rows_ > 0 &&
-      (semantic_spec().topn_lifted_ || active_pull_rows_ < slot.size_) &&
+      (has_bound_limit
+          ? quota_target_rows_ >= 0
+          : (active_pull_rows_ > 0 &&
+             (semantic_spec().topn_lifted_ || active_pull_rows_ < slot.size_))) &&
       !ablation_disables_quota_cutoff(ctx_);
 }
 
@@ -1294,7 +1358,7 @@ bool SemanticOp::quota_cruise_brake_enabled() const
       semantic_spec().row_async_enabled_ &&
       !semantic_spec().unordered_output() &&
       semantic_spec().topn_lifted_ &&
-      active_pull_rows_ > 0 &&
+      effective_quota_rows() > 0 &&
       (!has_semantic_ablation_mode(ctx_) || ablation_enables_dynamic_window(ctx_));
 }
 
@@ -1382,7 +1446,7 @@ int64_t SemanticOp::slot_cutoff_row(const Slot &slot) const
     return slot.size_;
   }
   const int64_t prior_accepted = accepted_before_slot(slot);
-  const int64_t rem_for_this_slot = active_pull_rows_ - prior_accepted;
+  const int64_t rem_for_this_slot = effective_quota_rows() - prior_accepted;
   if (rem_for_this_slot <= 0) {
     return -1;
   }
@@ -1457,7 +1521,7 @@ int64_t SemanticOp::quota_new_row_allowance(const Slot &slot) const
       }
     }
   }
-  const int64_t rem_needed = std::max<int64_t>(0, active_pull_rows_ - global_unemitted_accepted);
+  const int64_t rem_needed = std::max<int64_t>(0, effective_quota_rows() - global_unemitted_accepted);
   if (rem_needed == 0) {
     return 0;
   }
@@ -2144,6 +2208,9 @@ int SemanticOp::output(Slot &slot, int64_t max_row_cnt)
     }
   }
   slot.offset_ += brs_.size_;
+  if (OB_SUCC(ret) && brs_.size_ > 0) {
+    emitted_quota_rows_ += brs_.size_;
+  }
   if (OB_SUCC(ret) && semantic_spec().dispatch_rows_ > 0 && brs_.size_ > 0) {
     ++output_batches_;
     output_rows_ += brs_.size_;
@@ -2314,6 +2381,7 @@ int SemanticOp::inner_get_next_batch(int64_t max_row_cnt)
   bool suspended = false;
   active_pull_rows_ = max_row_cnt > 0 ? max_row_cnt : 0;
   if (OB_FAIL(child_frame_.restore())) {
+  } else if (OB_FAIL(resolve_quota_target())) {
   } else if (nullptr != lib::RequestAwait::current() &&
              OB_FAIL(lib::RequestAwait::current()->cancel_ret())) {
   }

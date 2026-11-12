@@ -1164,6 +1164,22 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
   spec.output_order_ = op.output_order();
   spec.execution_scope_ = op.execution_scope();
   spec.topn_lifted_ = op.lifted_topn_sort();
+  if (OB_SUCC(ret) && nullptr != op.quota_limit_expr()) {
+    if (!op.quota_limit_expr()->get_result_type().is_integer_type()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("semantic quota limit expr must be integer", K(ret), K(*op.quota_limit_expr()));
+    } else if (OB_FAIL(generate_rt_expr(*op.quota_limit_expr(), spec.quota_limit_expr_))) {
+      LOG_WARN("failed to generate semantic quota limit rt expr", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && nullptr != op.quota_offset_expr()) {
+    if (!op.quota_offset_expr()->get_result_type().is_integer_type()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("semantic quota offset expr must be integer", K(ret), K(*op.quota_offset_expr()));
+    } else if (OB_FAIL(generate_rt_expr(*op.quota_offset_expr(), spec.quota_offset_expr_))) {
+      LOG_WARN("failed to generate semantic quota offset rt expr", K(ret));
+    }
+  }
   if (OB_SUCC(ret) && OB_FAIL(opt_ctx_->get_global_hint().opt_params_
       .get_semantic_dispatch_options(spec.dispatch_rows_, spec.request_limit_))) {
     LOG_WARN("failed to read semantic dispatch options", K(ret));
