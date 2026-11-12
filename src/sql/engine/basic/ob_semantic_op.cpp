@@ -2049,12 +2049,22 @@ int SemanticOp::poll_tasks(Slot &slot, bool &progress)
       }
     }
     if (OB_SUCC(ret) && task.credit_ && nullptr == task.dispatches_) {
-      bool complete = true;
+      const int64_t cutoff_row = slot_cutoff_row(slot);
+      bool all_complete = true;
+      bool prefix_complete = cutoff_row < slot.size_;
       for (int64_t row : task.rows_) {
-        complete = complete && task.states_[row] == Task::COMPLETE;
+        all_complete = all_complete && task.states_[row] == Task::COMPLETE;
+        if (row <= cutoff_row) {
+          prefix_complete = prefix_complete && task.states_[row] == Task::COMPLETE;
+        }
       }
-      if (complete) {
+      if (all_complete) {
         reset_task(slot, task);
+      } else if (prefix_complete ||
+                 (quota_cutoff_enabled(slot) && task.task_group_limit_ == 0)) {
+        execution_->budget().release_task(task.task_group_);
+        task.credit_ = false;
+        progress = true;
       }
     }
   }

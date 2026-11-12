@@ -328,6 +328,39 @@ class SemanticRowAsyncContracts(cache.SemanticCacheContracts):
                 finally:
                     self.execute("SET @semantic_ablation_mode = NULL")
 
+    def test_quota_cutoff_releases_task_credit_for_downstream_stage_under_single_slot(self):
+        prompts = [f"credit-cutoff-{index:02d}" for index in range(BATCH_ROWS)]
+        self.load_inputs(prompts)
+        for caching in ("false", "true"):
+            with self.subTest(caching=caching):
+                self.execute("SET SESSION ai_pipeline_slots = 1")
+                self.execute("SET SESSION ob_query_timeout = 3000000")
+                try:
+                    first_offset = len(self.first.requests)
+                    second_offset = len(self.second.requests)
+                    for index, prompt in enumerate(prompts):
+                        self.fixtures.reply(0, prompt, True, kind="filter")
+                        if index < 2:
+                            self.fixtures.reply(1, prompt, f"summary-{index:02d}")
+                    statement = (
+                        f"SELECT /*+ PARALLEL(1) OPT_PARAM('rowsets_max_rows', {BATCH_ROWS}) "
+                        f"OPT_PARAM('enable_semantic_cache', '{caching}') {ROW_HINT} */ "
+                        f"v.id, {self.call('map', 'v.prompt', provider=1)} "
+                        f"FROM (SELECT /*+ NO_MERGE */ a.id, a.prompt FROM cache_inputs a "
+                        f"WHERE {self.call('filter')} LIMIT 2) v"
+                    )
+                    rows = self.execute(statement)
+                    self.assertEqual(rows, ((0, "summary-00"), (1, "summary-01")))
+                    self.assertLessEqual(len(self.first.requests) - first_offset, BATCH_ROWS)
+                    self.assertEqual(
+                        [body["messages"][0]["content"] for body in self.second.requests[second_offset:]],
+                        [prompts[0], prompts[1]],
+                    )
+                    self.assert_no_model_sockets()
+                finally:
+                    self.execute("SET SESSION ai_pipeline_slots = 2")
+                    self.execute("SET SESSION ob_query_timeout = 10000000")
+
     def test_nested_rows_advance_while_a_sibling_inner_request_is_held(self):
         prompts = [f"nested-{index}" for index in range(BATCH_ROWS)]
         self.load_inputs(prompts)
