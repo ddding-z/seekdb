@@ -308,7 +308,7 @@ SemanticOp::SemanticOp(ObExecContext &ctx, const ObOpSpec &spec, ObOpInput *inpu
       max_output_rows_(0), peak_pending_rows_(0), peak_frames_(0),
       demand_evaluated_(0), demand_matched_(0),
       active_pull_rows_(0), async_evaluated_rows_(0), async_matched_rows_(0),
-      async_ewma_pass_rate_(0.80), async_wave_draining_(false)
+      async_ewma_pass_rate_(0.80)
 {
 }
 
@@ -592,7 +592,6 @@ void SemanticOp::reset_pipeline()
   async_evaluated_rows_ = 0;
   async_matched_rows_ = 0;
   async_ewma_pass_rate_ = 0.80;
-  async_wave_draining_ = false;
 }
 
 int SemanticOp::inner_close()
@@ -1484,13 +1483,6 @@ int64_t SemanticOp::quota_new_row_allowance(const Slot &slot) const
   }
   const int64_t eval = async_evaluated_rows_;
   const int64_t match = async_matched_rows_;
-  const int64_t low_water = std::max<int64_t>(0, std::min<int64_t>(rem_needed - 1, 2));
-  if (total_active_in_flight <= low_water) {
-    async_wave_draining_ = false;
-  }
-  if (has_semantic_ablation_mode(ctx_) && eval > 0 && async_wave_draining_) {
-    return 0;
-  }
   int64_t w_demand = rem_needed;
   if (eval > 0) {
     const double n = static_cast<double>(eval);
@@ -1806,11 +1798,6 @@ int SemanticOp::submit_cached_tasks(Slot &slot, Task &task, bool &progress)
         progress = true;
       }
     }
-    if (semantic_spec().row_async_enabled_ &&
-        (remaining_new_rows <= 0 ||
-         pipeline_in_flight_rows(0) >= effective_max_parallel(task))) {
-      async_wave_draining_ = true;
-    }
   }
   return ret;
 }
@@ -1949,11 +1936,6 @@ int SemanticOp::submit_tasks(Slot &slot, bool &progress)
             task.in_flight_rows_ += dispatch->positions_.count();
             for (int64_t position : dispatch->positions_) {
               task.states_[task.rows_.at(position)] = Task::IN_FLIGHT;
-            }
-            if (semantic_spec().row_async_enabled_ &&
-                (remaining_new_rows <= 0 ||
-                 pipeline_in_flight_rows(index) >= max_parallel)) {
-              async_wave_draining_ = true;
             }
             progress = true;
           } else if (nullptr != dispatch) {

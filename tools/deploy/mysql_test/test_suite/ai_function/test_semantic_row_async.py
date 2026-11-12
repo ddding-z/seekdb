@@ -277,6 +277,57 @@ class SemanticRowAsyncContracts(cache.SemanticCacheContracts):
         self.assertLessEqual(len(self.first.requests) - offset, 12)
         self.assert_no_model_sockets()
 
+    def test_sliding_window_replenishes_continuously_without_wave_draining_barrier(self):
+        prompts = [f"cont-slide-{index:02d}" for index in range(3 * BATCH_ROWS)]
+        self.load_inputs(prompts)
+        statement = cache.sql_statement(
+            "a.id, a.prompt",
+            cache="false",
+            enabled_lift="true",
+            where=self.call("filter"),
+            suffix="ORDER BY a.prompt LIMIT 8",
+            hints="PARALLEL(1) " + ROW_HINT,
+        )
+        for ablation_mode in (None, "ours_dynamic"):
+            with self.subTest(ablation_mode=ablation_mode):
+                if ablation_mode is None:
+                    self.execute("SET @semantic_ablation_mode = NULL")
+                else:
+                    self.execute(f"SET @semantic_ablation_mode = '{ablation_mode}'")
+                try:
+                    slow_gate = self.fixtures.gate()
+                    offset = len(self.first.requests)
+                    # Hold 4 slow requests (rows 1..4 > old low_water=2) in flight while rows 0 and 5..7
+                    # return False quickly. A continuous sliding window must replenish rows 8..15 immediately
+                    # without waiting for the 4 in-flight stragglers to drain down to <= 2.
+                    self.fixtures.reply(0, prompts[0], False, kind="filter")
+                    for prompt in prompts[1:5]:
+                        self.fixtures.reply(0, prompt, False, kind="filter", gate=slow_gate)
+                    for prompt in prompts[5:8]:
+                        self.fixtures.reply(0, prompt, False, kind="filter")
+                    for prompt in prompts[8:]:
+                        self.fixtures.reply(0, prompt, True, kind="filter")
+                    pending = self.fixtures.start(lambda: self.execute(statement))
+                    self.wait_requests(
+                        self.first,
+                        lambda: len([record for record in semantic.audit(self.first)[offset:]
+                                     if record["response"] is not None]) >= 12,
+                        pending,
+                        "sliding window stalled on wave-draining barrier with 4 slow requests in flight",
+                    )
+                    self.assertFalse(slow_gate.is_set())
+                    slow_gate.set()
+                    self.assertEqual(
+                        pending.result(timeout=3),
+                        tuple((index, prompts[index]) for index in range(8, 16)),
+                    )
+                    dispatched = len(self.first.requests) - offset
+                    self.assertGreaterEqual(dispatched, 16)
+                    self.assertLessEqual(dispatched, 28)
+                    self.assert_no_model_sockets()
+                finally:
+                    self.execute("SET @semantic_ablation_mode = NULL")
+
     def test_nested_rows_advance_while_a_sibling_inner_request_is_held(self):
         prompts = [f"nested-{index}" for index in range(BATCH_ROWS)]
         self.load_inputs(prompts)

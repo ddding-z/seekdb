@@ -187,7 +187,6 @@ private:
   int64_t async_evaluated_rows_;
   int64_t async_matched_rows_;
   double async_ewma_pass_rate_;
-  mutable bool async_wave_draining_;
   DISALLOW_COPY_AND_ASSIGN(SemanticOp);
 };
 
