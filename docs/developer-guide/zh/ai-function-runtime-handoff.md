@@ -1948,11 +1948,14 @@ id 条件扩大样本。COUNT DISTINCT、带顺序的聚合、rollup 等不借�
 
 ## 27. Top-N / LIMIT 配额窗口与正式 `OPT_PARAM` 契约
 
-在 `LIMIT k`、`ORDER BY ... LIMIT k`（上提拆分为 `LIMIT -> SEMANTIC FILTER -> SORT`）
-与 `APPROXIMATE` 向量 ANN Top-K 下，`SEMANTIC FILTER` 通过编译期注入的全局配额
-（`bind_semantic_limit_quotas` 优先绑定上层 `ObLogLimit` 真实静态 `k + offset`，
-其次回退本地 `batch_size`）驱动乱序前缀截断与动态窗口控制（Wilson-UCB + EWMA +
-Newsvendor 尾部校正）。
+在纯 `LIMIT k`、索引有序 `ORDER BY <idx> LIMIT k`、`ORDER BY ... LIMIT k`（上提拆分为
+`LIMIT -> SEMANTIC FILTER -> SORT`）与 `APPROXIMATE` 向量 ANN Top-K 下，`SEMANTIC FILTER`
+通过编译期注入的全局配额（`bind_semantic_limit_quotas` 优先绑定上层 `ObLogLimit` 真实静态
+`k + offset`，其次回退本地 `batch_size`）驱动乱序配额截断与动态窗口控制（Wilson-UCB +
+EWMA + Newsvendor 尾部校正，同时支持 `ordered` 与串行 `unordered`/`auto` 输出策略）。
+当开启 `enable_semantic_lift='true'` 或显式指定任一配额 `OPT_PARAM` 时，无需依赖物理计划中
+是否发生 `ObLogSort` 拆分，所有绑定了 `ObLogLimit` 配额的 `SEMANTIC FILTER` 均统一激活
+`quota_demand_enabled_`（动态刹车、跨批滑动窗口与同步按需拉批）。
 
 默认策略为 `semantic_quota_policy='dynamic'` 且 `enable_semantic_cross_batch_slide='true'`。
 所有窗口上限与消融开关均通过正式 `OPT_PARAM` 暴露，移除会话用户变量

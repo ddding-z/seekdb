@@ -21,7 +21,7 @@ public:
         owned_exprs_(allocator), local_exprs_(allocator),
         shared_exprs_(allocator), carried_exprs_(allocator),
         query_task_count_(1), filter_expr_count_(0), row_async_enabled_(false),
-        topn_lifted_(false), memoized_exprs_(allocator),
+        topn_lifted_(false), quota_demand_enabled_(false), memoized_exprs_(allocator),
         proxy_configs_(allocator), output_order_(SemanticOutputOrder::INPUT_ORDER),
         execution_scope_(SemanticExecutionScope::SERIAL), dispatch_rows_(0), request_limit_(0),
         quota_policy_(SemanticQuotaPolicy::DYNAMIC), topn_window_max_(0),
@@ -39,6 +39,7 @@ public:
   int64_t filter_expr_count_;
   bool row_async_enabled_;
   bool topn_lifted_;
+  bool quota_demand_enabled_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> memoized_exprs_;
   common::ObFixedArray<SemanticProxyConfig, common::ObIAllocator> proxy_configs_;
   SemanticOutputOrder output_order_;

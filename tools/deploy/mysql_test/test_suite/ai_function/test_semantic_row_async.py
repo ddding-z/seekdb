@@ -507,6 +507,113 @@ class SemanticRowAsyncContracts(cache.SemanticCacheContracts):
         finally:
             self.execute("SET SESSION ai_pipeline_slots = 2")
 
+    def test_pure_limit_and_index_ordered_limit_enable_dynamic_cruise_brake(self):
+        prompts = [f"direct-lim-{index:02d}" for index in range(2 * BATCH_ROWS)]
+        self.load_inputs(prompts)
+
+        # 1) Pure LIMIT 2 (no ORDER BY) under both enable_semantic_lift='true' and explicit quota hint
+        for label, enabled_lift, extra_hint in (
+            ("lift_enabled", "true", ""),
+            ("explicit_quota_hint", None, " OPT_PARAM('semantic_quota_policy', 'dynamic')"),
+        ):
+            with self.subTest(mode="pure_limit_ordered", variant=label):
+                stmt = cache.sql_statement(
+                    "a.id",
+                    cache="false",
+                    enabled_lift=enabled_lift,
+                    where=self.call("filter"),
+                    suffix="LIMIT 2",
+                    hints="PARALLEL(1) " + ROW_HINT + extra_hint,
+                )
+                offset = len(self.first.requests)
+                for prompt in prompts:
+                    self.fixtures.reply(0, prompt, True, kind="filter")
+                self.assertEqual(self.execute(stmt), ((0,), (1,)))
+                self.assertEqual(
+                    [body["messages"][0]["content"] for body in self.first.requests[offset:]],
+                    prompts[:2],
+                )
+                self.assert_no_model_sockets()
+
+        # 2) Pure LIMIT 2 with unordered / auto output overtakes slow row 0 and brakes at 3 requests
+        for order_policy in ("unordered", "auto"):
+            with self.subTest(mode="pure_limit_unordered_straggler", policy=order_policy):
+                stmt = cache.sql_statement(
+                    "a.id",
+                    cache="false",
+                    enabled_lift="true",
+                    where=self.call("filter"),
+                    suffix="LIMIT 2",
+                    hints=(f"PARALLEL(1) {ROW_HINT} "
+                           f"OPT_PARAM('semantic_output_order', '{order_policy}')"),
+                )
+                head_gate = self.fixtures.gate()
+                offset = len(self.first.requests)
+                self.fixtures.reply(0, prompts[0], True, kind="filter", gate=head_gate)
+                for prompt in prompts[1:]:
+                    self.fixtures.reply(0, prompt, True, kind="filter")
+                pending = self.fixtures.start(lambda: self.execute(stmt))
+                rows = pending.result(timeout=3)
+                self.assertEqual(set(rows), {(1,), (2,)})
+                self.assertFalse(head_gate.is_set(), "unordered LIMIT 2 waited for held row 0")
+                self.assertEqual(
+                    Counter(body["messages"][0]["content"] for body in self.first.requests[offset:]),
+                    Counter(prompts[:3]),
+                )
+                self.assert_no_model_sockets()
+                head_gate.set()
+
+        # 3) Index-ordered ORDER BY a.id ASC LIMIT 2 (PK order, no SORT node in plan)
+        idx_async_stmt = cache.sql_statement(
+            "a.id, a.prompt",
+            cache="false",
+            enabled_lift="true",
+            where=self.call("filter"),
+            suffix="ORDER BY a.id ASC LIMIT 2",
+            hints="PARALLEL(1) " + ROW_HINT,
+        )
+        idx_plan = self.explain(idx_async_stmt)
+        self.assertEqual(len(idx_plan.find("SORT")), 0, idx_plan.text)
+        self.assertEqual(len(idx_plan.find("TOP-N SORT")), 0, idx_plan.text)
+        head_gate = self.fixtures.gate()
+        offset = len(self.first.requests)
+        self.fixtures.reply(0, prompts[0], True, kind="filter", gate=head_gate)
+        for prompt in prompts[1:]:
+            self.fixtures.reply(0, prompt, True, kind="filter")
+        pending = self.fixtures.start(lambda: self.execute(idx_async_stmt))
+        self.wait_requests(
+            self.first,
+            lambda: len([record for record in semantic.audit(self.first)[offset:]
+                         if record["response"] is not None]) >= 2,
+            pending,
+            "index-ordered LIMIT 2 did not replenish behind slow row 0",
+        )
+        self.assertEqual(
+            Counter(body["messages"][0]["content"] for body in self.first.requests[offset:]),
+            Counter(prompts[:3]),
+        )
+        head_gate.set()
+        self.assertEqual(pending.result(timeout=3), ((0, prompts[0]), (1, prompts[1])))
+        self.assert_no_model_sockets()
+
+        # Sync demand-sizing on index-ordered ORDER BY a.id ASC LIMIT 2
+        idx_sync_stmt = cache.sql_statement(
+            "a.id",
+            cache="false",
+            enabled_lift="true",
+            where=self.call("filter"),
+            suffix="ORDER BY a.id ASC LIMIT 2",
+            hints="PARALLEL(1)",
+        )
+        offset = len(self.first.requests)
+        for prompt in prompts:
+            self.fixtures.reply(0, prompt, True, kind="filter")
+        self.assertEqual(self.execute(idx_sync_stmt), ((0,), (1,)))
+        self.assertEqual(
+            [body["messages"][0]["content"] for body in self.first.requests[offset:]],
+            prompts[:2],
+        )
+
     def test_nested_rows_advance_while_a_sibling_inner_request_is_held(self):
         prompts = [f"nested-{index}" for index in range(BATCH_ROWS)]
         self.load_inputs(prompts)

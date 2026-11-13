@@ -6,11 +6,14 @@ For the current architecture, code map, maintenance invariants and handoff check
 
 ## Quota-Aware Top-N Window & Policy Hints
 
-Lifted `SEMANTIC FILTER` stages below `LIMIT` / `ORDER BY ... LIMIT k` default
+`SEMANTIC FILTER` stages with a bound `LIMIT` quota (lifted `ORDER BY ... LIMIT k`,
+index-ordered `ORDER BY <idx> LIMIT k`, `APPROXIMATE` vector Top-K, or pure `LIMIT k`
+when `enable_semantic_lift='true'` or an explicit quota hint is supplied) default
 to `semantic_quota_policy='dynamic'` and `enable_semantic_cross_batch_slide='true'`,
-using out-of-order prefix quota cutoff and continuous Cruise-then-Brake concurrency
-control. Three optional `OPT_PARAM` hints configure explicit caps and ablation
-baselines without session user variables:
+using out-of-order quota cutoff and continuous Cruise-then-Brake concurrency
+control (across both `ordered` and serial `unordered`/`auto` output policies). Three
+optional `OPT_PARAM` hints configure explicit caps and ablation baselines without
+session user variables:
 
 - `OPT_PARAM('semantic_quota_policy', 'dynamic' | 'static' | 'disabled')`
 - `OPT_PARAM('semantic_topn_window_max', <int 1..4096>)`

@@ -58,7 +58,7 @@ SemanticRequestMemory request_memory(const SemanticInput &input)
 OB_SERIALIZE_MEMBER((SemanticSpec, ObOpSpec), expressions_, semantic_exprs_, owned_exprs_,
                     local_exprs_, shared_exprs_, carried_exprs_, query_task_count_, filter_expr_count_,
                     memoized_exprs_, proxy_configs_, row_async_enabled_, output_order_, execution_scope_,
-                    dispatch_rows_, request_limit_, topn_lifted_,
+                    dispatch_rows_, request_limit_, topn_lifted_, quota_demand_enabled_,
                     quota_policy_, topn_window_max_, cross_batch_slide_enabled_,
                     quota_limit_expr_, quota_offset_expr_);
 OB_SERIALIZE_MEMBER((SemanticMapSpec, SemanticSpec));
@@ -726,7 +726,7 @@ int SemanticOp::capture(Slot &slot, int64_t max_row_cnt)
   const auto &columns = child_->get_spec().output_;
   int64_t batch_size = spec_.max_batch_size_;
   const int64_t target_rows = effective_quota_rows();
-  if (semantic_spec().topn_lifted_ &&
+  if (semantic_spec().quota_demand_enabled_ &&
       !semantic_spec().row_async_enabled_ &&
       target_rows > 0 &&
       semantic_spec().quota_policy_ != SemanticQuotaPolicy::DISABLED) {
@@ -1260,22 +1260,27 @@ bool SemanticOp::quota_cutoff_enabled(const Slot &slot) const
 {
   const bool has_bound_limit =
       nullptr != semantic_spec().quota_limit_expr_ && quota_bound_evaluated_;
-  return spec_.type_ == PHY_SEMANTIC_FILTER &&
-      semantic_spec().row_async_enabled_ &&
-      !semantic_spec().unordered_output() &&
-      (has_bound_limit
-          ? quota_target_rows_ >= 0
-          : (active_pull_rows_ > 0 &&
-             (semantic_spec().topn_lifted_ || active_pull_rows_ < slot.size_))) &&
-      semantic_spec().quota_policy_ != SemanticQuotaPolicy::DISABLED;
+  if (spec_.type_ != PHY_SEMANTIC_FILTER ||
+      !semantic_spec().row_async_enabled_ ||
+      semantic_spec().execution_scope_ != SemanticExecutionScope::SERIAL ||
+      semantic_spec().quota_policy_ == SemanticQuotaPolicy::DISABLED) {
+    return false;
+  }
+  if (semantic_spec().unordered_output()) {
+    return semantic_spec().quota_demand_enabled_ && has_bound_limit && quota_target_rows_ >= 0;
+  }
+  return has_bound_limit
+      ? quota_target_rows_ >= 0
+      : (active_pull_rows_ > 0 &&
+         (semantic_spec().quota_demand_enabled_ || active_pull_rows_ < slot.size_));
 }
 
 bool SemanticOp::quota_cruise_brake_enabled() const
 {
   return spec_.type_ == PHY_SEMANTIC_FILTER &&
       semantic_spec().row_async_enabled_ &&
-      !semantic_spec().unordered_output() &&
-      semantic_spec().topn_lifted_ &&
+      semantic_spec().execution_scope_ == SemanticExecutionScope::SERIAL &&
+      semantic_spec().quota_demand_enabled_ &&
       effective_quota_rows() > 0 &&
       semantic_spec().quota_policy_ == SemanticQuotaPolicy::DYNAMIC;
 }
@@ -1328,7 +1333,7 @@ int64_t SemanticOp::effective_max_parallel(const Task &task) const
   if (semantic_spec().request_limit_ > 0) {
     return semantic_spec().request_limit_;
   }
-  return semantic_spec().topn_lifted_
+  return semantic_spec().quota_demand_enabled_
       ? std::max(task.max_parallel_, spec_.max_batch_size_)
       : task.max_parallel_;
 }
@@ -1361,6 +1366,14 @@ int64_t SemanticOp::slot_cutoff_row(const Slot &slot) const
 {
   if (!quota_cutoff_enabled(slot)) {
     return slot.size_;
+  }
+  if (semantic_spec().unordered_output()) {
+    int64_t global_unemitted_accepted = 0;
+    for (int64_t index = 0; index < count_; ++index) {
+      const Slot &s = *slots_[(head_ + index) % slot_count_];
+      global_unemitted_accepted += std::max<int64_t>(0, s.unordered_accepted_ - s.offset_);
+    }
+    return global_unemitted_accepted >= effective_quota_rows() ? -1 : slot.size_;
   }
   const int64_t prior_accepted = accepted_before_slot(slot);
   const int64_t rem_for_this_slot = effective_quota_rows() - prior_accepted;
@@ -1419,6 +1432,9 @@ bool SemanticOp::row_needs_prefix_completion(
   if (!quota_cutoff_enabled(slot)) {
     return true;
   }
+  if (semantic_spec().unordered_output()) {
+    return false;
+  }
   return row < max_started || cutoff_row < slot.size_;
 }
 
@@ -1429,12 +1445,16 @@ int64_t SemanticOp::quota_new_row_allowance(const Slot &slot) const
   }
   int64_t global_unemitted_accepted = 0;
   int64_t total_active_in_flight = 0;
+  bool has_overtaken_straggler = false;
   for (int64_t index = 0; index < count_; ++index) {
     const Slot &s = *slots_[(head_ + index) % slot_count_];
     global_unemitted_accepted += std::max<int64_t>(0, s.unordered_accepted_ - s.offset_);
     for (int64_t row = 0; row < s.size_; ++row) {
       if (s.row_states_[row] == Slot::WAITING && row_started(s, row)) {
         ++total_active_in_flight;
+        if (row < s.max_completed_row_) {
+          has_overtaken_straggler = true;
+        }
       }
     }
   }
@@ -1446,13 +1466,14 @@ int64_t SemanticOp::quota_new_row_allowance(const Slot &slot) const
     return slot.size_;
   }
   const Slot &head_slot = count_ > 0 ? *slots_[head_] : slot;
-  const int64_t hol_straggler =
-      (head_slot.prefix_ < head_slot.max_completed_row_ &&
-       head_slot.prefix_ < head_slot.size_ &&
-       head_slot.row_states_[head_slot.prefix_] == Slot::WAITING &&
-       row_started(head_slot, head_slot.prefix_))
-          ? 1
-          : 0;
+  const int64_t hol_straggler = semantic_spec().unordered_output()
+      ? (has_overtaken_straggler ? 1 : 0)
+      : ((head_slot.prefix_ < head_slot.max_completed_row_ &&
+          head_slot.prefix_ < head_slot.size_ &&
+          head_slot.row_states_[head_slot.prefix_] == Slot::WAITING &&
+          row_started(head_slot, head_slot.prefix_))
+             ? 1
+             : 0);
   int64_t w_max = spec_.max_batch_size_ > 0 ? spec_.max_batch_size_ : 64;
   if (slot.task_count_ > 0 && nullptr != slot.tasks_[0]) {
     w_max = effective_max_parallel(*slot.tasks_[0]);
@@ -1796,10 +1817,15 @@ int SemanticOp::submit_tasks(Slot &slot, bool &progress)
     } else if (OB_FAIL(advance_media(slot, task, progress))) {
       break;
     }
+    const bool pipeline_window_capped =
+        semantic_spec().quota_demand_enabled_ ||
+        semantic_spec().topn_window_max_ > 0 ||
+        semantic_spec().request_limit_ > 0;
     const int64_t max_parallel = effective_max_parallel(task);
-    const int64_t active_in_flight = semantic_spec().row_async_enabled_
-        ? pipeline_in_flight_rows(index)
-        : task.in_flight_rows_;
+    const int64_t active_in_flight =
+        (semantic_spec().row_async_enabled_ && pipeline_window_capped)
+            ? pipeline_in_flight_rows(index)
+            : task.in_flight_rows_;
     if (active_in_flight >= max_parallel) {
       continue;
     }
@@ -2334,17 +2360,17 @@ int SemanticOp::inner_get_next_batch(int64_t max_row_cnt)
       reclaim_unordered_slots(progress);
     }
     const int64_t max_active_slots =
-        ((semantic_spec().topn_lifted_ &&
+        ((semantic_spec().quota_demand_enabled_ &&
           !semantic_spec().row_async_enabled_ &&
           semantic_spec().quota_policy_ != SemanticQuotaPolicy::DISABLED) ||
-         (semantic_spec().topn_lifted_ &&
+         (semantic_spec().quota_demand_enabled_ &&
           semantic_spec().row_async_enabled_ &&
           !semantic_spec().cross_batch_slide_enabled_))
             ? 1
             : slot_count_;
     const bool need_cross_batch_refill =
-        !semantic_spec().unordered_output() &&
-        semantic_spec().topn_lifted_ &&
+        semantic_spec().execution_scope_ == SemanticExecutionScope::SERIAL &&
+        semantic_spec().quota_demand_enabled_ &&
         semantic_spec().row_async_enabled_ &&
         !input_end_ &&
         count_ > 0 &&
@@ -2404,7 +2430,7 @@ int SemanticOp::inner_get_next_batch(int64_t max_row_cnt)
                !(count_ > 0 &&
                  slot_cutoff_row(*slots_[(head_ + count_ - 1) % slot_count_]) <
                      slots_[(head_ + count_ - 1) % slot_count_]->size_) &&
-               (!semantic_spec().topn_lifted_ ||
+               (!semantic_spec().quota_demand_enabled_ ||
                 !semantic_spec().row_async_enabled_ ||
                 count_ == 0) &&
                waiting_memory_ == 0 &&

@@ -1098,6 +1098,17 @@ class SemanticLiftContracts(unittest.TestCase):
                         f"ORDER BY l2_distance(emb, '[0, 0, 0, 0]') APPROXIMATE {over_clause}"
                     )
                     sql_error(self, 1235, lambda s=over_stmt: self.execute(s))
+        with self.subTest(mode="row_async_dynamic_brake_on_vec_approximate"):
+            for prompt in prompts[:2]:
+                self.seed(prompt, True)
+            async_vec_stmt = (
+                f"SELECT /*+ PARALLEL(1) OPT_PARAM('rowsets_max_rows', {BATCH_ROWS}) "
+                "OPT_PARAM('enable_semantic_lift', 'true') "
+                "OPT_PARAM('enable_semantic_row_async', 'true') */ id "
+                f"FROM lift_vec WHERE AI_FILTER('{MODEL_A}',prompt) "
+                "ORDER BY l2_distance(emb, '[0, 0, 0, 0]') APPROXIMATE LIMIT 2"
+            )
+            self.check_query(async_vec_stmt, ((1,), (2,)), first=prompts[:2])
 
     def test_aggregate_boundary_retains_group_level_demand(self):
         self.load_basic(12, stride=2)

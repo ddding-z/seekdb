@@ -1180,11 +1180,27 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
       LOG_WARN("failed to generate semantic quota offset rt expr", K(ret));
     }
   }
+  bool lift_enabled = false;
+  bool has_quota_policy_hint = false;
+  bool has_window_max_hint = false;
+  bool has_cross_batch_slide_hint = false;
   ObOptParamHint::SemanticQuotaOption quota_option = ObOptParamHint::SemanticQuotaOption::DYNAMIC;
-  if (OB_SUCC(ret) && OB_FAIL(opt_ctx_->get_global_hint().opt_params_
+  const ObOptParamHint &opt_params = opt_ctx_->get_global_hint().opt_params_;
+  if (OB_SUCC(ret) && OB_FAIL(opt_params.get_bool_opt_param(
+      ObOptParamHint::ENABLE_SEMANTIC_LIFT, lift_enabled))) {
+    LOG_WARN("failed to read semantic lift option", K(ret));
+  } else if (OB_SUCC(ret) &&
+             (OB_FAIL(opt_params.has_opt_param(
+                  ObOptParamHint::SEMANTIC_QUOTA_POLICY, has_quota_policy_hint)) ||
+              OB_FAIL(opt_params.has_opt_param(
+                  ObOptParamHint::SEMANTIC_TOPN_WINDOW_MAX, has_window_max_hint)) ||
+              OB_FAIL(opt_params.has_opt_param(
+                  ObOptParamHint::ENABLE_SEMANTIC_CROSS_BATCH_SLIDE, has_cross_batch_slide_hint)))) {
+    LOG_WARN("failed to inspect semantic quota option hints", K(ret));
+  } else if (OB_SUCC(ret) && OB_FAIL(opt_params
       .get_semantic_dispatch_options(spec.dispatch_rows_, spec.request_limit_))) {
     LOG_WARN("failed to read semantic dispatch options", K(ret));
-  } else if (OB_SUCC(ret) && OB_FAIL(opt_ctx_->get_global_hint().opt_params_
+  } else if (OB_SUCC(ret) && OB_FAIL(opt_params
       .get_semantic_quota_options(
           quota_option, spec.topn_window_max_, spec.cross_batch_slide_enabled_))) {
     LOG_WARN("failed to read semantic quota options", K(ret));
@@ -1194,6 +1210,14 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
         : quota_option == ObOptParamHint::SemanticQuotaOption::DISABLED
               ? SemanticQuotaPolicy::DISABLED
               : SemanticQuotaPolicy::DYNAMIC;
+    const bool has_explicit_quota_hint =
+        has_quota_policy_hint || has_window_max_hint || has_cross_batch_slide_hint;
+    spec.quota_demand_enabled_ =
+        op.get_type() == log_op_def::LOG_SEMANTIC_FILTER &&
+        (op.lifted_topn_sort() ||
+         (nullptr != op.quota_limit_expr() &&
+          ((lift_enabled && nullptr != op.get_plan() && op.get_plan()->is_final_root_plan()) ||
+           has_explicit_quota_hint)));
   }
   if (OB_SUCC(ret) && spec.dispatch_rows_ > 0) {
     if (!spec.row_async_enabled_ || op.get_parallel() != 1 ||
