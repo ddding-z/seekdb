@@ -1166,6 +1166,29 @@ class SemanticLiftContracts(unittest.TestCase):
                                      r"(?i)\bcandidate_policy\s*=\s*ALL_SQL_CANDIDATES\b")
                     self.assertIn("pair_predicates", candidate.annotation.lower())
                     self.check_query(statement, expected, first=prompts, second=payloads)
+        with self.subTest(mode="ai_join_lifts_over_topn_sort_and_demand_sizes"):
+            topn_payloads = []
+            for index in reversed(range(0, 12, 4)):
+                payload = joins.pair_payload(JOIN_RULE, prompts[index], f"category-{index}")
+                topn_payloads.append(payload)
+                self.seed_pair(payload, True)
+            topn_stmt = sql_statement(
+                "a.id,b.category",
+                enabled="true",
+                from_sql="lift_left a JOIN lift_right b",
+                on=f"a.id=b.id AND AI_JOIN('{MODEL_B}','{JOIN_RULE}',a.prompt,b.category)",
+                where="b.keep_row=1",
+                suffix="ORDER BY a.id DESC LIMIT 1",
+            )
+            topn_plan = self.explain(topn_stmt)
+            self.assertEqual(len(topn_plan.find("TOP-N SORT")), 0, topn_plan.text)
+            candidate = topn_plan.one("SEMANTIC JOIN")
+            self.assertTrue(topn_plan.is_above(topn_plan.one("LIMIT"), candidate), topn_plan.text)
+            self.assertTrue(topn_plan.is_above(candidate, topn_plan.one("SORT")), topn_plan.text)
+            self.assertTrue(topn_plan.is_above(topn_plan.one("SORT"), topn_plan.one("HASH JOIN")),
+                            topn_plan.text)
+            self.assertRegex(candidate.annotation, r"(?i)\bsemantic_placement\s*=\s*LIFTED\b")
+            self.check_query(topn_stmt, ((8, "category-8"),), second=topn_payloads[:1])
 
     def test_ordinary_prefilters_remain_first(self):
         prompts = self.load_basic(invalid_after=50)

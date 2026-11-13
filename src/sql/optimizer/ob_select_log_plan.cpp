@@ -5165,7 +5165,8 @@ int semantic_lift_expression_safe(ObRawExpr *expr, bool semantic_recipe,
       if (!safe && (semantic_input ||
                    (cached_recipe && semantic_recipe && child->is_const_raw_expr())) &&
           ob_is_string_type(child->get_data_type()) &&
-          child->get_data_type() == expr->get_data_type() &&
+          (child->get_data_type() == expr->get_data_type() ||
+           (semantic_input && expr->get_data_type() == ObLongTextType)) &&
           child->get_result_type().get_charset_type() == CHARSET_UTF8MB4 &&
           expr->get_collation_type() == CS_TYPE_UTF8MB4_BIN &&
           child->get_accuracy().get_length() <= expr->get_accuracy().get_length()) {
@@ -5187,6 +5188,23 @@ int semantic_lift_expression_safe(ObRawExpr *expr, bool semantic_recipe,
     } else {
       ret = SMART_CALL(semantic_lift_expression_safe(
           expr->get_param_expr(1), true, true, safe, cached_recipe));
+    }
+  } else if (semantic_recipe && expr->get_expr_type() == T_FUN_SYS_AI_JOIN) {
+    if (expr->get_param_count() < 4 || expr->get_param_count() > 5) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid semantic join recipe while checking placement", K(ret));
+    } else if (nullptr == expr->get_param_expr(0) ||
+               !expr->get_param_expr(0)->is_static_scalar_const_expr() ||
+               (expr->get_param_count() == 5 &&
+                (nullptr == expr->get_param_expr(4) ||
+                 !expr->get_param_expr(4)->is_static_scalar_const_expr()))) {
+      safe = false;
+    } else {
+      safe = true;
+      for (int64_t arg = 1; OB_SUCC(ret) && safe && arg < 4; ++arg) {
+        ret = SMART_CALL(semantic_lift_expression_safe(
+            expr->get_param_expr(arg), true, true, safe, cached_recipe));
+      }
     }
   } else if (semantic_input && expr->get_expr_type() == T_FUN_SYS_TO_FILE) {
     if (expr->get_param_count() < 1) {
@@ -5253,22 +5271,26 @@ int semantic_lift_expression_safe(ObRawExpr *expr, bool semantic_recipe,
   return ret;
 }
 
-bool semantic_lift_join_supported(ObLogJoin &join)
+bool semantic_lift_join_supported(ObLogJoin &join, bool allow_uncorrelated_nlj = false)
 {
   return join.get_join_type() == INNER_JOIN &&
-      (join.get_join_algo() == HASH_JOIN || join.get_join_algo() == MERGE_JOIN) &&
+      (join.get_join_algo() == HASH_JOIN || join.get_join_algo() == MERGE_JOIN ||
+       (allow_uncorrelated_nlj && join.get_join_algo() == NESTED_LOOP_JOIN &&
+        !join.enable_px_batch_rescan())) &&
       join.get_nl_params().empty() &&
       join.get_above_pushdown_left_params().empty() &&
       join.get_above_pushdown_right_params().empty() && !join.is_late_mat();
 }
 
-int semantic_lift_relational_safe(ObLogicalOperator &node, bool &safe)
+int semantic_lift_relational_safe(ObLogicalOperator &node, bool &safe,
+                                  bool allow_uncorrelated_nlj = false)
 {
   int ret = OB_SUCCESS;
   ObSEArray<ObRawExpr *, 16> expressions;
   safe = node.get_type() == LOG_TABLE_SCAN ||
+      (allow_uncorrelated_nlj && node.get_type() == LOG_MATERIAL) ||
       (node.get_type() == LOG_JOIN &&
-       semantic_lift_join_supported(static_cast<ObLogJoin &>(node))) ||
+       semantic_lift_join_supported(static_cast<ObLogJoin &>(node), allow_uncorrelated_nlj)) ||
       (node.get_type() == LOG_SORT &&
        nullptr == static_cast<ObLogSort &>(node).get_topn_expr());
   if (safe) {
@@ -5313,7 +5335,7 @@ int semantic_lift_relational_safe(ObLogicalOperator &node, bool &safe)
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("missing relational child while checking semantic placement", K(ret));
     } else {
-      ret = SMART_CALL(semantic_lift_relational_safe(*child, safe));
+      ret = SMART_CALL(semantic_lift_relational_safe(*child, safe, allow_uncorrelated_nlj));
     }
   }
   return ret;
@@ -5607,7 +5629,7 @@ int set_semantic_execution_scope(ObLogicalOperator &node, SemanticExecutionScope
 {
   int ret = OB_SUCCESS;
   if (node.get_type() == LOG_SEMANTIC_MAP || node.get_type() == LOG_SEMANTIC_FILTER ||
-      node.get_type() == LOG_SEMANTIC_RANK) {
+      node.get_type() == LOG_SEMANTIC_JOIN || node.get_type() == LOG_SEMANTIC_RANK) {
     static_cast<LogSemantic &>(node).set_execution_scope(scope);
   }
   for (int64_t index = 0; OB_SUCC(ret) && index < node.get_num_of_child(); ++index) {
@@ -5937,10 +5959,12 @@ public:
         if (!SemanticExprUtils::supports_row_async(call)) {
           ret = OB_NOT_SUPPORTED;
           LOG_USER_ERROR(OB_NOT_SUPPORTED,
-                         "row asynchronous execution supports static text or FILE MAP/FILTER/RANK calls only");
-        } else if (dispatch_rows > 0 && !SemanticExprUtils::supports_function_cache(call)) {
+                         "row asynchronous execution supports static text or FILE MAP/FILTER/JOIN/RANK calls only");
+        } else if (dispatch_rows > 0 &&
+                   (!SemanticExprUtils::supports_function_cache(call) ||
+                    call.get_expr_type() == T_FUN_SYS_AI_JOIN)) {
           ret = OB_NOT_SUPPORTED;
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "shared semantic dispatch currently supports static TEXT calls only");
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "shared semantic dispatch currently supports static TEXT MAP/FILTER/RANK calls only");
         }
       }
     }
@@ -6139,7 +6163,8 @@ private:
     const ObSelectStmt *stmt = plan_.get_stmt();
     bool safe = false;
     if (!plan_.is_final_root_plan() ||
-        stage.get_type() != LOG_SEMANTIC_FILTER ||
+        (stage.get_type() != LOG_SEMANTIC_FILTER &&
+         stage.get_type() != LOG_SEMANTIC_JOIN) ||
         !stage.shared_exprs().empty() || !stage.carried_exprs().empty()) {
       reason = "non_filter_or_shared_stage";
     } else if (OB_ISNULL(source) || stage.get_num_of_child() != 1 ||
@@ -6177,7 +6202,8 @@ private:
       }
     }
     if (OB_SUCC(ret) && nullptr == reason) {
-      if (OB_FAIL(semantic_lift_relational_safe(*source, safe))) {
+      if (OB_FAIL(semantic_lift_relational_safe(
+              *source, safe, stage.get_type() == LOG_SEMANTIC_JOIN))) {
       } else if (!safe) {
         reason = "unsafe_source_subtree";
       }
@@ -6214,7 +6240,9 @@ private:
     if (OB_ISNULL(child)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("missing sort child while lifting semantic stage", K(ret));
-    } else if (!candidate_boundary && child->get_type() == LOG_SEMANTIC_FILTER) {
+    } else if (!candidate_boundary &&
+               (child->get_type() == LOG_SEMANTIC_FILTER ||
+                child->get_type() == LOG_SEMANTIC_JOIN)) {
       auto &stage = *static_cast<LogSemantic *>(child);
       const char *reason = nullptr;
       if (OB_FAIL(semantic_lift_topn_sort_candidate(sort, stage, reason))) {
@@ -6463,7 +6491,7 @@ private:
 
 void bind_semantic_limit_quotas(ObLogicalOperator &node)
 {
-  if (node.get_type() == LOG_SEMANTIC_FILTER) {
+  if (node.get_type() == LOG_SEMANTIC_FILTER || node.get_type() == LOG_SEMANTIC_JOIN) {
     static_cast<LogSemantic &>(node).set_quota_limit(nullptr, nullptr);
   }
   for (int64_t index = 0; index < node.get_num_of_child(); ++index) {
@@ -6476,7 +6504,8 @@ void bind_semantic_limit_quotas(ObLogicalOperator &node)
     auto &limit = static_cast<ObLogLimit &>(node);
     ObLogicalOperator *child = limit.get_child(ObLogicalOperator::first_child);
     if (nullptr != child &&
-        child->get_type() == LOG_SEMANTIC_FILTER &&
+        (child->get_type() == LOG_SEMANTIC_FILTER ||
+         child->get_type() == LOG_SEMANTIC_JOIN) &&
         !limit.get_is_calc_found_rows() &&
         !limit.is_fetch_with_ties() &&
         nullptr == limit.get_percent_expr() &&

@@ -82,7 +82,7 @@ bool ObOpSpec::has_semantic_operator() const
 bool ObOpSpec::has_row_async_semantic_operator() const
 {
   bool present = (type_ == PHY_SEMANTIC_MAP || type_ == PHY_SEMANTIC_FILTER ||
-                  type_ == PHY_SEMANTIC_RANK) &&
+                  type_ == PHY_SEMANTIC_JOIN || type_ == PHY_SEMANTIC_RANK) &&
                  static_cast<const SemanticSpec &>(*this).row_async_enabled_;
   for (uint32_t index = 0; !present && index < child_cnt_; ++index) {
     if (nullptr != children_[index]) {

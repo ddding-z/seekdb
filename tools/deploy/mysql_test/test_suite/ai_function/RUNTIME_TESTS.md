@@ -6,14 +6,16 @@ For the current architecture, code map, maintenance invariants and handoff check
 
 ## Quota-Aware Top-N Window & Policy Hints
 
-`SEMANTIC FILTER` stages with a bound `LIMIT` quota (lifted `ORDER BY ... LIMIT k`,
-index-ordered `ORDER BY <idx> LIMIT k`, `APPROXIMATE` vector Top-K, or pure `LIMIT k`
-when `enable_semantic_lift='true'` or an explicit quota hint is supplied) default
-to `semantic_quota_policy='dynamic'` and `enable_semantic_cross_batch_slide='true'`,
+`SEMANTIC FILTER` and `SEMANTIC JOIN` stages with a bound `LIMIT` quota (lifted
+`ORDER BY ... LIMIT k` over `SEMANTIC FILTER` or `SEMANTIC JOIN`, index-ordered
+`ORDER BY <idx> LIMIT k`, `APPROXIMATE` vector Top-K, or pure `LIMIT k` when
+`enable_semantic_lift='true'` or an explicit quota hint is supplied) default to
+`semantic_quota_policy='dynamic'` and `enable_semantic_cross_batch_slide='true'`,
 using out-of-order quota cutoff and continuous Cruise-then-Brake concurrency
-control (across both `ordered` and serial `unordered`/`auto` output policies). Three
-optional `OPT_PARAM` hints configure explicit caps and ablation baselines without
-session user variables:
+control (`SEMANTIC JOIN` retains its `ALL_SQL_CANDIDATES` candidate-pair boundary
+and supports serial `ordered` row-async execution, including bilateral embedding
+proxy composition). Three optional `OPT_PARAM` hints configure explicit caps and
+ablation baselines without session user variables:
 
 - `OPT_PARAM('semantic_quota_policy', 'dynamic' | 'static' | 'disabled')`
 - `OPT_PARAM('semantic_topn_window_max', <int 1..4096>)`

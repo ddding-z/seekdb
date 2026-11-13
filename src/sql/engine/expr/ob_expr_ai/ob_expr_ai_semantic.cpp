@@ -759,6 +759,7 @@ bool SemanticExprUtils::supports_row_async(const ObRawExpr &expr)
 {
   return (expr.get_expr_type() == T_FUN_SYS_AI_MAP ||
           expr.get_expr_type() == T_FUN_SYS_AI_FILTER ||
+          expr.get_expr_type() == T_FUN_SYS_AI_JOIN ||
           expr.get_expr_type() == T_FUN_SYS_AI_RANK) && semantic_static_call(expr, true);
 }
 

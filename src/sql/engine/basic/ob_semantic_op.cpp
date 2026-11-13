@@ -646,7 +646,7 @@ int SemanticOp::allocate_slot(Slot &slot, int64_t size)
       } else {
         MEMSET(slot.row_states_, Slot::WAITING, size);
         MEMSET(slot.dirty_, 0, size);
-        for (int64_t row = 0; row < size; ++row) {
+        for (int64_t row = 0; row < slot.size_; ++row) {
           mark_row_ready(slot, row);
         }
       }
@@ -825,7 +825,25 @@ int SemanticOp::capture_join_candidates(Slot &slot)
 {
   int ret = OB_SUCCESS;
   const auto &columns = child_->get_spec().output_;
-  const int64_t capacity = MIN(spec_.max_batch_size_, eval_ctx_.max_batch_size_);
+  int64_t capacity = MIN(spec_.max_batch_size_, eval_ctx_.max_batch_size_);
+  const int64_t target_rows = effective_quota_rows();
+  if (semantic_spec().quota_demand_enabled_ &&
+      !semantic_spec().row_async_enabled_ &&
+      target_rows > 0 &&
+      semantic_spec().quota_policy_ != SemanticQuotaPolicy::DISABLED) {
+    const int64_t rem = std::max<int64_t>(target_rows, 1);
+    int64_t demand_rows = demand_evaluated_ > 0
+        ? (rem * (demand_evaluated_ + 1) + demand_matched_) / (demand_matched_ + 1)
+        : rem;
+    if (semantic_spec().quota_policy_ == SemanticQuotaPolicy::DYNAMIC &&
+        demand_evaluated_ > 0 && demand_matched_ == 0) {
+      demand_rows = std::max(demand_rows, demand_evaluated_ * 2);
+    }
+    const int64_t max_batch = semantic_spec().topn_window_max_ > 0
+        ? std::min(capacity, semantic_spec().topn_window_max_)
+        : capacity;
+    capacity = std::min<int64_t>(max_batch, std::max<int64_t>(demand_rows, 1));
+  }
   if (capacity <= 0) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid semantic join candidate batch capacity", K(ret), K(capacity));
@@ -918,6 +936,11 @@ int SemanticOp::capture_join_candidates(Slot &slot)
     }
   }
   if (OB_SUCC(ret) && slot.size_ > 0) {
+    if (semantic_spec().row_async_enabled_) {
+      for (int64_t row = 0; row < slot.size_; ++row) {
+        mark_row_ready(slot, row);
+      }
+    }
     slot.needs_prepare_ = true;
     ++count_;
   }
@@ -1260,7 +1283,7 @@ bool SemanticOp::quota_cutoff_enabled(const Slot &slot) const
 {
   const bool has_bound_limit =
       nullptr != semantic_spec().quota_limit_expr_ && quota_bound_evaluated_;
-  if (spec_.type_ != PHY_SEMANTIC_FILTER ||
+  if (!is_filter() ||
       !semantic_spec().row_async_enabled_ ||
       semantic_spec().execution_scope_ != SemanticExecutionScope::SERIAL ||
       semantic_spec().quota_policy_ == SemanticQuotaPolicy::DISABLED) {
@@ -1277,7 +1300,7 @@ bool SemanticOp::quota_cutoff_enabled(const Slot &slot) const
 
 bool SemanticOp::quota_cruise_brake_enabled() const
 {
-  return spec_.type_ == PHY_SEMANTIC_FILTER &&
+  return is_filter() &&
       semantic_spec().row_async_enabled_ &&
       semantic_spec().execution_scope_ == SemanticExecutionScope::SERIAL &&
       semantic_spec().quota_demand_enabled_ &&
@@ -1329,9 +1352,6 @@ int64_t SemanticOp::effective_max_parallel(const Task &task) const
 {
   if (semantic_spec().topn_window_max_ > 0) {
     return semantic_spec().topn_window_max_;
-  }
-  if (semantic_spec().request_limit_ > 0) {
-    return semantic_spec().request_limit_;
   }
   return semantic_spec().quota_demand_enabled_
       ? std::max(task.max_parallel_, spec_.max_batch_size_)
@@ -1819,8 +1839,7 @@ int SemanticOp::submit_tasks(Slot &slot, bool &progress)
     }
     const bool pipeline_window_capped =
         semantic_spec().quota_demand_enabled_ ||
-        semantic_spec().topn_window_max_ > 0 ||
-        semantic_spec().request_limit_ > 0;
+        semantic_spec().topn_window_max_ > 0;
     const int64_t max_parallel = effective_max_parallel(task);
     const int64_t active_in_flight =
         (semantic_spec().row_async_enabled_ && pipeline_window_capped)

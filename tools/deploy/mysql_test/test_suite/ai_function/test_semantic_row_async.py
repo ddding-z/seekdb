@@ -614,6 +614,103 @@ class SemanticRowAsyncContracts(cache.SemanticCacheContracts):
             prompts[:2],
         )
 
+    def test_ai_join_limit_and_topn_sort_lift_with_dynamic_window(self):
+        left_prompts = [f"jleft-{index:02d}" for index in range(6)]
+        right_prompts = [f"jright-{index:02d}" for index in range(6)]
+        self.load_inputs(left_prompts)
+        self.load_right(6, copies=1, prompt=lambda index: right_prompts[index])
+        # 1) Pure LIMIT 2 over equality HASH JOIN + AI_JOIN: dynamic Cruise-then-Brake + straggler cutoff
+        eq_join_call = (
+            f"AI_JOIN('{self.models[1]}','{cache.JOIN_RULE}',a.prompt,b.prompt)"
+        )
+        head_gate = self.fixtures.gate()
+        second_offset = len(self.second.requests)
+        for idx in range(6):
+            payload = cache.joins.pair_payload(
+                cache.JOIN_RULE, left_prompts[idx], right_prompts[idx]
+            )
+            self.fixtures.reply(
+                1, payload, True, kind="join", gate=head_gate if idx == 0 else None
+            )
+        pure_limit_stmt = cache.sql_statement(
+            "a.id, b.row_id",
+            cache="false",
+            enabled_lift="true",
+            source=f"cache_inputs a JOIN cache_right b ON a.id = b.join_id AND {eq_join_call}",
+            suffix="LIMIT 2",
+            hints="PARALLEL(1) LEADING(a b) USE_HASH(b) " + ROW_HINT,
+        )
+        pure_plan = self.explain(pure_limit_stmt)
+        join_stage = pure_plan.one("SEMANTIC JOIN")
+        self.assertIn("ROW_ASYNC=ORDERED_PREFIX", join_stage.annotation.upper())
+        self.assertTrue(pure_plan.is_above(pure_plan.one("LIMIT"), join_stage), pure_plan.text)
+        pending = self.fixtures.start(lambda: self.execute(pure_limit_stmt))
+        self.wait_requests(
+            self.second,
+            lambda: len([record for record in semantic.audit(self.second)[second_offset:]
+                         if record["response"] is not None]) >= 2,
+            pending,
+            "AI_JOIN LIMIT 2 did not replenish behind held pair 0",
+        )
+        self.assertEqual(len(self.second.requests) - second_offset, 3)
+        head_gate.set()
+        self.assertEqual(pending.result(timeout=3), ((0, 0), (1, 1)))
+        self.assert_no_model_sockets()
+
+        # 2) Cartesian 6x6=36 pairs (> 2*BATCH_ROWS) with ORDER BY b.row_id DESC, a.id DESC LIMIT 2
+        #    verifying TOP-N SORT split -> LIMIT -> SEMANTIC JOIN -> SORT -> NESTED-LOOP JOIN
+        #    plus sandwich downstream AI_MAP only on the 2 surviving pairs!
+        ordered_pairs = [
+            (li, ri)
+            for ri in reversed(range(6))
+            for li in reversed(range(6))
+        ]
+        for rank_idx, (li, ri) in enumerate(ordered_pairs):
+            payload = cache.joins.pair_payload(
+                cache.JOIN_RULE, left_prompts[li], right_prompts[ri]
+            )
+            matches = rank_idx in (4, 5)
+            self.fixtures.reply(1, payload, matches, kind="join")
+            if matches:
+                self.fixtures.reply(
+                    0, f"pair:{left_prompts[li]}:{right_prompts[ri]}", f"sum-{li}-{ri}"
+                )
+        pair_expr = "CONCAT('pair:',a.prompt,':',b.prompt)"
+        topn_join_stmt = cache.sql_statement(
+            f"a.id, b.row_id, {self.call('map', pair_expr)}",
+            cache="false",
+            enabled_lift="true",
+            source=f"cache_inputs a JOIN cache_right b ON {eq_join_call}",
+            suffix="ORDER BY b.row_id DESC, a.id DESC LIMIT 2",
+            hints="PARALLEL(1) LEADING(a b) " + ROW_HINT,
+        )
+        topn_plan = self.explain(topn_join_stmt)
+        self.assertEqual(len(topn_plan.find("TOP-N SORT")), 0, topn_plan.text)
+        sem_map = topn_plan.one("SEMANTIC MAP")
+        limit_op = topn_plan.one("LIMIT")
+        sem_join = topn_plan.one("SEMANTIC JOIN")
+        full_sort = topn_plan.one("SORT")
+        self.assertTrue(topn_plan.is_above(sem_map, limit_op), topn_plan.text)
+        self.assertTrue(topn_plan.is_above(limit_op, sem_join), topn_plan.text)
+        self.assertTrue(topn_plan.is_above(sem_join, full_sort), topn_plan.text)
+        self.assertIn("SEMANTIC_PLACEMENT=LIFTED", sem_join.annotation.upper())
+        self.assertIn("CANDIDATE_POLICY=ALL_SQL_CANDIDATES", sem_join.annotation.upper())
+        first_offset = len(self.first.requests)
+        second_offset = len(self.second.requests)
+        rows = self.execute(topn_join_stmt)
+        expected_pairs = [ordered_pairs[4], ordered_pairs[5]]
+        self.assertEqual(
+            rows,
+            tuple((li, ri, f"sum-{li}-{ri}") for li, ri in expected_pairs),
+        )
+        self.assertLessEqual(
+            len(self.second.requests) - second_offset,
+            16,
+            "AI_JOIN Top-N evaluated too many sorted candidate pairs out of 36",
+        )
+        self.assertEqual(len(self.first.requests) - first_offset, 2)
+        self.assert_no_model_sockets()
+
     def test_nested_rows_advance_while_a_sibling_inner_request_is_held(self):
         prompts = [f"nested-{index}" for index in range(BATCH_ROWS)]
         self.load_inputs(prompts)
@@ -852,12 +949,24 @@ class SemanticRowAsyncContracts(cache.SemanticCacheContracts):
                 statement = self.statement(fields)
                 for prefix in ("EXPLAIN ", ""):
                     sql_error(self, 1235, lambda: self.execute(prefix + statement))
-        join = self.statement(
-            "a.id,b.id", source="cache_inputs a JOIN cache_inputs b ON " + self.join_call())
-        for prefix in ("EXPLAIN ", ""):
-            sql_error(self, 1235, lambda: self.execute(prefix + join))
+        for bad_join in (
+            f"AI_JOIN(a.prompt,'{cache.JOIN_RULE}',a.prompt,b.prompt)",
+            f"AI_JOIN('{self.models[1]}','{cache.JOIN_RULE}',a.prompt,b.prompt,a.opts)",
+        ):
+            with self.subTest(bad_join=bad_join):
+                join = self.statement(
+                    "a.id,b.id", source="cache_inputs a JOIN cache_inputs b ON " + bad_join)
+                for prefix in ("EXPLAIN ", ""):
+                    sql_error(self, 1235, lambda s=prefix + join: self.execute(s))
         self.cursor.executemany(
             "INSERT INTO cache_px_inputs VALUES (%s,%s)", [(index, "px") for index in range(256)])
+        px_join = cache.sql_statement(
+            "a.id,b.id",
+            source="cache_px_inputs a JOIN cache_px_inputs b ON a.id = b.id AND " + self.join_call(),
+            suffix="",
+            hints="PARALLEL(4) " + ROW_HINT,
+        )
+        sql_error(self, 1235, lambda: self.execute(px_join))
         px = cache.sql_statement(
             "a.id," + map_call, source="cache_px_inputs a", suffix="",
             hints="PARALLEL(4) " + ROW_HINT)

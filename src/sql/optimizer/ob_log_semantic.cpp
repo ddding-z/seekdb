@@ -365,13 +365,22 @@ int LogSemanticJoin::add_join_expression(ObRawExpr *expr)
 int LogSemanticJoin::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan_item)
 {
   int ret = OB_SUCCESS;
+  ObOptParamHint::SemanticQuotaOption quota_option = ObOptParamHint::SemanticQuotaOption::DYNAMIC;
+  int64_t topn_window_max = 0;
+  bool cross_batch_slide = true;
   if (OB_FAIL(ObLogicalOperator::get_plan_item_info(plan_text, plan_item))) {
+  } else if (OB_FAIL(get_plan()->get_optimizer_context().get_global_hint()
+                 .opt_params_.get_semantic_quota_options(
+                     quota_option, topn_window_max, cross_batch_slide))) {
   } else {
     BEGIN_BUF_PRINT;
     if (OB_FAIL(BUF_PRINTF("candidate_policy=ALL_SQL_CANDIDATES, "))) {
     } else {
       const ObIArray<ObRawExpr *> &pair_predicates = join_exprs_;
       EXPLAIN_PRINT_EXPRS(pair_predicates, type);
+    }
+    if (OB_SUCC(ret) && lifted_topn_sort()) {
+      ret = BUF_PRINTF(", semantic_placement=LIFTED");
     }
     if (OB_SUCC(ret) && function_cache_enabled()) {
       int64_t memoized = 0;
@@ -384,6 +393,20 @@ int LogSemanticJoin::get_plan_item_info(PlanText &plan_text, ObSqlPlanItem &plan
     if (OB_SUCC(ret) && has_embedding_proxy()) {
       ret = BUF_PRINTF(", embedding_proxy=REJECT_ONLY, proxy_input=LEFT_RIGHT_TEXT, "
                        "approximate=true, threshold=%.17g", proxy_configs().at(0).threshold_);
+    }
+    if (OB_SUCC(ret) && row_async_enabled()) {
+      ret = BUF_PRINTF(", row_async=ORDERED_PREFIX, execution_scope=SERIAL");
+    }
+    if (OB_SUCC(ret) && quota_option != ObOptParamHint::SemanticQuotaOption::DYNAMIC) {
+      ret = BUF_PRINTF(", quota_policy=%s",
+                       quota_option == ObOptParamHint::SemanticQuotaOption::STATIC
+                           ? "STATIC" : "DISABLED");
+    }
+    if (OB_SUCC(ret) && topn_window_max > 0) {
+      ret = BUF_PRINTF(", topn_window_max=%ld", topn_window_max);
+    }
+    if (OB_SUCC(ret) && !cross_batch_slide) {
+      ret = BUF_PRINTF(", cross_batch_slide=false");
     }
     END_BUF_PRINT(plan_item.special_predicates_, plan_item.special_predicates_len_);
   }

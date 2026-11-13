@@ -1213,7 +1213,8 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
     const bool has_explicit_quota_hint =
         has_quota_policy_hint || has_window_max_hint || has_cross_batch_slide_hint;
     spec.quota_demand_enabled_ =
-        op.get_type() == log_op_def::LOG_SEMANTIC_FILTER &&
+        (op.get_type() == log_op_def::LOG_SEMANTIC_FILTER ||
+         op.get_type() == log_op_def::LOG_SEMANTIC_JOIN) &&
         (op.lifted_topn_sort() ||
          (nullptr != op.quota_limit_expr() &&
           ((lift_enabled && nullptr != op.get_plan() && op.get_plan()->is_final_root_plan()) ||
@@ -1244,11 +1245,13 @@ int ObStaticEngineCG::generate_semantic_spec(LogSemantic &op, SemanticSpec &spec
   if (OB_SUCC(ret) && spec.row_async_enabled_ &&
       ((spec.execution_scope_ == SemanticExecutionScope::SERIAL && op.get_parallel() != 1) ||
        (spec.execution_scope_ == SemanticExecutionScope::LOCAL_PX_WORKER &&
-        (op.get_parallel() < 1 || !spec.unordered_output() || op.has_embedding_proxy())) ||
+        (op.get_parallel() < 1 || !spec.unordered_output() || op.has_embedding_proxy() ||
+         op.get_type() == log_op_def::LOG_SEMANTIC_JOIN)) ||
        (spec.execution_scope_ != SemanticExecutionScope::SERIAL &&
         spec.execution_scope_ != SemanticExecutionScope::LOCAL_PX_WORKER) ||
        (op.get_type() != log_op_def::LOG_SEMANTIC_MAP &&
         op.get_type() != log_op_def::LOG_SEMANTIC_FILTER &&
+        op.get_type() != log_op_def::LOG_SEMANTIC_JOIN &&
         op.get_type() != log_op_def::LOG_SEMANTIC_RANK))) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED,

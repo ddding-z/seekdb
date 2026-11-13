@@ -274,6 +274,47 @@ class SemanticJoinProxySmoke(unittest.TestCase):
         self.assertEqual(self.execute(statement), (("oak", "pine"),))
         self.assertEqual(self.work(before)[:2], (Counter(["oak", "pine"]), Counter([identity])))
 
+    def test_row_async_join_proxy_topn_lift_and_dynamic_brake(self):
+        candidates = self.load(["oak", "pine"], ["far", "oak", "pine"])
+        for left, right in set(candidates):
+            self.reply(pair_key(left, right), main_value(left, right))
+        before = self.offsets()
+        options = {
+            "enable_semantic_cache": "true",
+            "enable_semantic_proxy": "true",
+            "semantic_proxy_model": self.models[1],
+            "semantic_proxy_threshold": "0.5",
+            "enable_semantic_lift": "true",
+            "enable_semantic_row_async": "true",
+        }
+        quote = self.database.connection.escape
+        parameters = " ".join(
+            f"OPT_PARAM({quote(name)}, {quote(value)})" for name, value in options.items()
+        )
+        stmt = (
+            f"SELECT /*+ PARALLEL(1) LEADING(l r) USE_HASH(r) "
+            f"OPT_PARAM('rowsets_max_rows', {BATCH_ROWS}) {parameters} */ l.prompt, r.prompt "
+            f"FROM proxy_inputs l INNER JOIN proxy_right r "
+            f"ON l.id=r.join_id AND ({self.call()}) "
+            "ORDER BY l.id DESC, r.id ASC LIMIT 1"
+        )
+        plan = lift.ExplainPlan(lift.render_explain(self.execute("EXPLAIN " + stmt)))
+        self.assertEqual(len(plan.find("TOP-N SORT")), 0, plan.text)
+        stage = plan.one("SEMANTIC JOIN")
+        self.assertTrue(plan.is_above(plan.one("LIMIT"), stage), plan.text)
+        self.assertTrue(plan.is_above(stage, plan.one("SORT")), plan.text)
+        self.assertRegex(stage.annotation, r"(?i)\bsemantic_placement\s*=\s*LIFTED\b")
+        self.assertRegex(stage.annotation, r"(?i)\brow_async\s*=\s*ORDERED_PREFIX\b")
+        # Sorted candidates for l='pine' (id=1): ('pine','far') -> proxy rejected,
+        # ('pine','oak') -> main LLM False, ('pine','pine') -> main LLM True (satisfies LIMIT 1!).
+        self.assertEqual(self.execute(stmt), (("pine", "pine"),))
+        embeddings, completions, _requests = self.work(before)
+        self.assertEqual(
+            completions,
+            Counter([pair_key("pine", "oak"), pair_key("pine", "pine")]),
+            "AI_JOIN Top-N + bilateral proxy did not stop before evaluating oak-* pairs",
+        )
+
 
 def main(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
